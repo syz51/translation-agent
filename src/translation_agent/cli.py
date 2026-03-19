@@ -1,0 +1,59 @@
+"""CLI entrypoint for the translation agent bootstrap."""
+
+from __future__ import annotations
+
+import argparse
+import json
+from dataclasses import asdict
+
+from translation_agent.api import RunJobRequest, run_job
+from translation_agent.config import load_settings, validate_environment
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="translation-agent")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    validate_parser = subparsers.add_parser("validate-config", help="Validate local runtime config")
+    validate_parser.add_argument("--json", action="store_true", dest="as_json")
+
+    run_parser = subparsers.add_parser("run-job", help="Bootstrap a local run record")
+    run_parser.add_argument("source")
+    run_parser.add_argument("--job-id")
+    run_parser.add_argument("--json", action="store_true", dest="as_json")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if args.command == "validate-config":
+        settings = load_settings()
+        result = validate_environment(settings)
+        payload = {
+            "ok": result.ok,
+            "checked_paths": [str(path) for path in result.checked_paths],
+        }
+        if args.as_json:
+            print(json.dumps(payload))
+        else:
+            print("configuration valid" if result.ok else "configuration invalid")
+            for path in payload["checked_paths"]:
+                print(path)
+        return 0 if result.ok else 1
+
+    if args.command == "run-job":
+        result = run_job(RunJobRequest(source=args.source, job_id=args.job_id))
+        payload = {
+            key: str(value) if hasattr(value, "__fspath__") else value
+            for key, value in asdict(result).items()
+        }
+        if args.as_json:
+            print(json.dumps(payload))
+        else:
+            print(result.run_id)
+        return 0
+
+    parser.error(f"unsupported command: {args.command}")
+    return 2
