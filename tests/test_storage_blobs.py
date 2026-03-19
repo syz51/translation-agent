@@ -22,4 +22,3 @@ def test_blob_rejects_traversal(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError):
         store.put_bytes("../escape.bin", b"nope")
-

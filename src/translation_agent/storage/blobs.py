@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from pathlib import Path
 import os
 import tempfile
-from typing import Iterator
+from collections.abc import Iterator
+from dataclasses import dataclass
+from pathlib import Path
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,11 +46,7 @@ class LocalBlobStore:
             path.unlink()
 
     def list_keys(self, prefix: str | None = None) -> list[str]:
-        keys = [
-            self._relative_key(path)
-            for path in sorted(self.root.rglob("*"))
-            if path.is_file()
-        ]
+        keys = [self._relative_key(path) for path in sorted(self.root.rglob("*")) if path.is_file()]
         if prefix is None:
             return keys
         return [key for key in keys if key.startswith(prefix)]
@@ -76,4 +72,3 @@ class LocalBlobStore:
         if any(part in {"..", ".", ""} for part in relative.parts):
             raise ValueError("blob key must not traverse directories")
         return relative
-

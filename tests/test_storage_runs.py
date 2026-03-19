@@ -5,7 +5,6 @@ import pytest
 
 from translation_agent.storage import PostgresRunStore
 
-
 pytestmark = pytest.mark.integration
 
 

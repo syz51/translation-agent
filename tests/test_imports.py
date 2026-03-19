@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import importlib
 
-
 MODULES = [
     "translation_agent",
     "translation_agent.adapters.assemblyai",

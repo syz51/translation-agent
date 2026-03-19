@@ -41,7 +41,7 @@ class TraceSink(ABC):
     def close(self) -> None:
         return None
 
-    def __enter__(self) -> "TraceSink":
+    def __enter__(self) -> TraceSink:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:

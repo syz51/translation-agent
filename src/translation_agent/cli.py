@@ -42,11 +42,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.as_json:
             print(json.dumps(payload))
         else:
+            db_connectivity = (
+                "database connectivity ok" if result.state_db_ok else "database connectivity failed"
+            )
             print("configuration valid" if result.ok else "configuration invalid")
             for path in payload["checked_paths"]:
                 print(path)
             print(f"{result.state_backend}: {result.state_db_target}")
-            print("database connectivity ok" if result.state_db_ok else "database connectivity failed")
+            print(db_connectivity)
             if result.state_db_error:
                 print(result.state_db_error)
         return 0 if result.ok else 1

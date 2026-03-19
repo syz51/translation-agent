@@ -77,9 +77,7 @@ def test_cli_validate_config_json_missing_dsn(monkeypatch, tmp_path: Path, capsy
     assert payload["state_db_target"] == "<missing>"
 
 
-def test_cli_validate_config_json_unreachable_dsn(
-    monkeypatch, tmp_path: Path, capsys
-) -> None:
+def test_cli_validate_config_json_unreachable_dsn(monkeypatch, tmp_path: Path, capsys) -> None:
     monkeypatch.setenv("TA_DATA_DIR", str(tmp_path / "runtime"))
     monkeypatch.setenv(
         "TA_STATE_DB_DSN",

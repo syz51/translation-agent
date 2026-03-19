@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-import json
 from pathlib import Path
 from uuid import uuid4
 
@@ -46,11 +46,15 @@ def run_job(request: RunJobRequest, settings: Settings | None = None) -> RunJobR
     if not validation.ok:
         message = validation.state_db_error or "invalid runtime configuration"
         raise RuntimeError(message)
-    assert settings.state_db_dsn is not None
+    state_db_dsn = settings.state_db_dsn
+    if state_db_dsn is None:
+        raise RuntimeError("TA_STATE_DB_DSN is required")
+    blob_dir = settings.blob_dir
+    trace_dir = settings.trace_dir
 
     configure_structured_logging()
     logger = get_structured_logger("translation_agent.api")
-    blob_store = LocalBlobStore(settings.blob_dir)
+    blob_store = LocalBlobStore(blob_dir)
 
     run_id = uuid4().hex
     job_id = request.job_id or run_id
@@ -60,7 +64,7 @@ def run_job(request: RunJobRequest, settings: Settings | None = None) -> RunJobR
         f"jobs/{run_id}-request.json",
         _serialize_request(request, now).encode("utf-8"),
     )
-    with PostgresRunStore(settings.state_db_dsn) as run_store:
+    with PostgresRunStore(state_db_dsn) as run_store:
         run_store.create_run(
             run_id=run_id,
             status="bootstrapped",
@@ -71,7 +75,7 @@ def run_job(request: RunJobRequest, settings: Settings | None = None) -> RunJobR
             },
             metadata=request.metadata,
         )
-    trace_path = settings.trace_dir / f"{run_id}.jsonl"
+    trace_path = trace_dir / f"{run_id}.jsonl"
     with JsonlTraceSink(trace_path) as trace_sink:
         trace_sink.record(
             TraceEvent(
@@ -99,7 +103,7 @@ def run_job(request: RunJobRequest, settings: Settings | None = None) -> RunJobR
         job_id=job_id,
         status="bootstrapped",
         source=request.source,
-        blob_root=settings.blob_dir,
+        blob_root=blob_dir,
         state_db_target=validation.state_db_target,
         trace_path=trace_path,
     )

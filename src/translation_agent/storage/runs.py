@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Any, Mapping
+from datetime import UTC, datetime
+from typing import Any, cast
 from uuid import uuid4
 
 import psycopg
@@ -45,7 +46,11 @@ class PostgresRunStore:
 
     def __init__(self, dsn: str) -> None:
         self.dsn = dsn
-        self._conn = psycopg.connect(self.dsn, autocommit=True, row_factory=dict_row)
+        self._conn: Any = psycopg.connect(
+            self.dsn,
+            autocommit=True,
+            row_factory=cast(Any, dict_row),
+        )
         self._initialize_schema()
 
     def close(self) -> None:
@@ -92,7 +97,7 @@ class PostgresRunStore:
                 """,
                 payload,
             )
-        return self.get_run(run_id)
+        return _require_run(self.get_run(run_id), run_id)
 
     def get_run(self, run_id: str) -> RunRecord | None:
         row = self._conn.execute(
@@ -129,7 +134,11 @@ class PostgresRunStore:
             self._conn.execute(
                 """
                 UPDATE runs
-                SET status = %s, updated_at = %s, output_data_json = %s, metadata_json = %s, error_json = %s
+                SET status = %s,
+                    updated_at = %s,
+                    output_data_json = %s,
+                    metadata_json = %s,
+                    error_json = %s
                 WHERE run_id = %s
                 """,
                 (
@@ -141,7 +150,7 @@ class PostgresRunStore:
                     run_id,
                 ),
             )
-        return self.get_run(run_id)
+        return _require_run(self.get_run(run_id), run_id)
 
     def create_node_execution(
         self,
@@ -176,7 +185,7 @@ class PostgresRunStore:
                 """,
                 payload,
             )
-        return self.get_node_execution(execution_id)
+        return _require_node_execution(self.get_node_execution(execution_id), execution_id)
 
     def get_node_execution(self, execution_id: str) -> NodeExecutionRecord | None:
         row = self._conn.execute(
@@ -227,7 +236,7 @@ class PostgresRunStore:
                     execution_id,
                 ),
             )
-        return self.get_node_execution(execution_id)
+        return _require_node_execution(self.get_node_execution(execution_id), execution_id)
 
     def _initialize_schema(self) -> None:
         with self._conn.transaction():
@@ -300,7 +309,7 @@ def _row_to_node_execution(row: Mapping[str, Any]) -> NodeExecutionRecord:
 
 
 def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _isoformat_timestamp(value: datetime | str) -> str:
@@ -319,3 +328,17 @@ def _decode_json(value: Any) -> Any:
     if value is None:
         return None
     return value
+
+
+def _require_run(record: RunRecord | None, run_id: str) -> RunRecord:
+    if record is None:
+        raise RuntimeError(f"run {run_id} was not persisted")
+    return record
+
+
+def _require_node_execution(
+    record: NodeExecutionRecord | None, execution_id: str
+) -> NodeExecutionRecord:
+    if record is None:
+        raise RuntimeError(f"node execution {execution_id} was not persisted")
+    return record

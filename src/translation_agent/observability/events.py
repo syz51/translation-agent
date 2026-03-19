@@ -4,13 +4,14 @@ import json
 import logging
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from importlib import import_module
 from pathlib import Path
 from typing import Any
 
 try:  # Optional dependency: keep the code ready for structlog when installed.
-    import structlog
+    structlog = import_module("structlog")
 except ModuleNotFoundError:  # pragma: no cover - exercised by environment, not logic.
-    structlog = None  # type: ignore[assignment]
+    structlog = None
 
 STRUCTLOG_AVAILABLE = structlog is not None
 

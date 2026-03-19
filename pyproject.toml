@@ -18,8 +18,32 @@ dependencies = [
 translation-agent = "translation_agent.cli:main"
 
 [dependency-groups]
-dev = ["pytest>=9.0.0"]
+dev = [
+    "bandit[toml]>=1.9.4",
+    "pre-commit>=4.5.1",
+    "pyright>=1.1.408",
+    "pytest>=9.0.0",
+    "ruff>=0.15.6",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = ["integration: marks tests that require Docker-backed Postgres"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.pyright]
+include = ["src", "tests"]
+pythonVersion = "3.14"
+typeCheckingMode = "standard"
+reportMissingTypeStubs = false
+executionEnvironments = [{ root = ".", extraPaths = ["src"] }]
+
+[tool.bandit]
+exclude_dirs = ["tests"]

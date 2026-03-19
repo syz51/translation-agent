@@ -5,10 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from pydantic import Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
 import psycopg
 from psycopg.conninfo import conninfo_to_dict
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -22,23 +22,25 @@ class Settings(BaseSettings):
 
     workspace_dir: Path = Field(default_factory=lambda: Path.cwd())
     data_dir: Path = Field(default_factory=lambda: Path.cwd() / ".translation-agent")
-    blob_dir: Path | None = None
+    blob_dir: Path = Field(default_factory=lambda: Path.cwd() / ".translation-agent" / "blobs")
     state_db_dsn: str | None = None
-    trace_dir: Path | None = None
+    trace_dir: Path = Field(default_factory=lambda: Path.cwd() / ".translation-agent" / "traces")
     log_level: str = "INFO"
     emit_console_logs: bool = True
 
     def model_post_init(self, __context: object) -> None:
+        blob_dir_overridden = "blob_dir" in self.model_fields_set
+        trace_dir_overridden = "trace_dir" in self.model_fields_set
         self.workspace_dir = self.workspace_dir.expanduser().resolve()
         self.data_dir = self.data_dir.expanduser().resolve()
-        if self.blob_dir is None:
-            self.blob_dir = self.data_dir / "blobs"
-        else:
+        if blob_dir_overridden:
             self.blob_dir = self.blob_dir.expanduser().resolve()
-        if self.trace_dir is None:
-            self.trace_dir = self.data_dir / "traces"
         else:
+            self.blob_dir = self.data_dir / "blobs"
+        if trace_dir_overridden:
             self.trace_dir = self.trace_dir.expanduser().resolve()
+        else:
+            self.trace_dir = self.data_dir / "traces"
 
 
 @dataclass(slots=True)
@@ -60,11 +62,7 @@ def load_settings() -> Settings:
 def validate_environment(settings: Settings, *, create_dirs: bool = True) -> ValidationResult:
     """Validate the configured local runtime paths and Postgres connectivity."""
 
-    paths = (
-        settings.data_dir,
-        settings.blob_dir,
-        settings.trace_dir,
-    )
+    paths = _runtime_paths(settings)
     if create_dirs:
         for path in paths:
             path.mkdir(parents=True, exist_ok=True)
@@ -106,9 +104,12 @@ def sanitize_db_target(state_db_dsn: str | None) -> str:
     except Exception:
         return "<invalid>"
 
-    host = conninfo.get("host", "")
-    port = conninfo.get("port", "")
-    dbname = conninfo.get("dbname", "")
+    host_value = conninfo.get("host")
+    port_value = conninfo.get("port")
+    dbname_value = conninfo.get("dbname")
+    host = str(host_value) if host_value else ""
+    port = str(port_value) if port_value else ""
+    dbname = str(dbname_value) if dbname_value else ""
 
     target = "postgresql://"
     if host:
@@ -123,3 +124,7 @@ def sanitize_db_target(state_db_dsn: str | None) -> str:
     elif not host and not port:
         target += "/"
     return target
+
+
+def _runtime_paths(settings: Settings) -> tuple[Path, Path, Path]:
+    return (settings.data_dir, settings.blob_dir, settings.trace_dir)

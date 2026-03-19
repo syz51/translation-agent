@@ -1,17 +1,17 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 import shutil
 import socket
 import subprocess
 import sys
 import time
+from collections.abc import Iterator
+from pathlib import Path
 from uuid import uuid4
 
 import psycopg
 import pytest
-
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -30,8 +30,14 @@ def _ensure_docker_available() -> None:
         pytest.skip("docker is unavailable; skipping Postgres integration tests")
 
     checks = (
-        (["docker", "compose", "version"], "docker compose is unavailable; skipping Postgres integration tests"),
-        (["docker", "info"], "docker daemon is unavailable; skipping Postgres integration tests"),
+        (
+            ["docker", "compose", "version"],
+            "docker compose is unavailable; skipping Postgres integration tests",
+        ),
+        (
+            ["docker", "info"],
+            "docker daemon is unavailable; skipping Postgres integration tests",
+        ),
     )
     for command, message in checks:
         result = subprocess.run(command, capture_output=True, text=True, check=False)
@@ -59,7 +65,7 @@ def _wait_for_postgres(dsn: str, *, timeout_seconds: float = 30.0) -> None:
 
 
 @pytest.fixture
-def postgres_dsn() -> str:
+def postgres_dsn() -> Iterator[str]:
     _ensure_docker_available()
 
     compose_file = ROOT / "compose.yaml"
