@@ -8,8 +8,8 @@ from translation_agent.storage import PostgresRunStore
 pytestmark = pytest.mark.integration
 
 
-def test_store_bootstraps_schema_on_first_connection(postgres_dsn: str) -> None:
-    with PostgresRunStore(postgres_dsn) as store:
+def test_store_uses_explicit_migrated_schema(migrated_postgres_dsn: str) -> None:
+    with PostgresRunStore(migrated_postgres_dsn) as store:
         tables = {
             row["tablename"]
             for row in store._conn.execute(
@@ -27,8 +27,14 @@ def test_store_bootstraps_schema_on_first_connection(postgres_dsn: str) -> None:
     assert "idx_node_executions_run_id_created_at" in indexes
 
 
-def test_create_get_update_list_run_records(postgres_dsn: str) -> None:
+def test_store_does_not_bootstrap_schema_on_first_connection(postgres_dsn: str) -> None:
     with PostgresRunStore(postgres_dsn) as store:
+        with pytest.raises(psycopg.errors.UndefinedTable):
+            store.create_run(input_data={"source": "video.mp4"})
+
+
+def test_create_get_update_list_run_records(migrated_postgres_dsn: str) -> None:
+    with PostgresRunStore(migrated_postgres_dsn) as store:
         run = store.create_run(
             tenant_id="tenant-1",
             project_id="project-1",
@@ -42,7 +48,7 @@ def test_create_get_update_list_run_records(postgres_dsn: str) -> None:
             error={"code": "none"},
         )
 
-    with PostgresRunStore(postgres_dsn) as reopened:
+    with PostgresRunStore(migrated_postgres_dsn) as reopened:
         loaded = reopened.get_run(run.run_id)
         listed = reopened.list_runs()
 
@@ -57,8 +63,8 @@ def test_create_get_update_list_run_records(postgres_dsn: str) -> None:
     assert isinstance(loaded.updated_at, str)
 
 
-def test_create_get_update_list_node_execution_records(postgres_dsn: str) -> None:
-    with PostgresRunStore(postgres_dsn) as store:
+def test_create_get_update_list_node_execution_records(migrated_postgres_dsn: str) -> None:
+    with PostgresRunStore(migrated_postgres_dsn) as store:
         run = store.create_run(input_data={"source": "video.mp4"})
         first = store.create_node_execution(
             run_id=run.run_id,
@@ -77,7 +83,7 @@ def test_create_get_update_list_node_execution_records(postgres_dsn: str) -> Non
             error={"code": "none"},
         )
 
-    with PostgresRunStore(postgres_dsn) as reopened:
+    with PostgresRunStore(migrated_postgres_dsn) as reopened:
         loaded = reopened.get_node_execution(first.execution_id)
         listed = reopened.list_node_executions(run.run_id)
 
@@ -91,8 +97,8 @@ def test_create_get_update_list_node_execution_records(postgres_dsn: str) -> Non
     assert isinstance(loaded.updated_at, str)
 
 
-def test_node_execution_foreign_key_behavior(postgres_dsn: str) -> None:
-    with PostgresRunStore(postgres_dsn) as store:
+def test_node_execution_foreign_key_behavior(migrated_postgres_dsn: str) -> None:
+    with PostgresRunStore(migrated_postgres_dsn) as store:
         with pytest.raises(psycopg.errors.ForeignKeyViolation):
             store.create_node_execution(
                 run_id="missing-run",

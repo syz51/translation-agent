@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import importlib
 
+import pytest
+
 MODULES = [
     "translation_agent",
     "translation_agent.adapters.assemblyai",
@@ -42,9 +44,12 @@ MODULES = [
     "translation_agent.review.prompts",
     "translation_agent.storage.blobs",
     "translation_agent.storage.decisions",
+    "translation_agent.storage.migrations",
     "translation_agent.storage.memory_batches",
     "translation_agent.storage.runs",
 ]
+
+pytestmark = pytest.mark.slice
 
 
 def test_phase_zero_modules_import_cleanly() -> None:

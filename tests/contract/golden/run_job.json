@@ -1,0 +1,10 @@
+{
+  "blob_root": "<blob_root>",
+  "job_id": "job-123",
+  "run_id": "<run_id>",
+  "source": "input.wav",
+  "state_backend": "postgres",
+  "state_db_target": "<state_db_target>",
+  "status": "bootstrapped",
+  "trace_path": "<trace_path>"
+}

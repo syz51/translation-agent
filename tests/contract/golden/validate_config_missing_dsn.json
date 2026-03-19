@@ -1,0 +1,12 @@
+{
+  "checked_paths": [
+    "<data_dir>",
+    "<blob_dir>",
+    "<trace_dir>"
+  ],
+  "ok": false,
+  "state_backend": "postgres",
+  "state_db_error": "TA_STATE_DB_DSN is required",
+  "state_db_ok": false,
+  "state_db_target": "<missing>"
+}

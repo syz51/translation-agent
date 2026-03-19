@@ -109,3 +109,11 @@ def postgres_dsn() -> Iterator[str]:
             text=True,
             env=env,
         )
+
+
+@pytest.fixture
+def migrated_postgres_dsn(postgres_dsn: str) -> str:
+    from translation_agent.storage.migrations import upgrade_database
+
+    upgrade_database(postgres_dsn)
+    return postgres_dsn

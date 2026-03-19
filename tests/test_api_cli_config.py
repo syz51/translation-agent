@@ -11,6 +11,7 @@ from translation_agent.config import load_settings, sanitize_db_target, validate
 from translation_agent.storage import PostgresRunStore
 
 
+@pytest.mark.unit
 def test_load_settings_reads_environment(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setenv("TA_DATA_DIR", str(tmp_path / "runtime"))
     monkeypatch.setenv(
@@ -28,6 +29,7 @@ def test_load_settings_reads_environment(monkeypatch, tmp_path: Path) -> None:
     )
 
 
+@pytest.mark.unit
 def test_validate_environment_fails_cleanly_without_state_db_dsn(
     monkeypatch, tmp_path: Path
 ) -> None:
@@ -45,6 +47,7 @@ def test_validate_environment_fails_cleanly_without_state_db_dsn(
         assert path.exists()
 
 
+@pytest.mark.unit
 def test_validate_environment_fails_cleanly_for_unreachable_dsn(
     monkeypatch, tmp_path: Path
 ) -> None:
@@ -64,6 +67,7 @@ def test_validate_environment_fails_cleanly_for_unreachable_dsn(
     assert result.state_db_error is not None
 
 
+@pytest.mark.unit
 def test_cli_validate_config_json_missing_dsn(monkeypatch, tmp_path: Path, capsys) -> None:
     monkeypatch.setenv("TA_DATA_DIR", str(tmp_path / "runtime"))
     monkeypatch.delenv("TA_STATE_DB_DSN", raising=False)
@@ -77,6 +81,7 @@ def test_cli_validate_config_json_missing_dsn(monkeypatch, tmp_path: Path, capsy
     assert payload["state_db_target"] == "<missing>"
 
 
+@pytest.mark.unit
 def test_cli_validate_config_json_unreachable_dsn(monkeypatch, tmp_path: Path, capsys) -> None:
     monkeypatch.setenv("TA_DATA_DIR", str(tmp_path / "runtime"))
     monkeypatch.setenv(
@@ -95,10 +100,10 @@ def test_cli_validate_config_json_unreachable_dsn(monkeypatch, tmp_path: Path, c
 
 @pytest.mark.integration
 def test_run_job_bootstraps_local_artifacts_and_postgres_record(
-    postgres_dsn: str, monkeypatch, tmp_path: Path
+    migrated_postgres_dsn: str, monkeypatch, tmp_path: Path
 ) -> None:
     monkeypatch.setenv("TA_DATA_DIR", str(tmp_path / "runtime"))
-    monkeypatch.setenv("TA_STATE_DB_DSN", postgres_dsn)
+    monkeypatch.setenv("TA_STATE_DB_DSN", migrated_postgres_dsn)
 
     result = run_job(RunJobRequest(source="input.mp4", job_id="job-123"))
 
@@ -107,9 +112,9 @@ def test_run_job_bootstraps_local_artifacts_and_postgres_record(
     assert result.trace_path.exists()
     assert (result.blob_root / "jobs" / f"{result.run_id}-request.json").exists()
     assert result.state_backend == "postgres"
-    assert result.state_db_target == sanitize_db_target(postgres_dsn)
+    assert result.state_db_target == sanitize_db_target(migrated_postgres_dsn)
 
-    with PostgresRunStore(postgres_dsn) as store:
+    with PostgresRunStore(migrated_postgres_dsn) as store:
         record = store.get_run(result.run_id)
 
     assert record is not None
@@ -139,9 +144,9 @@ def test_cli_validate_config_json_with_working_dsn(
 
 
 @pytest.mark.integration
-def test_cli_run_job_json(postgres_dsn: str, monkeypatch, tmp_path: Path, capsys) -> None:
+def test_cli_run_job_json(migrated_postgres_dsn: str, monkeypatch, tmp_path: Path, capsys) -> None:
     monkeypatch.setenv("TA_DATA_DIR", str(tmp_path / "runtime"))
-    monkeypatch.setenv("TA_STATE_DB_DSN", postgres_dsn)
+    monkeypatch.setenv("TA_STATE_DB_DSN", migrated_postgres_dsn)
 
     exit_code = main(["run-job", "input.wav", "--job-id", "job-123", "--json"])
 
@@ -149,10 +154,10 @@ def test_cli_run_job_json(postgres_dsn: str, monkeypatch, tmp_path: Path, capsys
     assert exit_code == 0
     assert payload["job_id"] == "job-123"
     assert payload["state_backend"] == "postgres"
-    assert payload["state_db_target"] == sanitize_db_target(postgres_dsn)
+    assert payload["state_db_target"] == sanitize_db_target(migrated_postgres_dsn)
     assert Path(payload["trace_path"]).exists()
 
-    with PostgresRunStore(postgres_dsn) as store:
+    with PostgresRunStore(migrated_postgres_dsn) as store:
         record = store.get_run(payload["run_id"])
 
     assert record is not None

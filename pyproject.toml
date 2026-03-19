@@ -9,6 +9,7 @@ description = "Workflow-first translation agent bootstrap"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
+	"alembic>=1.18.4,<2.0.0",
 	"psycopg[binary]>=3.2.0,<4.0.0",
 	"pydantic>=2.11.0,<3.0.0",
 	"pydantic-settings>=2.11.0,<3.0.0",
@@ -23,12 +24,22 @@ dev = [
     "pre-commit>=4.5.1",
     "pyright>=1.1.408",
     "pytest>=9.0.0",
+    "pytest-cov>=7.0.0",
+    "pytest-xdist>=3.8.0",
     "ruff>=0.15.6",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["integration: marks tests that require Docker-backed Postgres"]
+markers = [
+    "unit: marks fast local tests",
+    "slice: marks import or subsystem slice tests",
+    "integration: marks tests that require Docker-backed Postgres",
+    "contract: marks public output contract tests",
+    "migration: marks schema bootstrap and compatibility tests",
+    "regression: marks regression coverage for previously fragile behavior",
+    "staging_only: marks tests that only run in staging environments",
+]
 
 [tool.ruff]
 line-length = 100

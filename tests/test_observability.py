@@ -8,6 +8,8 @@ from io import StringIO
 from pathlib import Path
 from unittest import TestCase, main
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from translation_agent.observability import (  # noqa: E402
@@ -20,6 +22,8 @@ from translation_agent.observability import (  # noqa: E402
     get_structured_logger,
     log_structured_event,
 )
+
+pytestmark = pytest.mark.unit
 
 
 class ObservabilityTests(TestCase):

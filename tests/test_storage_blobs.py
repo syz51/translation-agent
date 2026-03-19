@@ -4,6 +4,8 @@ import pytest
 
 from translation_agent.storage import LocalBlobStore
 
+pytestmark = pytest.mark.unit
+
 
 def test_blob_round_trip_and_listing(tmp_path: Path) -> None:
     store = LocalBlobStore(tmp_path / "blobs")

@@ -51,7 +51,6 @@ class PostgresRunStore:
             autocommit=True,
             row_factory=cast(Any, dict_row),
         )
-        self._initialize_schema()
 
     def close(self) -> None:
         self._conn.close()
@@ -237,46 +236,6 @@ class PostgresRunStore:
                 ),
             )
         return _require_node_execution(self.get_node_execution(execution_id), execution_id)
-
-    def _initialize_schema(self) -> None:
-        with self._conn.transaction():
-            self._conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS runs (
-                    run_id TEXT PRIMARY KEY,
-                    tenant_id TEXT,
-                    project_id TEXT,
-                    status TEXT NOT NULL,
-                    created_at TIMESTAMPTZ NOT NULL,
-                    updated_at TIMESTAMPTZ NOT NULL,
-                    input_data_json JSONB,
-                    output_data_json JSONB,
-                    metadata_json JSONB,
-                    error_json JSONB
-                )
-                """
-            )
-            self._conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS node_executions (
-                    execution_id TEXT PRIMARY KEY,
-                    run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
-                    node_name TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    created_at TIMESTAMPTZ NOT NULL,
-                    updated_at TIMESTAMPTZ NOT NULL,
-                    input_data_json JSONB,
-                    output_data_json JSONB,
-                    error_json JSONB
-                )
-                """
-            )
-            self._conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_node_executions_run_id_created_at
-                ON node_executions(run_id, created_at, execution_id)
-                """
-            )
 
 
 def _row_to_run(row: Mapping[str, Any]) -> RunRecord:

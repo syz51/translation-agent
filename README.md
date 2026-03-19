@@ -7,9 +7,10 @@ Quick start:
 1. `uv sync`
 2. `docker compose up -d postgres`
 3. `export TA_STATE_DB_DSN=postgresql://translation_agent:translation_agent@127.0.0.1:55432/translation_agent`
-4. `uv run translation-agent validate-config --json`
-5. `uv run translation-agent run-job path/to/input.media --json`
-6. `uv run pytest`
+4. `uv run alembic upgrade head`
+5. `uv run translation-agent validate-config --json`
+6. `uv run translation-agent run-job path/to/input.media --json`
+7. `uv run pytest`
 
 Recommended reading order:
 
