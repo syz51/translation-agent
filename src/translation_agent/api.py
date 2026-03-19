@@ -16,7 +16,7 @@ from translation_agent.observability.events import (
 )
 from translation_agent.observability.tracing import JsonlTraceSink, TraceEvent
 from translation_agent.storage.blobs import LocalBlobStore
-from translation_agent.storage.runs import SQLiteRunStore
+from translation_agent.storage.runs import PostgresRunStore
 
 
 @dataclass(slots=True)
@@ -33,15 +33,20 @@ class RunJobResult:
     status: str
     source: str
     blob_root: Path
-    state_db_path: Path
     trace_path: Path
+    state_backend: str = "postgres"
+    state_db_target: str = ""
 
 
 def run_job(request: RunJobRequest, settings: Settings | None = None) -> RunJobResult:
     """Bootstrap a run record and local runtime artifacts."""
 
     settings = settings or load_settings()
-    validate_environment(settings)
+    validation = validate_environment(settings)
+    if not validation.ok:
+        message = validation.state_db_error or "invalid runtime configuration"
+        raise RuntimeError(message)
+    assert settings.state_db_dsn is not None
 
     configure_structured_logging()
     logger = get_structured_logger("translation_agent.api")
@@ -55,7 +60,7 @@ def run_job(request: RunJobRequest, settings: Settings | None = None) -> RunJobR
         f"jobs/{run_id}-request.json",
         _serialize_request(request, now).encode("utf-8"),
     )
-    with SQLiteRunStore(settings.state_db_path) as run_store:
+    with PostgresRunStore(settings.state_db_dsn) as run_store:
         run_store.create_run(
             run_id=run_id,
             status="bootstrapped",
@@ -95,7 +100,7 @@ def run_job(request: RunJobRequest, settings: Settings | None = None) -> RunJobR
         status="bootstrapped",
         source=request.source,
         blob_root=settings.blob_dir,
-        state_db_path=settings.state_db_path,
+        state_db_target=validation.state_db_target,
         trace_path=trace_path,
     )
 

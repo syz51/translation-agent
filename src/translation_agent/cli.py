@@ -34,6 +34,10 @@ def main(argv: list[str] | None = None) -> int:
         payload = {
             "ok": result.ok,
             "checked_paths": [str(path) for path in result.checked_paths],
+            "state_backend": result.state_backend,
+            "state_db_ok": result.state_db_ok,
+            "state_db_target": result.state_db_target,
+            "state_db_error": result.state_db_error,
         }
         if args.as_json:
             print(json.dumps(payload))
@@ -41,6 +45,10 @@ def main(argv: list[str] | None = None) -> int:
             print("configuration valid" if result.ok else "configuration invalid")
             for path in payload["checked_paths"]:
                 print(path)
+            print(f"{result.state_backend}: {result.state_db_target}")
+            print("database connectivity ok" if result.state_db_ok else "database connectivity failed")
+            if result.state_db_error:
+                print(result.state_db_error)
         return 0 if result.ok else 1
 
     if args.command == "run-job":
@@ -53,6 +61,8 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(payload))
         else:
             print(result.run_id)
+            print(f"{result.state_backend}: {result.state_db_target}")
+            print(result.trace_path)
         return 0
 
     parser.error(f"unsupported command: {args.command}")

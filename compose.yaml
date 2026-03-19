@@ -1,0 +1,18 @@
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_DB: ${TA_PG_DB:-translation_agent}
+      POSTGRES_USER: ${TA_PG_USER:-translation_agent}
+      POSTGRES_PASSWORD: ${TA_PG_PASSWORD:-translation_agent}
+    ports:
+      - '${TA_PG_PORT:-55432}:5432'
+    healthcheck:
+      test:
+        [
+          'CMD-SHELL',
+          'pg_isready -U ${TA_PG_USER:-translation_agent} -d ${TA_PG_DB:-translation_agent}',
+        ]
+      interval: 1s
+      timeout: 5s
+      retries: 30

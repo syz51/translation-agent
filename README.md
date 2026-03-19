@@ -5,9 +5,11 @@ Phase 0 bootstrap is in place. The implementation spec still lives in [`docs/REA
 Quick start:
 
 1. `uv sync`
-2. `uv run translation-agent validate-config --json`
-3. `uv run translation-agent run-job path/to/input.media --json`
-4. `uv run pytest`
+2. `docker compose up -d postgres`
+3. `export TA_STATE_DB_DSN=postgresql://translation_agent:translation_agent@127.0.0.1:55432/translation_agent`
+4. `uv run translation-agent validate-config --json`
+5. `uv run translation-agent run-job path/to/input.media --json`
+6. `uv run pytest`
 
 Recommended reading order:
 
