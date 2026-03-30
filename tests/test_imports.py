@@ -1,8 +1,14 @@
 from __future__ import annotations
 
 import importlib
+import os
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
+
+ROOT = Path(__file__).resolve().parents[1]
 
 MODULES = [
     "translation_agent",
@@ -55,3 +61,29 @@ pytestmark = pytest.mark.slice
 def test_phase_zero_modules_import_cleanly() -> None:
     for module in MODULES:
         importlib.import_module(module)
+
+
+def test_graph_builder_import_has_no_runtime_user_warnings() -> None:
+    env = dict(os.environ)
+    pythonpath = [str(ROOT / "src")]
+    if existing_pythonpath := env.get("PYTHONPATH"):
+        pythonpath.append(existing_pythonpath)
+    env["PYTHONPATH"] = os.pathsep.join(pythonpath)
+    command = [
+        sys.executable,
+        "-W",
+        "error::UserWarning",
+        "-c",
+        "import translation_agent.graph.builder",
+    ]
+
+    result = subprocess.run(
+        command,
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr

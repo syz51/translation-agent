@@ -5,9 +5,9 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
-from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel
 
+from translation_agent.graph._langgraph_compat import END, START, StateGraph
 from translation_agent.graph.routing import route_after_memory_pipeline
 from translation_agent.graph.runtime import WorkflowRuntime
 from translation_agent.graph.state import GraphState
