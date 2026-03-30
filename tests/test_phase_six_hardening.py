@@ -7,45 +7,15 @@ from pathlib import Path
 
 import pytest
 
-from translation_agent.config import sanitize_db_target
 from translation_agent.graph import GraphState, build_phase_two_runtime, run_workflow
-from translation_agent.models import JobContext
-from translation_agent.observability import NoOpTraceSink
+from translation_agent.models import (
+    FinalTranslationDecision,
+    JobContext,
+)
+from translation_agent.observability import JsonlTraceSink
 from translation_agent.storage import LocalBlobStore, NodeExecutionRecord, RunRecord, job_path
 
-pytestmark = pytest.mark.regression
-
-
-@pytest.mark.parametrize(
-    ("dsn", "expected"),
-    [
-        (
-            "postgresql://user:secret@db.example.com:5432/translation_agent?sslmode=require",
-            "postgresql://db.example.com:5432/translation_agent",
-        ),
-        (
-            "postgresql://user:secret@db.example.com/translation_agent?connect_timeout=1",
-            "postgresql://db.example.com/translation_agent",
-        ),
-        ("not-a-dsn", "<invalid>"),
-        (None, "<missing>"),
-    ],
-)
-def test_sanitize_db_target_strips_secrets_and_noise_regression(
-    dsn: str | None, expected: str
-) -> None:
-    assert sanitize_db_target(dsn) == expected
-
-
-def test_blob_store_overwrite_does_not_leave_temporary_files_regression(tmp_path: Path) -> None:
-    store = LocalBlobStore(tmp_path / "blobs")
-
-    store.put_bytes("jobs/run-1/request.json", b"first")
-    store.put_bytes("jobs/run-1/request.json", b"second")
-
-    assert store.read_bytes("jobs/run-1/request.json") == b"second"
-    assert store.list_keys() == ["jobs/run-1/request.json"]
-    assert not any(path.name.startswith(".tmp-blob-") for path in store.root.rglob("*"))
+pytestmark = pytest.mark.unit
 
 
 @dataclass
@@ -176,7 +146,7 @@ class InMemoryRunStore:
 
 def _job_context(
     *,
-    job_id: str = "job-replay",
+    job_id: str = "job-phase-six",
     tenant_id: str = "tenant-1",
     project_id: str = "project-1",
     source_language: str = "en",
@@ -200,109 +170,150 @@ def _run_workflow(
     *,
     run_id: str,
     scenario: str,
-    job: JobContext | None = None,
-) -> tuple[GraphState, LocalBlobStore]:
+    job: JobContext,
+    blob_root: Path | None = None,
+) -> tuple[GraphState, LocalBlobStore, Path]:
     run_store = InMemoryRunStore()
     run_store.create_run(run_id=run_id, status="running")
-    blob_store = LocalBlobStore(tmp_path / run_id / "blobs")
+    blob_store = LocalBlobStore(blob_root or tmp_path / "blobs")
     source_ref = f"jobs/{run_id}-request.json"
     blob_store.put_bytes(source_ref, b"{}\n")
-    runtime = build_phase_two_runtime(
-        blob_store=blob_store,
-        run_store=run_store,
-        trace_sink=NoOpTraceSink(),
-        source_artifact_ref=source_ref,
-        scenario=scenario,
+    trace_path = tmp_path / f"{run_id}.jsonl"
+    with JsonlTraceSink(trace_path) as trace_sink:
+        runtime = build_phase_two_runtime(
+            blob_store=blob_store,
+            run_store=run_store,
+            trace_sink=trace_sink,
+            source_artifact_ref=source_ref,
+            scenario=scenario,
+        )
+        initial_state = GraphState(
+            run_id=run_id,
+            job=job,
+            current_stage="ingest",
+            source_video_ref="input.mp4",
+            source_artifact_ref=source_ref,
+        )
+        final_state = run_workflow(initial_state, runtime)
+    return final_state, blob_store, trace_path
+
+
+def test_phase_six_publishes_trace_artifact_into_blob_store(tmp_path: Path) -> None:
+    job = _job_context(job_id="job-trace")
+    final_state, blob_store, trace_path = _run_workflow(
+        tmp_path,
+        run_id="run-trace",
+        scenario="happy",
+        job=job,
     )
-    initial_state = GraphState(
-        run_id=run_id,
-        job=job or _job_context(),
-        current_stage="ingest",
-        source_video_ref="input.mp4",
-        source_artifact_ref=source_ref,
+
+    trace_ref = job_path(job, "traces", "run-trace.jsonl")
+    assert trace_ref in final_state.published_artifact_refs
+    assert blob_store.exists(trace_ref)
+    assert blob_store.read_bytes(trace_ref) == trace_path.read_bytes()
+
+
+def test_phase_six_scoped_publish_paths_isolate_same_job_id_across_tenants(tmp_path: Path) -> None:
+    shared_root = tmp_path / "shared"
+    tenant_a = _job_context(job_id="job-shared", tenant_id="tenant-a")
+    tenant_b = _job_context(job_id="job-shared", tenant_id="tenant-b")
+
+    _, blob_store_a, _ = _run_workflow(
+        shared_root,
+        run_id="run-a",
+        scenario="happy",
+        job=tenant_a,
+        blob_root=shared_root / "blobs",
     )
-    final_state = run_workflow(initial_state, runtime)
-    return final_state, blob_store
+    _, blob_store_b, _ = _run_workflow(
+        shared_root,
+        run_id="run-b",
+        scenario="happy",
+        job=tenant_b,
+        blob_root=shared_root / "blobs",
+    )
+
+    transcript_a = job_path(tenant_a, "published", "transcript.json")
+    transcript_b = job_path(tenant_b, "published", "transcript.json")
+
+    assert transcript_a != transcript_b
+    assert blob_store_a.exists(transcript_a)
+    assert blob_store_b.exists(transcript_b)
 
 
-def _load_json(blob_store: LocalBlobStore, path: str) -> dict[str, object]:
-    return json.loads(blob_store.read_bytes(path).decode("utf-8"))
-
-
-def _normalize_scorecard(payload: dict[str, object]) -> dict[str, object]:
-    normalized = json.loads(json.dumps(payload))
-    normalized["run_id"] = "<normalized>"
-    normalized["trace_refs"] = ["<normalized>"]
-    for fact in normalized.get("routing_facts", []):
-        source_ref = fact.get("source_ref")
-        if isinstance(source_ref, str) and source_ref.startswith("jobs/run-"):
-            fact["source_ref"] = "<normalized-request-artifact>"
-    return normalized
-
-
-def _normalize_failure_manifest(payload: dict[str, object]) -> dict[str, object]:
-    normalized = json.loads(json.dumps(payload))
-    normalized["run_id"] = "<normalized>"
-    return normalized
-
-
-def test_replay_scorecards_memory_and_prompt_proposals_are_stable_regression(
+def test_phase_six_translation_conflict_timeout_escalates_to_human_review(
     tmp_path: Path,
 ) -> None:
-    job = _job_context(job_id="job-replay-happy")
-    _, first_blob_store = _run_workflow(
+    job = _job_context(job_id="job-timeout")
+    final_state, blob_store, _ = _run_workflow(
         tmp_path,
-        run_id="run-replay-a",
-        scenario="happy",
-        job=job,
-    )
-    _, second_blob_store = _run_workflow(
-        tmp_path,
-        run_id="run-replay-b",
-        scenario="happy",
+        run_id="run-timeout",
+        scenario="translation_conflict_timeout",
         job=job,
     )
 
-    scorecard_path = job_path(job, "published", "scorecard.json")
-    consolidation_path = job_path(
-        job,
-        "memory",
-        "consolidations",
-        "consolidation-batch-translation_adjudication-job-replay-happy.json",
+    decision = FinalTranslationDecision.model_validate_json(
+        blob_store.read_bytes(job_path(job, "decisions", "translation.json"))
     )
-    prompt_path = job_path(
-        job,
-        "memory",
-        "prompt-evolution",
-        "prompt-evolution-consolidation-batch-translation_adjudication-job-replay-happy.json",
+    investigation = json.loads(
+        blob_store.read_bytes(job_path(job, "investigations", "translation.json")).decode("utf-8")
     )
 
-    assert _normalize_scorecard(_load_json(first_blob_store, scorecard_path)) == (
-        _normalize_scorecard(_load_json(second_blob_store, scorecard_path))
-    )
-    assert _load_json(first_blob_store, consolidation_path) == _load_json(
-        second_blob_store,
-        consolidation_path,
-    )
-    assert _load_json(first_blob_store, prompt_path) == _load_json(second_blob_store, prompt_path)
-
-
-def test_replay_translation_failure_manifest_is_stable_regression(tmp_path: Path) -> None:
-    job = _job_context(job_id="job-replay-failure")
-    _, first_blob_store = _run_workflow(
-        tmp_path,
-        run_id="run-failure-a",
-        scenario="translation_failed",
-        job=job,
-    )
-    _, second_blob_store = _run_workflow(
-        tmp_path,
-        run_id="run-failure-b",
-        scenario="translation_failed",
-        job=job,
+    assert final_state.human_review_required is True
+    assert decision.decision_mode == "human_review"
+    assert decision.disagreement_bucket == "unresolved"
+    assert investigation["status"] == "timed_out"
+    assert any(
+        fact.fact_type == "investigation_timeout" and fact.value == "conflict_investigator"
+        for fact in final_state.routing_facts
     )
 
-    failure_path = job_path(job, "published", "translation-failed.json")
-    assert _normalize_failure_manifest(_load_json(first_blob_store, failure_path)) == (
-        _normalize_failure_manifest(_load_json(second_blob_store, failure_path))
+
+def test_phase_six_missing_blob_fetch_emits_node_failed_trace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job = _job_context(job_id="job-missing-blob")
+    run_store = InMemoryRunStore()
+    run_store.create_run(run_id="run-missing-blob", status="running")
+    blob_store = LocalBlobStore(tmp_path / "blobs")
+    source_ref = "jobs/run-missing-blob-request.json"
+    blob_store.put_bytes(source_ref, b"{}\n")
+    trace_path = tmp_path / "missing-blob.jsonl"
+
+    def fail_read_model_artifact(*args, **kwargs):  # noqa: ANN002, ANN003
+        raise FileNotFoundError("missing blob fetch")
+
+    monkeypatch.setattr(
+        "translation_agent.nodes.transcription.read_model_artifact",
+        fail_read_model_artifact,
+    )
+
+    with JsonlTraceSink(trace_path) as trace_sink:
+        runtime = build_phase_two_runtime(
+            blob_store=blob_store,
+            run_store=run_store,
+            trace_sink=trace_sink,
+            source_artifact_ref=source_ref,
+            scenario="happy",
+        )
+        initial_state = GraphState(
+            run_id="run-missing-blob",
+            job=job,
+            current_stage="ingest",
+            source_video_ref="input.mp4",
+            source_artifact_ref=source_ref,
+        )
+        with pytest.raises(FileNotFoundError, match="missing blob fetch"):
+            run_workflow(initial_state, runtime)
+
+    records = [
+        json.loads(line)
+        for line in trace_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert any(
+        record["name"] == "node.failed"
+        and record["attributes"]["node_name"] == "fanout_transcription"
+        for record in records
     )

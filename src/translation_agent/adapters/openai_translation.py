@@ -21,7 +21,7 @@ from translation_agent.models import (
     TranscriptCandidate,
     TranslationCandidate,
 )
-from translation_agent.storage import BlobStore
+from translation_agent.storage import BlobStore, job_path
 
 
 class OpenAITranslationAdapter:
@@ -62,8 +62,11 @@ class OpenAITranslationAdapter:
             retry_policy=self._retry_policy,
             sleep=self._sleep,
         )
-        raw_response_ref = (
-            f"raw/provider-payloads/{request_context.job.job_id}/openai-{prompt_variant_id}.json"
+        raw_response_ref = job_path(
+            request_context.job,
+            "raw",
+            "provider-payloads",
+            f"openai-{prompt_variant_id}.json",
         )
         self._blob_store.put_bytes(
             raw_response_ref,

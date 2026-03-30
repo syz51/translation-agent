@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel
@@ -21,6 +22,7 @@ from translation_agent.nodes.review import review_transcripts, review_translatio
 from translation_agent.nodes.transcription import fanout_transcription
 from translation_agent.nodes.translate import generate_translation_candidates
 from translation_agent.observability import TraceEvent
+from translation_agent.storage import job_path
 
 NodeFn = Callable[[GraphState, WorkflowRuntime], dict[str, object]]
 
@@ -108,7 +110,9 @@ def run_workflow(initial_state: GraphState, runtime: WorkflowRuntime) -> GraphSt
 
     compiled = build_workflow_graph(runtime)
     result = compiled.invoke(initial_state)
-    return GraphState.model_validate(result)
+    final_state = GraphState.model_validate(result)
+    _sync_trace_artifact(final_state, runtime)
+    return final_state
 
 
 def _instrumented_node(name: str, runtime: WorkflowRuntime, node_fn: NodeFn):
@@ -174,3 +178,13 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, dict):
         return {key: _json_safe(item) for key, item in value.items()}
     return value
+
+
+def _sync_trace_artifact(state: GraphState, runtime: WorkflowRuntime) -> None:
+    trace_path = getattr(runtime.trace_sink, "path", None)
+    if trace_path is None:
+        return
+    trace_ref = job_path(state.job, "traces", f"{state.run_id}.jsonl")
+    if trace_ref not in state.published_artifact_refs:
+        return
+    runtime.blob_store.put_bytes(trace_ref, Path(trace_path).read_bytes())

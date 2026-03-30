@@ -50,10 +50,10 @@ def background_memory_pipeline(state: GraphState, runtime: WorkflowRuntime) -> d
     consolidation = runtime.memory_consolidation_backend.consolidate_batch(batch)
     batch = batch.model_copy(update={"consolidation_status": "consolidated"})
     runtime.memory_batch_store.save_batch(batch)
-    batch_ref = write_model_artifact(runtime, memory_batch_key(batch.batch_id), batch)
+    batch_ref = write_model_artifact(runtime, memory_batch_key(state.job, batch.batch_id), batch)
     consolidation_ref = write_model_artifact(
         runtime,
-        memory_consolidation_key(consolidation.consolidation_id),
+        memory_consolidation_key(state.job, consolidation.consolidation_id),
         consolidation,
     )
     proposal = runtime.prompt_evolution_backend.propose_prompt_evolution(
@@ -69,7 +69,7 @@ def background_memory_pipeline(state: GraphState, runtime: WorkflowRuntime) -> d
     if proposal is not None:
         proposal_ref = write_model_artifact(
             runtime,
-            prompt_evolution_key(proposal.proposal_id),
+            prompt_evolution_key(state.job, proposal.proposal_id),
             proposal,
         )
 

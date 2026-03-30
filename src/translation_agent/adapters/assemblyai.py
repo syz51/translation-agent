@@ -17,7 +17,7 @@ from translation_agent.adapters.common import (
     poll_until_complete,
 )
 from translation_agent.models import AudioArtifact, RequestContext, Segment, TranscriptCandidate
-from translation_agent.storage import BlobStore
+from translation_agent.storage import BlobStore, job_path
 
 JsonFetcher = Callable[[str], dict[str, Any]]
 
@@ -79,8 +79,11 @@ class AssemblyAITranscriptionAdapter:
             retry_policy=self._retry_policy,
             sleep=self._sleep,
         )
-        raw_payload_ref = (
-            f"raw/provider-payloads/{request_context.job.job_id}/{self.provider_id}.json"
+        raw_payload_ref = job_path(
+            request_context.job,
+            "raw",
+            "provider-payloads",
+            f"{self.provider_id}.json",
         )
         self._store_raw_payload(raw_payload_ref, final_payload)
         return _candidate_from_payload(

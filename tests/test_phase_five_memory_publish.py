@@ -27,7 +27,7 @@ from translation_agent.models import (
     MemoryWriteBatch,
 )
 from translation_agent.observability import NoOpTraceSink
-from translation_agent.storage import LocalBlobStore, NodeExecutionRecord, RunRecord
+from translation_agent.storage import LocalBlobStore, NodeExecutionRecord, RunRecord, job_path
 
 pytestmark = pytest.mark.unit
 
@@ -172,6 +172,10 @@ def _job_context(job_id: str = "job-phase-five") -> JobContext:
     )
 
 
+def _artifact_path(*parts: str) -> str:
+    return job_path(_job_context(), *parts)
+
+
 def _run_workflow(
     tmp_path: Path,
     *,
@@ -203,25 +207,35 @@ def _run_workflow(
 def test_phase_five_happy_path_publishes_audit_ready_outputs(tmp_path: Path) -> None:
     final_state, runtime, blob_store = _run_workflow(tmp_path, scenario="happy")
 
-    assert blob_store.exists("published/job-phase-five/scorecard.json")
-    assert blob_store.exists("exports/job-phase-five.txt")
-    assert blob_store.exists("exports/job-phase-five.json")
-    assert blob_store.exists("deliveries/job-phase-five.json")
+    assert blob_store.exists(_artifact_path("published", "scorecard.json"))
+    assert blob_store.exists(_artifact_path("exports", "translation.txt"))
+    assert blob_store.exists(_artifact_path("exports", "translation.json"))
+    assert blob_store.exists(_artifact_path("deliveries", "translation.json"))
     assert blob_store.exists(
-        "memory/consolidations/consolidation-batch-translation_adjudication-job-phase-five.json"
+        _artifact_path(
+            "memory",
+            "consolidations",
+            "consolidation-batch-translation_adjudication-job-phase-five.json",
+        )
     )
     assert blob_store.exists(
-        "memory/prompt-evolution/"
-        "prompt-evolution-consolidation-batch-translation_adjudication-job-phase-five.json"
+        _artifact_path(
+            "memory",
+            "prompt-evolution",
+            "prompt-evolution-consolidation-batch-translation_adjudication-job-phase-five.json",
+        )
     )
 
     scorecard = json.loads(
-        blob_store.read_bytes("published/job-phase-five/scorecard.json").decode("utf-8")
+        blob_store.read_bytes(_artifact_path("published", "scorecard.json")).decode("utf-8")
     )
     prompt_proposal = json.loads(
         blob_store.read_bytes(
-            "memory/prompt-evolution/"
-            "prompt-evolution-consolidation-batch-translation_adjudication-job-phase-five.json"
+            _artifact_path(
+                "memory",
+                "prompt-evolution",
+                "prompt-evolution-consolidation-batch-translation_adjudication-job-phase-five.json",
+            )
         ).decode("utf-8")
     )
 
@@ -231,21 +245,22 @@ def test_phase_five_happy_path_publishes_audit_ready_outputs(tmp_path: Path) -> 
     assert scorecard["prompt_evolution_refs"]
     assert prompt_proposal["target_model_id"] == runtime.translation_adapter.model_id
     assert prompt_proposal["auto_activate"] is True
-    assert any("memory/prompt-evolution/" in ref for ref in final_state.published_artifact_refs)
+    assert any("/memory/prompt-evolution/" in ref for ref in final_state.published_artifact_refs)
 
 
 def test_phase_five_translation_failure_publishes_recoverable_manifest(tmp_path: Path) -> None:
     _, _, blob_store = _run_workflow(tmp_path, scenario="translation_failed")
 
-    assert blob_store.exists("published/job-phase-five/translation-failed.json")
-    assert not blob_store.exists("published/job-phase-five/translation.json")
+    assert blob_store.exists(_artifact_path("published", "translation-failed.json"))
+    assert not blob_store.exists(_artifact_path("published", "translation.json"))
 
     scorecard = json.loads(
-        blob_store.read_bytes("published/job-phase-five/scorecard.json").decode("utf-8")
+        blob_store.read_bytes(_artifact_path("published", "scorecard.json")).decode("utf-8")
     )
     assert scorecard["translation_failed"] is True
-    assert (
-        scorecard["translation_failure_ref"] == "published/job-phase-five/translation-failed.json"
+    assert scorecard["translation_failure_ref"] == _artifact_path(
+        "published",
+        "translation-failed.json",
     )
 
 
@@ -344,3 +359,65 @@ def test_phase_five_prompt_evolution_uses_runtime_model_selection() -> None:
     assert proposal.target_model_id == "openai-generic-model"
     assert proposal.target_prompt_variant_id == "variant-b"
     assert proposal.auto_activate is True
+
+
+@pytest.mark.parametrize("bucket", ["medium", "high"])
+def test_phase_five_prompt_evolution_keeps_higher_disagreement_gated(bucket: str) -> None:
+    backend = DeterministicPromptEvolutionBackend()
+
+    proposal = backend.propose_prompt_evolution(
+        consolidation=MemoryConsolidation(
+            consolidation_id=f"consolidation-{bucket}",
+            batch_id=f"batch-{bucket}",
+            job_id="job-1",
+            source_stage="translation_adjudication",
+            source_disagreement_bucket=bucket,
+            source_translation_model_id="persisted-model",
+            source_prompt_variant_id="variant-a",
+            source_prompt_version="v3",
+            procedural_write_count=1,
+        ),
+        translation_model_id=None,
+        evidence_ref="memory/consolidations/example.json",
+    )
+
+    assert proposal is not None
+    assert proposal.target_model_id == "persisted-model"
+    assert proposal.activation_mode == "approval_required"
+    assert proposal.auto_activate is False
+
+
+def test_phase_five_prompt_evolution_returns_none_without_required_translation_inputs() -> None:
+    backend = DeterministicPromptEvolutionBackend()
+
+    missing_variant = backend.propose_prompt_evolution(
+        consolidation=MemoryConsolidation(
+            consolidation_id="consolidation-missing-variant",
+            batch_id="batch-missing-variant",
+            job_id="job-1",
+            source_stage="translation_adjudication",
+            source_disagreement_bucket="low",
+            source_translation_model_id="persisted-model",
+            source_prompt_variant_id=None,
+            procedural_write_count=1,
+        ),
+        translation_model_id=None,
+        evidence_ref="memory/consolidations/example.json",
+    )
+    non_translation_stage = backend.propose_prompt_evolution(
+        consolidation=MemoryConsolidation(
+            consolidation_id="consolidation-transcript",
+            batch_id="batch-transcript",
+            job_id="job-1",
+            source_stage="transcript_adjudication",
+            source_disagreement_bucket="low",
+            source_translation_model_id="persisted-model",
+            source_prompt_variant_id="variant-a",
+            procedural_write_count=0,
+        ),
+        translation_model_id="runtime-model",
+        evidence_ref="memory/consolidations/example.json",
+    )
+
+    assert missing_variant is None
+    assert non_translation_stage is None

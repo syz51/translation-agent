@@ -40,7 +40,7 @@ from translation_agent.normalization import (
     normalize_translation_candidate,
 )
 from translation_agent.observability import NoOpTraceSink
-from translation_agent.storage import LocalBlobStore, NodeExecutionRecord, RunRecord
+from translation_agent.storage import LocalBlobStore, NodeExecutionRecord, RunRecord, job_path
 
 pytestmark = pytest.mark.unit
 
@@ -210,6 +210,10 @@ def _request_context(job_id: str = "job-phase-three") -> RequestContext:
     )
 
 
+def _artifact_path(*parts: str) -> str:
+    return job_path(_job_context(), *parts)
+
+
 def _audio_artifact(job_id: str = "job-phase-three") -> AudioArtifact:
     return AudioArtifact(
         artifact_id=f"audio-{job_id}",
@@ -242,7 +246,7 @@ def _transcript_candidate(job_id: str = "job-phase-three") -> TranscriptCandidat
         full_text="Hello world",
         speaker_map={"speaker-1": "speaker-1"},
         timing_resolution="segment",
-        raw_payload_ref="raw/provider-payloads/job-phase-three/assemblyai.json",
+        raw_payload_ref=_artifact_path("raw", "provider-payloads", "assemblyai.json"),
         normalization_version="raw",
         metadata={},
     )
@@ -995,7 +999,7 @@ def test_phase_three_normalization_helpers_canonicalize_candidates() -> None:
         ),
         full_text=" Hello   world ",
         speaker_map={" speaker-2 ": " Speaker_2 "},
-        raw_payload_ref=" raw/provider-payloads/job-phase-three/assemblyai.json ",
+        raw_payload_ref=f" {_artifact_path('raw', 'provider-payloads', 'assemblyai.json')} ",
         normalization_version="raw",
         metadata={"provider": "bad-shape"},
     )
@@ -1018,7 +1022,7 @@ def test_phase_three_normalization_helpers_canonicalize_candidates() -> None:
             ),
         ),
         full_text=" Bonjour   le   monde ",
-        raw_response_ref=" raw/provider-payloads/job-phase-three/openai-variant-a.json ",
+        raw_response_ref=f" {_artifact_path('raw', 'provider-payloads', 'openai-variant-a.json')} ",
         normalization_version="raw",
         metadata={"prompt": "bad-shape"},
     )
@@ -1032,7 +1036,7 @@ def test_phase_three_normalization_helpers_canonicalize_candidates() -> None:
     assert normalized_transcript.provider_request_id == "req-1"
     assert normalized_transcript.full_text == "Hello world"
     assert normalized_transcript.raw_payload_ref == (
-        "raw/provider-payloads/job-phase-three/assemblyai.json"
+        _artifact_path("raw", "provider-payloads", "assemblyai.json")
     )
     assert normalized_transcript.segments[0].segment_id == "seg-1"
     assert normalized_transcript.segments[0].speaker == "speaker-2"
@@ -1046,7 +1050,7 @@ def test_phase_three_normalization_helpers_canonicalize_candidates() -> None:
     assert normalized_translation.prompt_version == "phase-3-v1"
     assert normalized_translation.full_text == "Bonjour le monde"
     assert normalized_translation.raw_response_ref == (
-        "raw/provider-payloads/job-phase-three/openai-variant-a.json"
+        _artifact_path("raw", "provider-payloads", "openai-variant-a.json")
     )
     assert normalized_translation.segments[0].segment_id == "seg-1"
     assert normalized_translation.metadata["provider"]["provider_id"] == "openai"
@@ -1298,9 +1302,13 @@ def test_phase_three_runtime_completes_workflow_with_real_adapters(tmp_path: Pat
     assert final_state.current_stage == "finalize_outputs"
     assert final_state.translation_failed is False
     assert final_state.final_translation_candidate_id is not None
-    assert blob_store.exists("raw/provider-payloads/job-phase-three/assemblyai.json")
-    assert blob_store.exists("raw/provider-payloads/job-phase-three/speechmatics.json")
-    assert blob_store.exists("raw/provider-payloads/job-phase-three/deepgram.json")
-    assert blob_store.exists("raw/provider-payloads/job-phase-three/openai-variant-a.json")
-    assert blob_store.exists("candidates/transcripts/tr-assemblyai-job-phase-three.json")
-    assert blob_store.exists("candidates/translations/tl-variant-a-job-phase-three.json")
+    assert blob_store.exists(_artifact_path("raw", "provider-payloads", "assemblyai.json"))
+    assert blob_store.exists(_artifact_path("raw", "provider-payloads", "speechmatics.json"))
+    assert blob_store.exists(_artifact_path("raw", "provider-payloads", "deepgram.json"))
+    assert blob_store.exists(_artifact_path("raw", "provider-payloads", "openai-variant-a.json"))
+    assert blob_store.exists(
+        _artifact_path("candidates", "transcripts", "tr-assemblyai-job-phase-three.json")
+    )
+    assert blob_store.exists(
+        _artifact_path("candidates", "translations", "tl-variant-a-job-phase-three.json")
+    )

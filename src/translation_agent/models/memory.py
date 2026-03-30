@@ -70,6 +70,7 @@ class MemoryWriteBatch(ContractModel):
     decision_mode: str | None = None
     decision_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
     disagreement_bucket: str | None = None
+    translation_model_winner: str | None = None
     prompt_variant_winner: str | None = None
     prompt_version_winner: str | None = None
     semantic_writes: tuple[MemoryWrite, ...] = ()
@@ -90,6 +91,7 @@ class MemoryConsolidation(ContractModel):
     source_decision_ref: str | None = None
     source_decision_mode: str | None = None
     source_disagreement_bucket: str | None = None
+    source_translation_model_id: str | None = None
     source_prompt_variant_id: str | None = None
     source_prompt_version: str | None = None
     semantic_memory_ids: tuple[str, ...] = ()

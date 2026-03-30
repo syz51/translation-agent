@@ -91,6 +91,9 @@ class DeterministicMemoryStagingBackend:
             decision_mode=decision.decision_mode,
             decision_confidence=decision.decision_confidence,
             disagreement_bucket=decision.disagreement_bucket,
+            translation_model_winner=(
+                decision.winner_model_id if isinstance(decision, FinalTranslationDecision) else None
+            ),
             prompt_variant_winner=(
                 decision.prompt_variant_winner
                 if isinstance(decision, FinalTranslationDecision)

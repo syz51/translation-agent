@@ -99,60 +99,76 @@ def run_job(request: RunJobRequest, settings: Settings | None = None) -> RunJobR
     trace_path = trace_dir / f"{run_id}.jsonl"
     with JsonlTraceSink(trace_path) as trace_sink:
         runtime_run_store = PostgresRunStore(state_db_dsn)
-        runtime = build_runtime(
-            settings=settings,
-            blob_store=blob_store,
-            run_store=runtime_run_store,
-            trace_sink=trace_sink,
-            source_artifact_ref=manifest_entry.key,
-            scenario=request.metadata.get("scenario", "happy"),
-        )
-        trace_sink.record(
-            TraceEvent(
-                run_id=run_id,
-                name="run.bootstrapped",
-                attributes={
-                    "job_id": job_id,
-                    "source": request.source,
-                    "artifact_ref": manifest_entry.key,
-                },
-            )
-        )
-        initial_state = GraphState(
-            run_id=run_id,
-            job=job,
-            current_stage="ingest",
-            source_video_ref=request.source,
-            source_artifact_ref=manifest_entry.key,
-        )
-        runtime.run_store.update_run(run_id, status="running")
-        trace_sink.record(
-            TraceEvent(
-                run_id=run_id,
-                name="run.started",
-                attributes={"job_id": job_id, "scenario": runtime.scenario},
-            )
-        )
+        runtime = None
         try:
+            runtime = build_runtime(
+                settings=settings,
+                blob_store=blob_store,
+                run_store=runtime_run_store,
+                trace_sink=trace_sink,
+                source_artifact_ref=manifest_entry.key,
+                scenario=request.metadata.get("scenario", "happy"),
+            )
+            trace_sink.record(
+                TraceEvent(
+                    run_id=run_id,
+                    name="run.bootstrapped",
+                    attributes={
+                        "job_id": job_id,
+                        "source": request.source,
+                        "artifact_ref": manifest_entry.key,
+                    },
+                )
+            )
+            initial_state = GraphState(
+                run_id=run_id,
+                job=job,
+                current_stage="ingest",
+                source_video_ref=request.source,
+                source_artifact_ref=manifest_entry.key,
+            )
+            runtime.run_store.update_run(run_id, status="running")
+            trace_sink.record(
+                TraceEvent(
+                    run_id=run_id,
+                    name="run.started",
+                    attributes={"job_id": job_id, "scenario": runtime.scenario},
+                )
+            )
             final_state = run_workflow(initial_state, runtime)
         except Exception as exc:
-            runtime.run_store.update_run(
+            runtime_run_store.update_run(
                 run_id,
                 status="failed",
+                output_data={"final_stage": "bootstrap" if runtime is None else None},
                 error={"message": str(exc)},
             )
             trace_sink.record(
                 TraceEvent(
                     run_id=run_id,
                     name="run.failed",
-                    attributes={"error": str(exc)},
+                    attributes={
+                        "error": str(exc),
+                        "phase": "bootstrap" if runtime is None else "run",
+                    },
                 )
+            )
+            log_structured_event(
+                logger,
+                "run.failed",
+                level="error",
+                run_id=run_id,
+                job_id=job_id,
+                source=request.source,
+                artifact_ref=manifest_entry.key,
+                error=str(exc),
+                trace_path=str(trace_path),
             )
             runtime_run_store.close()
             raise
 
         final_status = _final_status(final_state)
-        runtime.run_store.update_run(
+        runtime_run_store.update_run(
             run_id,
             status=final_status,
             output_data={

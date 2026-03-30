@@ -23,7 +23,11 @@ def normalize_transcripts(state: GraphState, runtime: WorkflowRuntime) -> dict[s
         candidate = read_model_artifact(runtime, raw_ref, TranscriptCandidate)
         normalized = normalized_transcript(candidate)
         runtime.decision_store.save_transcript_candidate(normalized)
-        write_model_artifact(runtime, transcript_candidate_key(normalized.candidate_id), normalized)
+        write_model_artifact(
+            runtime,
+            transcript_candidate_key(state.job, normalized.candidate_id),
+            normalized,
+        )
         candidates.append(normalized)
 
     if not candidates:
@@ -38,7 +42,7 @@ def normalize_transcripts(state: GraphState, runtime: WorkflowRuntime) -> dict[s
                 stage="normalize_transcripts",
                 fact_type="surviving_transcript_candidates",
                 value=str(len(candidates)),
-                source_ref=transcript_candidate_key(candidates[0].candidate_id),
+                source_ref=transcript_candidate_key(state.job, candidates[0].candidate_id),
             ),
         ),
     }
@@ -52,7 +56,7 @@ def normalize_translations(state: GraphState, runtime: WorkflowRuntime) -> dict[
         candidate = read_model_artifact(runtime, raw_ref, TranslationCandidate)
         normalized = normalized_translation(candidate)
         runtime.decision_store.save_translation_candidate(normalized)
-        candidate_key = translation_candidate_key(normalized.candidate_id)
+        candidate_key = translation_candidate_key(state.job, normalized.candidate_id)
         write_model_artifact(runtime, candidate_key, normalized)
         candidates.append(normalized)
 
@@ -66,7 +70,9 @@ def normalize_translations(state: GraphState, runtime: WorkflowRuntime) -> dict[
                 fact_type="surviving_translation_candidates",
                 value=str(len(candidates)),
                 source_ref=(
-                    translation_candidate_key(candidates[0].candidate_id) if candidates else None
+                    translation_candidate_key(state.job, candidates[0].candidate_id)
+                    if candidates
+                    else None
                 ),
             ),
         ),

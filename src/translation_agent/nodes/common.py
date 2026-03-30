@@ -12,6 +12,7 @@ from pydantic import BaseModel
 from translation_agent.graph.runtime import WorkflowRuntime, runtime_metadata
 from translation_agent.graph.state import GraphState, RoutingFact
 from translation_agent.models import (
+    JobContext,
     MemoryQuery,
     RequestContext,
     ReviewBundle,
@@ -22,6 +23,7 @@ from translation_agent.normalization import (
     normalize_transcript_candidate,
     normalize_translation_candidate,
 )
+from translation_agent.storage import job_path
 
 TRANSCRIPT_REVIEW_STAGE = "transcript"
 TRANSLATION_REVIEW_STAGE = "translation"
@@ -109,76 +111,76 @@ def read_model_artifact[ModelT: BaseModel](
     return model_type.model_validate_json(runtime.blob_store.read_bytes(key))
 
 
-def transcript_candidate_key(candidate_id: str) -> str:
-    return f"candidates/transcripts/{candidate_id}.json"
+def transcript_candidate_key(job: JobContext, candidate_id: str) -> str:
+    return job_path(job, "candidates", "transcripts", f"{candidate_id}.json")
 
 
-def raw_transcript_candidate_key(job_id: str, provider_id: str) -> str:
-    return f"raw/transcript-candidates/{job_id}/{provider_id}.json"
+def raw_transcript_candidate_key(job: JobContext, provider_id: str) -> str:
+    return job_path(job, "raw", "transcript-candidates", f"{provider_id}.json")
 
 
-def translation_candidate_key(candidate_id: str) -> str:
-    return f"candidates/translations/{candidate_id}.json"
+def translation_candidate_key(job: JobContext, candidate_id: str) -> str:
+    return job_path(job, "candidates", "translations", f"{candidate_id}.json")
 
 
-def raw_translation_candidate_key(job_id: str, prompt_variant_id: str) -> str:
-    return f"raw/translation-candidates/{job_id}/{prompt_variant_id}.json"
+def raw_translation_candidate_key(job: JobContext, prompt_variant_id: str) -> str:
+    return job_path(job, "raw", "translation-candidates", f"{prompt_variant_id}.json")
 
 
-def staged_transcript_candidate_key(candidate_id: str) -> str:
-    return f"staging/transcripts/{candidate_id}.json"
+def staged_transcript_candidate_key(job: JobContext, candidate_id: str) -> str:
+    return job_path(job, "staging", "transcripts", f"{candidate_id}.json")
 
 
-def staged_translation_candidate_key(candidate_id: str) -> str:
-    return f"staging/translations/{candidate_id}.json"
+def staged_translation_candidate_key(job: JobContext, candidate_id: str) -> str:
+    return job_path(job, "staging", "translations", f"{candidate_id}.json")
 
 
-def transcript_review_key(review_id: str) -> str:
-    return f"reviews/transcript/{review_id}.json"
+def transcript_review_key(job: JobContext, review_id: str) -> str:
+    return job_path(job, "reviews", "transcript", f"{review_id}.json")
 
 
-def translation_review_key(review_id: str) -> str:
-    return f"reviews/translation/{review_id}.json"
+def translation_review_key(job: JobContext, review_id: str) -> str:
+    return job_path(job, "reviews", "translation", f"{review_id}.json")
 
 
-def transcript_decision_key(job_id: str) -> str:
-    return f"decisions/transcript/{job_id}.json"
+def transcript_decision_key(job: JobContext) -> str:
+    return job_path(job, "decisions", "transcript.json")
 
 
-def translation_decision_key(job_id: str) -> str:
-    return f"decisions/translation/{job_id}.json"
+def translation_decision_key(job: JobContext) -> str:
+    return job_path(job, "decisions", "translation.json")
 
 
-def transcript_investigation_key(job_id: str) -> str:
-    return f"investigations/transcript/{job_id}.json"
+def transcript_investigation_key(job: JobContext) -> str:
+    return job_path(job, "investigations", "transcript.json")
 
 
-def translation_investigation_key(job_id: str) -> str:
-    return f"investigations/translation/{job_id}.json"
+def translation_investigation_key(job: JobContext) -> str:
+    return job_path(job, "investigations", "translation.json")
 
 
-def memory_batch_key(batch_id: str) -> str:
-    return f"memory/batches/{batch_id}.json"
+def memory_batch_key(job: JobContext, batch_id: str) -> str:
+    return job_path(job, "memory", "batches", f"{batch_id}.json")
 
 
-def memory_consolidation_key(consolidation_id: str) -> str:
-    return f"memory/consolidations/{consolidation_id}.json"
+def memory_consolidation_key(job: JobContext, consolidation_id: str) -> str:
+    return job_path(job, "memory", "consolidations", f"{consolidation_id}.json")
 
 
-def prompt_evolution_key(proposal_id: str) -> str:
-    return f"memory/prompt-evolution/{proposal_id}.json"
+def prompt_evolution_key(job: JobContext, proposal_id: str) -> str:
+    return job_path(job, "memory", "prompt-evolution", f"{proposal_id}.json")
 
 
-def audio_artifact_key(job_id: str) -> str:
-    return f"artifacts/audio/{job_id}.json"
+def audio_artifact_key(job: JobContext) -> str:
+    return job_path(job, "artifacts", "audio.json")
 
 
-def published_artifacts_key(job_id: str) -> str:
-    return f"published/{job_id}/artifacts.json"
+def published_artifacts_key(job: JobContext) -> str:
+    return job_path(job, "published", "artifacts.json")
 
 
-def translation_failure_key(job_id: str) -> str:
-    return f"published/{job_id}/translation-failed.json"
+def translation_failure_key(job: JobContext) -> str:
+    return job_path(job, "published", "translation-failed.json")
 
 
 def select_transcript_candidates(
@@ -213,6 +215,7 @@ def load_reviews(
     runtime: WorkflowRuntime,
     *,
     stage: str,
+    job: JobContext,
     review_ids: tuple[str, ...],
 ) -> tuple[ReviewBundle, ...]:
     """Load review bundles from the blob store."""
@@ -221,7 +224,7 @@ def load_reviews(
         transcript_review_key if stage == TRANSCRIPT_REVIEW_STAGE else translation_review_key
     )
     return tuple(
-        read_model_artifact(runtime, key_factory(review_id), ReviewBundle)
+        read_model_artifact(runtime, key_factory(job, review_id), ReviewBundle)
         for review_id in review_ids
     )
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -13,7 +14,26 @@ from translation_agent.config import (
     validate_environment,
     validate_runtime_compatibility,
 )
-from translation_agent.storage import PostgresRunStore
+from translation_agent.models import JobContext
+from translation_agent.storage import PostgresRunStore, job_path
+
+
+def _job_context(job_id: str = "job-123") -> JobContext:
+    return JobContext(
+        job_id=job_id,
+        tenant_id="tenant-local",
+        project_id="project-local",
+        source_video_ref="input.mp4",
+        target_language="fr",
+        source_language="en",
+        requested_by="system@local",
+        created_at=datetime(2026, 3, 31, 0, 0, tzinfo=UTC),
+        profile_ref="profiles/default",
+    )
+
+
+def _artifact_path(*parts: str) -> Path:
+    return Path(job_path(_job_context(), *parts))
 
 
 @pytest.mark.unit
@@ -192,8 +212,8 @@ def test_run_job_bootstraps_local_artifacts_and_postgres_record(
     assert result.blob_root.exists()
     assert result.trace_path.exists()
     assert (result.blob_root / "jobs" / f"{result.run_id}-request.json").exists()
-    assert (result.blob_root / "published" / "job-123" / "transcript.json").exists()
-    assert (result.blob_root / "published" / "job-123" / "translation.json").exists()
+    assert (result.blob_root / _artifact_path("published", "transcript.json")).exists()
+    assert (result.blob_root / _artifact_path("published", "translation.json")).exists()
     assert result.state_backend == "postgres"
     assert result.state_db_target == sanitize_db_target(migrated_postgres_dsn)
 
@@ -211,6 +231,45 @@ def test_run_job_bootstraps_local_artifacts_and_postgres_record(
     assert record.output_data is not None
     assert record.output_data["final_stage"] == "finalize_outputs"
     assert len(node_executions) == 13
+
+
+@pytest.mark.integration
+def test_run_job_marks_bootstrap_failure_and_emits_failed_trace(
+    migrated_postgres_dsn: str,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("TA_DATA_DIR", str(tmp_path / "runtime"))
+    monkeypatch.setenv("TA_STATE_DB_DSN", migrated_postgres_dsn)
+
+    def fail_build_runtime(**_: object) -> object:
+        raise RuntimeError("bootstrap exploded")
+
+    monkeypatch.setattr("translation_agent.api.build_runtime", fail_build_runtime)
+
+    with pytest.raises(RuntimeError, match="bootstrap exploded"):
+        run_job(RunJobRequest(source="input.mp4", job_id="job-bootstrap-fail"))
+
+    with PostgresRunStore(migrated_postgres_dsn) as store:
+        records = store.list_runs()
+
+    assert len(records) == 1
+    record = records[0]
+    assert record.status == "failed"
+    assert record.error == {"message": "bootstrap exploded"}
+    assert record.output_data == {"final_stage": "bootstrap"}
+
+    trace_files = list((tmp_path / "runtime" / "traces").glob("*.jsonl"))
+    assert len(trace_files) == 1
+    trace_records = [
+        json.loads(line)
+        for line in trace_files[0].read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert any(
+        item["name"] == "run.failed" and item["attributes"]["phase"] == "bootstrap"
+        for item in trace_records
+    )
 
 
 @pytest.mark.integration

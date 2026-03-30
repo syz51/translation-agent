@@ -407,6 +407,21 @@ def test_phase_one_contract_models_reject_invalid_shapes() -> None:
             }
         )
 
+    with pytest.raises(
+        ValidationError,
+        match="only translation prompt proposals can auto-activate",
+    ):
+        PromptEvolutionProposal(
+            proposal_id="proposal-reviewer",
+            job_id="job-1",
+            source_consolidation_id="consolidation-1",
+            prompt_family="reviewer",
+            target_model_id="reviewer-model",
+            activation_mode="auto_activate_eligible",
+            auto_activate=True,
+            rationale="Should never auto-activate reviewer prompts.",
+        )
+
 
 def test_phase_one_protocols_accept_fake_implementations(tmp_path: Path) -> None:
     class FakeExtractor:

@@ -126,5 +126,6 @@ class FinalTranslationDecision(ContractModel):
     adjudication_scorecard: AdjudicationScorecard
     escalated: bool = False
     human_review_required: bool = False
+    winner_model_id: str | None = None
     prompt_variant_winner: str | None = None
     prompt_version_winner: str | None = None

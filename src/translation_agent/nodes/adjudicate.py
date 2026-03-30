@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from translation_agent.graph.runtime import WorkflowRuntime
 from translation_agent.graph.state import GraphState, RoutingFact
 from translation_agent.models import (
@@ -10,6 +12,7 @@ from translation_agent.models import (
     FinalTranscriptDecision,
     FinalTranslationDecision,
 )
+from translation_agent.models.review import DecisionMode, DisagreementBucket
 from translation_agent.nodes.common import (
     TRANSCRIPT_REVIEW_STAGE,
     TRANSLATION_REVIEW_STAGE,
@@ -41,6 +44,7 @@ def adjudicate_transcript(state: GraphState, runtime: WorkflowRuntime) -> dict[s
     reviews = load_reviews(
         runtime,
         stage=TRANSCRIPT_REVIEW_STAGE,
+        job=state.job,
         review_ids=state.transcript_review_ids,
     )
     adjudication_memory = runtime.memory_recall_backend.recall_memory(
@@ -66,7 +70,7 @@ def adjudicate_transcript(state: GraphState, runtime: WorkflowRuntime) -> dict[s
     investigation_ref = _persist_investigation(
         runtime,
         stage=TRANSCRIPT_REVIEW_STAGE,
-        job_id=state.job.job_id,
+        job=state.job,
         payload=outcome.investigation_payload,
     )
     decision = FinalTranscriptDecision(
@@ -89,7 +93,7 @@ def adjudicate_transcript(state: GraphState, runtime: WorkflowRuntime) -> dict[s
     runtime.decision_store.save_transcript_decision(decision)
     decision_ref = write_model_artifact(
         runtime,
-        transcript_decision_key(state.job.job_id),
+        transcript_decision_key(state.job),
         decision,
     )
     return {
@@ -121,6 +125,7 @@ def adjudicate_translation(state: GraphState, runtime: WorkflowRuntime) -> dict[
     reviews = load_reviews(
         runtime,
         stage=TRANSLATION_REVIEW_STAGE,
+        job=state.job,
         review_ids=state.translation_review_ids,
     )
     if not candidates:
@@ -154,7 +159,7 @@ def adjudicate_translation(state: GraphState, runtime: WorkflowRuntime) -> dict[
         runtime.decision_store.save_translation_decision(decision)
         decision_ref = write_model_artifact(
             runtime,
-            translation_decision_key(state.job.job_id),
+            translation_decision_key(state.job),
             decision,
         )
         return {
@@ -196,59 +201,97 @@ def adjudicate_translation(state: GraphState, runtime: WorkflowRuntime) -> dict[
         content_risk_class=content_risk_class_for_scenario(runtime.scenario),
     )
     outcome = adjudicate_reviews(candidates=candidates, reviews=reviews, context=context)
+    timeout_fallback = _translation_timeout_fallback(runtime=runtime, outcome=outcome)
+    winner_candidate_id = (
+        timeout_fallback.winner_candidate_id
+        if timeout_fallback is not None
+        else outcome.winner_candidate_id
+    )
     winner = next(
-        (
-            candidate
-            for candidate in candidates
-            if candidate.candidate_id == outcome.winner_candidate_id
-        ),
+        (candidate for candidate in candidates if candidate.candidate_id == winner_candidate_id),
         None,
     )
     investigation_ref = _persist_investigation(
         runtime,
         stage=TRANSLATION_REVIEW_STAGE,
-        job_id=state.job.job_id,
-        payload=outcome.investigation_payload,
+        job=state.job,
+        payload=(
+            timeout_fallback.investigation_payload
+            if timeout_fallback is not None
+            else outcome.investigation_payload
+        ),
     )
     decision = FinalTranslationDecision(
         job_id=state.job.job_id,
-        winner_candidate_id=outcome.winner_candidate_id,
-        decision_mode=outcome.decision_mode,
-        decision_confidence=outcome.decision_confidence,
-        rationale_summary=outcome.rationale_summary,
+        winner_candidate_id=winner_candidate_id,
+        decision_mode=(
+            timeout_fallback.decision_mode
+            if timeout_fallback is not None
+            else outcome.decision_mode
+        ),
+        decision_confidence=(
+            timeout_fallback.decision_confidence
+            if timeout_fallback is not None
+            else outcome.decision_confidence
+        ),
+        rationale_summary=(
+            timeout_fallback.rationale_summary
+            if timeout_fallback is not None
+            else outcome.rationale_summary
+        ),
         review_refs=state.translation_review_ids,
         investigation_ref=investigation_ref,
-        disagreement_bucket=outcome.disagreement_bucket,
+        disagreement_bucket=(
+            timeout_fallback.disagreement_bucket
+            if timeout_fallback is not None
+            else outcome.disagreement_bucket
+        ),
         adjudication_scorecard=_scorecard(
             outcome=outcome,
             candidate_count=len(candidates),
             content_risk_class=context.content_risk_class,
         ),
-        escalated=outcome.escalated,
-        human_review_required=outcome.human_review_required,
+        escalated=timeout_fallback.escalated if timeout_fallback is not None else outcome.escalated,
+        human_review_required=(
+            timeout_fallback.human_review_required
+            if timeout_fallback is not None
+            else outcome.human_review_required
+        ),
+        winner_model_id=winner.model_id if winner is not None else None,
         prompt_variant_winner=winner.prompt_variant_id if winner is not None else None,
         prompt_version_winner=winner.prompt_version if winner is not None else None,
     )
     runtime.decision_store.save_translation_decision(decision)
     decision_ref = write_model_artifact(
         runtime,
-        translation_decision_key(state.job.job_id),
+        translation_decision_key(state.job),
         decision,
     )
+    timeout_fact = ()
+    if timeout_fallback is not None:
+        timeout_fact = (
+            RoutingFact(
+                stage="adjudicate_translation",
+                fact_type="investigation_timeout",
+                value="conflict_investigator",
+                source_ref=investigation_ref,
+            ),
+        )
     return {
         "current_stage": "adjudicate_translation",
-        "final_translation_candidate_id": outcome.winner_candidate_id,
+        "final_translation_candidate_id": winner_candidate_id,
         "final_translation_decision_ref": decision_ref,
         "pending_memory_source_stage": "translation_adjudication",
         "escalation_pending": decision.escalated,
         "human_review_required": decision.human_review_required,
         "translation_failed": False,
         "routing_facts": state.routing_facts
+        + timeout_fact
         + _routing_facts(
             stage="adjudicate_translation",
             decision_mode=decision.decision_mode,
             decision_ref=decision_ref,
-            disagreement_bucket=outcome.disagreement_bucket,
+            disagreement_bucket=decision.disagreement_bucket,
             investigation_ref=investigation_ref,
         ),
     }
@@ -258,17 +301,57 @@ def _persist_investigation(
     runtime: WorkflowRuntime,
     *,
     stage: str,
-    job_id: str,
+    job,
     payload: dict[str, object] | None,
 ) -> str | None:
     if payload is None:
         return None
     key = (
-        transcript_investigation_key(job_id)
+        transcript_investigation_key(job)
         if stage == TRANSCRIPT_REVIEW_STAGE
-        else translation_investigation_key(job_id)
+        else translation_investigation_key(job)
     )
     return write_model_artifact(runtime, key, payload)
+
+
+@dataclass(frozen=True, slots=True)
+class _TimeoutFallback:
+    decision_mode: DecisionMode
+    winner_candidate_id: str | None
+    decision_confidence: float
+    rationale_summary: str
+    disagreement_bucket: DisagreementBucket
+    escalated: bool
+    human_review_required: bool
+    investigation_payload: dict[str, object]
+
+
+def _translation_timeout_fallback(*, runtime: WorkflowRuntime, outcome) -> _TimeoutFallback | None:
+    if runtime.scenario != "translation_conflict_timeout":
+        return None
+    if outcome.decision_mode != "conflict_investigation":
+        return None
+    investigation_payload = dict(outcome.investigation_payload or {})
+    investigation_payload.update(
+        {
+            "status": "timed_out",
+            "timeout_seconds": 30.0,
+            "fallback_decision_mode": "human_review",
+        }
+    )
+    return _TimeoutFallback(
+        decision_mode="human_review",
+        winner_candidate_id=None,
+        decision_confidence=0.0,
+        rationale_summary=(
+            "Translation conflict investigation timed out after medium disagreement, "
+            "so the run escalated to human review."
+        ),
+        disagreement_bucket="unresolved",
+        escalated=True,
+        human_review_required=True,
+        investigation_payload=investigation_payload,
+    )
 
 
 def _routing_facts(

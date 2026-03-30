@@ -32,7 +32,8 @@ class DeterministicPromptEvolutionBackend:
     ) -> PromptEvolutionProposal | None:
         if consolidation.source_stage != "translation_adjudication":
             return None
-        if translation_model_id is None or consolidation.source_prompt_variant_id is None:
+        resolved_model_id = translation_model_id or consolidation.source_translation_model_id
+        if resolved_model_id is None or consolidation.source_prompt_variant_id is None:
             return None
         activation_mode = (
             "auto_activate_eligible"
@@ -45,7 +46,7 @@ class DeterministicPromptEvolutionBackend:
             job_id=consolidation.job_id,
             source_consolidation_id=consolidation.consolidation_id,
             prompt_family="translation",
-            target_model_id=translation_model_id,
+            target_model_id=resolved_model_id,
             target_prompt_version=target_prompt_version,
             target_prompt_variant_id=consolidation.source_prompt_variant_id,
             activation_mode=activation_mode,

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from uuid import uuid4
+from hashlib import sha256
 
 from translation_agent.graph.runtime import WorkflowRuntime
 from translation_agent.graph.state import GraphState, RoutingFact
@@ -65,7 +65,7 @@ def review_transcripts(state: GraphState, runtime: WorkflowRuntime) -> dict[str,
         )
         for spec in reviewer_roles_for_stage(TRANSCRIPT_REVIEW_STAGE)
     )
-    first_review_ref = transcript_review_key(review_ids[0])
+    first_review_ref = transcript_review_key(state.job, review_ids[0])
     return {
         "current_stage": "review_transcripts",
         "transcript_review_ids": review_ids,
@@ -124,7 +124,7 @@ def review_translations(state: GraphState, runtime: WorkflowRuntime) -> dict[str
         )
         for spec in reviewer_roles_for_stage(TRANSLATION_REVIEW_STAGE)
     )
-    first_review_ref = translation_review_key(review_ids[0])
+    first_review_ref = translation_review_key(state.job, review_ids[0])
     return {
         "current_stage": "review_translations",
         "translation_review_ids": review_ids,
@@ -159,9 +159,9 @@ def _review_stage(
         memory_bundle=memory_bundle,
     )
     candidate_refs = tuple(
-        transcript_candidate_key(candidate.candidate_id)
+        transcript_candidate_key(state.job, candidate.candidate_id)
         if stage == TRANSCRIPT_REVIEW_STAGE
-        else translation_candidate_key(candidate.candidate_id)
+        else translation_candidate_key(state.job, candidate.candidate_id)
         for candidate in candidates
     )
     raw_payload_refs = _raw_payload_refs(stage=stage, candidates=candidates)
@@ -170,7 +170,7 @@ def _review_stage(
         candidate_refs=candidate_refs,
         raw_payload_refs=raw_payload_refs,
         final_transcript_ref=(
-            transcript_candidate_key(final_transcript.candidate_id)
+            transcript_candidate_key(state.job, final_transcript.candidate_id)
             if final_transcript is not None
             else None
         ),
@@ -183,7 +183,12 @@ def _review_stage(
     )
     parsed = parse_reviewer_output(raw_review_text)
     review = ReviewBundle(
-        review_id=_review_id(stage),
+        review_id=_review_id(
+            job=state.job,
+            stage=stage,
+            reviewer_role=reviewer_role,
+            candidate_ids=tuple(candidate.candidate_id for candidate in candidates),
+        ),
         job_id=state.job.job_id,
         stage=stage,
         reviewer_role=reviewer_role,
@@ -204,7 +209,7 @@ def _review_stage(
         escalation_signal=parsed.escalation_signal,
         parser_version=PARSER_VERSION,
     )
-    return _persist_review(runtime, review)
+    return _persist_review(runtime, state.job, review)
 
 
 def _load_final_transcript_candidate(
@@ -223,16 +228,34 @@ def _load_final_transcript_candidate(
     return candidates[0]
 
 
-def _review_id(stage: ReviewStage) -> str:
+def _review_id(
+    *,
+    job,
+    stage: ReviewStage,
+    reviewer_role: str,
+    candidate_ids: tuple[str, ...],
+) -> str:
     prefix = "rev-tr" if stage == TRANSCRIPT_REVIEW_STAGE else "rev-tl"
-    return f"{prefix}-{uuid4().hex}"
+    payload = "|".join(
+        (
+            job.tenant_id,
+            job.project_id,
+            job.job_id,
+            stage,
+            reviewer_role,
+            *candidate_ids,
+        )
+    )
+    digest = sha256(payload.encode("utf-8")).hexdigest()[:12]
+    role_slug = reviewer_role.replace("_", "-")
+    return f"{prefix}-{role_slug}-{digest}"
 
 
-def _persist_review(runtime: WorkflowRuntime, review: ReviewBundle) -> str:
+def _persist_review(runtime: WorkflowRuntime, job, review: ReviewBundle) -> str:
     key = (
-        transcript_review_key(review.review_id)
+        transcript_review_key(job, review.review_id)
         if review.stage == TRANSCRIPT_REVIEW_STAGE
-        else translation_review_key(review.review_id)
+        else translation_review_key(job, review.review_id)
     )
     write_model_artifact(runtime, key, review)
     return review.review_id

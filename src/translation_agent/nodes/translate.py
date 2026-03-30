@@ -68,7 +68,7 @@ def generate_translation_candidates(
             continue
 
         raw_payload_ref = candidate.raw_response_ref or raw_translation_candidate_key(
-            state.job.job_id, prompt_variant_id
+            state.job, prompt_variant_id
         )
         if raw_payload is None:
             raw_payload = candidate.metadata.get("_raw_payload")
@@ -85,7 +85,7 @@ def generate_translation_candidates(
         staged_refs.append(
             write_model_artifact(
                 runtime,
-                staged_translation_candidate_key(staged_candidate.candidate_id),
+                staged_translation_candidate_key(state.job, staged_candidate.candidate_id),
                 staged_candidate,
             )
         )

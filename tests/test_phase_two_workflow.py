@@ -9,7 +9,7 @@ import pytest
 from translation_agent.graph import GraphState, build_phase_two_runtime, run_workflow
 from translation_agent.models import JobContext
 from translation_agent.observability import NoOpTraceSink
-from translation_agent.storage import LocalBlobStore, NodeExecutionRecord, RunRecord
+from translation_agent.storage import LocalBlobStore, NodeExecutionRecord, RunRecord, job_path
 
 pytestmark = pytest.mark.unit
 
@@ -154,6 +154,10 @@ def _job_context(job_id: str = "job-phase-two") -> JobContext:
     )
 
 
+def _artifact_path(*parts: str) -> str:
+    return job_path(_job_context(), *parts)
+
+
 def _run_workflow(
     tmp_path: Path, *, scenario: str
 ) -> tuple[GraphState, InMemoryRunStore, LocalBlobStore]:
@@ -188,8 +192,8 @@ def test_phase_two_happy_path_executes_full_graph(tmp_path: Path) -> None:
     assert final_state.translation_failed is False
     assert len(final_state.memory_batch_ids) == 2
     assert final_state.final_translation_candidate_id is not None
-    assert blob_store.exists("published/job-phase-two/transcript.json")
-    assert blob_store.exists("published/job-phase-two/translation.json")
+    assert blob_store.exists(_artifact_path("published", "transcript.json"))
+    assert blob_store.exists(_artifact_path("published", "translation.json"))
     assert len(run_store.list_node_executions("run-123")) == 13
 
 
@@ -210,7 +214,7 @@ def test_phase_two_single_surviving_translation_variant_still_publishes(tmp_path
 
     assert final_state.translation_failed is False
     assert final_state.final_translation_candidate_id is not None
-    assert blob_store.exists("published/job-phase-two/translation.json")
+    assert blob_store.exists(_artifact_path("published", "translation.json"))
     surviving_translation_counts = [
         fact.value
         for fact in final_state.routing_facts
@@ -225,8 +229,8 @@ def test_phase_two_translation_failure_preserves_transcript_outputs(tmp_path: Pa
     assert final_state.translation_failed is True
     assert final_state.final_translation_candidate_id is None
     assert final_state.final_translation_decision_ref is not None
-    assert blob_store.exists("published/job-phase-two/transcript.json")
-    assert not blob_store.exists("published/job-phase-two/translation.json")
+    assert blob_store.exists(_artifact_path("published", "transcript.json"))
+    assert not blob_store.exists(_artifact_path("published", "translation.json"))
 
 
 def test_phase_two_escalation_skips_translation_path(tmp_path: Path) -> None:
@@ -234,7 +238,7 @@ def test_phase_two_escalation_skips_translation_path(tmp_path: Path) -> None:
 
     assert final_state.human_review_required is True
     assert final_state.final_translation_decision_ref is None
-    assert not blob_store.exists("published/job-phase-two/translation.json")
+    assert not blob_store.exists(_artifact_path("published", "translation.json"))
     executed_nodes = [record.node_name for record in run_store.list_node_executions("run-123")]
     assert "generate_translation_candidates" not in executed_nodes
     assert len(executed_nodes) == 8
@@ -245,8 +249,8 @@ def test_phase_four_medium_disagreement_invokes_conflict_investigator(tmp_path: 
 
     assert final_state.human_review_required is False
     assert final_state.final_translation_candidate_id is not None
-    assert blob_store.exists("published/job-phase-two/translation.json")
-    assert blob_store.exists("investigations/translation/job-phase-two.json")
+    assert blob_store.exists(_artifact_path("published", "translation.json"))
+    assert blob_store.exists(_artifact_path("investigations", "translation.json"))
     assert any(
         fact.fact_type == "decision_mode" and fact.value == "conflict_investigation"
         for fact in final_state.routing_facts
@@ -262,8 +266,8 @@ def test_phase_four_high_risk_invokes_stronger_adjudicator(tmp_path: Path) -> No
 
     assert final_state.human_review_required is False
     assert final_state.final_translation_candidate_id is not None
-    assert blob_store.exists("published/job-phase-two/translation.json")
-    assert blob_store.exists("investigations/translation/job-phase-two.json")
+    assert blob_store.exists(_artifact_path("published", "translation.json"))
+    assert blob_store.exists(_artifact_path("investigations", "translation.json"))
     assert any(
         fact.fact_type == "decision_mode" and fact.value == "stronger_adjudicator"
         for fact in final_state.routing_facts
@@ -282,8 +286,8 @@ def test_phase_four_translation_escalation_uses_stronger_adjudicator(
     assert final_state.human_review_required is False
     assert final_state.final_translation_candidate_id is not None
     assert final_state.final_translation_decision_ref is not None
-    assert blob_store.exists("published/job-phase-two/translation.json")
-    assert blob_store.exists("investigations/translation/job-phase-two.json")
+    assert blob_store.exists(_artifact_path("published", "translation.json"))
+    assert blob_store.exists(_artifact_path("investigations", "translation.json"))
     assert any(
         fact.fact_type == "decision_mode" and fact.value == "stronger_adjudicator"
         for fact in final_state.routing_facts

@@ -39,6 +39,7 @@ class DeterministicMemoryConsolidationBackend:
             source_decision_ref=batch.decision_ref,
             source_decision_mode=batch.decision_mode,
             source_disagreement_bucket=batch.disagreement_bucket,
+            source_translation_model_id=batch.translation_model_winner,
             source_prompt_variant_id=batch.prompt_variant_winner,
             source_prompt_version=batch.prompt_version_winner,
             semantic_memory_ids=semantic_memory_ids,

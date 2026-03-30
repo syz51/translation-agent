@@ -8,6 +8,7 @@ from typing import Any, Protocol, runtime_checkable
 from .blobs import BlobEntry, LocalBlobStore
 from .decisions import DecisionStore
 from .memory_batches import MemoryBatchStore
+from .paths import job_path, job_scope_prefix
 from .runs import NodeExecutionRecord, PostgresRunStore, RunRecord
 
 
@@ -91,4 +92,6 @@ __all__ = [
     "PostgresRunStore",
     "RunRecord",
     "RunStore",
+    "job_path",
+    "job_scope_prefix",
 ]

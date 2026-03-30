@@ -29,7 +29,7 @@ def extract_audio(state: GraphState, runtime: WorkflowRuntime) -> dict[str, obje
             artifact.blob_ref,
             f"stub audio for {state.job.job_id}\n".encode(),
         )
-    metadata_ref = write_model_artifact(runtime, audio_artifact_key(state.job.job_id), artifact)
+    metadata_ref = write_model_artifact(runtime, audio_artifact_key(state.job), artifact)
 
     return {
         "current_stage": "extract_audio",

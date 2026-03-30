@@ -20,9 +20,7 @@ from translation_agent.nodes.common import (
 def fanout_transcription(state: GraphState, runtime: WorkflowRuntime) -> dict[str, object]:
     """Run transcription providers and persist raw payloads plus staged candidates."""
 
-    audio_artifact = read_model_artifact(
-        runtime, audio_artifact_key(state.job.job_id), AudioArtifact
-    )
+    audio_artifact = read_model_artifact(runtime, audio_artifact_key(state.job), AudioArtifact)
     request_context = build_request_context(state, runtime)
     payload_refs: list[str] = []
     staged_refs: list[str] = []
@@ -49,7 +47,7 @@ def fanout_transcription(state: GraphState, runtime: WorkflowRuntime) -> dict[st
             continue
 
         raw_payload_ref = candidate.raw_payload_ref or raw_transcript_candidate_key(
-            state.job.job_id, adapter.provider_id
+            state.job, adapter.provider_id
         )
         if raw_payload is None:
             raw_payload = candidate.metadata.get("_raw_payload")
@@ -66,7 +64,7 @@ def fanout_transcription(state: GraphState, runtime: WorkflowRuntime) -> dict[st
         staged_refs.append(
             write_model_artifact(
                 runtime,
-                staged_transcript_candidate_key(staged_candidate.candidate_id),
+                staged_transcript_candidate_key(state.job, staged_candidate.candidate_id),
                 staged_candidate,
             )
         )

@@ -40,6 +40,10 @@ class TraceSink(Protocol):
 
 
 class NoOpTraceSink:
+    @property
+    def path(self) -> None:
+        return None
+
     def record(self, event: TraceEvent) -> None:
         return None
 
@@ -59,6 +63,10 @@ class JsonlTraceSink:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._handle = self._path.open("a", encoding="utf-8")
         self._lock = Lock()
+
+    @property
+    def path(self) -> Path:
+        return self._path
 
     def record(self, event: TraceEvent) -> None:
         payload = json.dumps(event.to_record(), default=_json_default, sort_keys=True)

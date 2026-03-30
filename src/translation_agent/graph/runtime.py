@@ -46,7 +46,7 @@ from translation_agent.models import (
     TranslationCandidate,
 )
 from translation_agent.observability import TraceSink
-from translation_agent.storage import BlobStore, DecisionStore, MemoryBatchStore, RunStore
+from translation_agent.storage import BlobStore, DecisionStore, MemoryBatchStore, RunStore, job_path
 
 PHASE_TWO_NORMALIZATION_VERSION = "2026-03-30-phase-2"
 PHASE_THREE_NORMALIZATION_VERSION = "2026-03-30-phase-3"
@@ -185,8 +185,11 @@ class FakeTranscriptionAdapter:
             raise RuntimeError(f"simulated transcription failure for {self.provider_id}")
 
         text = _transcript_text_for_provider(self.provider_id, scenario)
-        raw_payload_ref = (
-            f"raw/provider-payloads/{request_context.job.job_id}/{self.provider_id}.json"
+        raw_payload_ref = job_path(
+            request_context.job,
+            "raw",
+            "provider-payloads",
+            f"{self.provider_id}.json",
         )
         self._blob_store.put_bytes(
             raw_payload_ref,
@@ -238,8 +241,11 @@ class FakeTranslationAdapter:
             raise RuntimeError(f"simulated translation failure for {prompt_variant_id}")
 
         text = _translation_text_for_variant(prompt_variant_id, scenario)
-        raw_response_ref = (
-            f"raw/provider-payloads/{request_context.job.job_id}/openai-{prompt_variant_id}.json"
+        raw_response_ref = job_path(
+            request_context.job,
+            "raw",
+            "provider-payloads",
+            f"openai-{prompt_variant_id}.json",
         )
         self._blob_store.put_bytes(
             raw_response_ref,
@@ -500,6 +506,10 @@ def _translation_text_for_variant(prompt_variant_id: str, scenario: str) -> str:
             "variant-b": "Salut tout le monde depuis le workflow.",
         },
         "translation_conflict": {
+            "variant-a": "Bonjour a tous depuis le flux de travail.",
+            "variant-b": "Salut tout le monde depuis le pipeline.",
+        },
+        "translation_conflict_timeout": {
             "variant-a": "Bonjour a tous depuis le flux de travail.",
             "variant-b": "Salut tout le monde depuis le pipeline.",
         },

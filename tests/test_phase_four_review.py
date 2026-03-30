@@ -21,7 +21,7 @@ from translation_agent.models import (
 from translation_agent.models.review import ReviewStage
 from translation_agent.observability import NoOpTraceSink
 from translation_agent.review import adjudicate_reviews, parse_reviewer_output
-from translation_agent.storage import LocalBlobStore, NodeExecutionRecord, RunRecord
+from translation_agent.storage import LocalBlobStore, NodeExecutionRecord, RunRecord, job_path
 
 pytestmark = pytest.mark.unit
 
@@ -164,6 +164,10 @@ def _job_context(job_id: str = "job-phase-four") -> JobContext:
         created_at=datetime(2026, 3, 30, 12, 0, tzinfo=UTC),
         profile_ref="profiles/default",
     )
+
+
+def _artifact_path(*parts: str) -> str:
+    return job_path(_job_context(), *parts)
 
 
 def _run_workflow(
@@ -502,15 +506,15 @@ def test_phase_four_workflow_routes_translation_escalation_to_stronger_adjudicat
     final_state, _, blob_store = _run_workflow(tmp_path, scenario="translation_escalation")
 
     decision = FinalTranslationDecision.model_validate_json(
-        blob_store.read_bytes("decisions/translation/job-phase-four.json")
+        blob_store.read_bytes(_artifact_path("decisions", "translation.json"))
     )
 
     assert final_state.current_stage == "finalize_outputs"
     assert final_state.human_review_required is False
     assert final_state.translation_failed is False
     assert decision.decision_mode == "stronger_adjudicator"
-    assert decision.investigation_ref == "investigations/translation/job-phase-four.json"
-    assert blob_store.exists("investigations/translation/job-phase-four.json")
+    assert decision.investigation_ref == _artifact_path("investigations", "translation.json")
+    assert blob_store.exists(_artifact_path("investigations", "translation.json"))
 
 
 def test_phase_four_workflow_routes_transcript_escalation_to_human_review(
@@ -519,14 +523,14 @@ def test_phase_four_workflow_routes_transcript_escalation_to_human_review(
     final_state, run_store, blob_store = _run_workflow(tmp_path, scenario="transcript_escalation")
 
     decision = FinalTranscriptDecision.model_validate_json(
-        blob_store.read_bytes("decisions/transcript/job-phase-four.json")
+        blob_store.read_bytes(_artifact_path("decisions", "transcript.json"))
     )
 
     assert final_state.human_review_required is True
     assert final_state.final_translation_decision_ref is None
     assert decision.decision_mode == "human_review"
-    assert decision.investigation_ref == "investigations/transcript/job-phase-four.json"
-    assert blob_store.exists("investigations/transcript/job-phase-four.json")
+    assert decision.investigation_ref == _artifact_path("investigations", "transcript.json")
+    assert blob_store.exists(_artifact_path("investigations", "transcript.json"))
     executed_nodes = [
         record.node_name for record in run_store.list_node_executions("run-phase-four")
     ]

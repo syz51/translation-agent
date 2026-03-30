@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 from translation_agent.graph.runtime import WorkflowRuntime
@@ -22,6 +23,7 @@ from translation_agent.nodes.common import (
     translation_failure_key,
     write_model_artifact,
 )
+from translation_agent.storage import job_path
 
 
 def publish_outputs(state: GraphState, runtime: WorkflowRuntime) -> tuple[PublishedArtifacts, str]:
@@ -34,14 +36,14 @@ def publish_outputs(state: GraphState, runtime: WorkflowRuntime) -> tuple[Publis
     translation_failure_ref = None
 
     if transcript is not None:
-        transcript_ref = f"published/{state.job.job_id}/transcript.json"
+        transcript_ref = job_path(state.job, "published", "transcript.json")
         write_model_artifact(runtime, transcript_ref, transcript)
 
     if translation is not None and not state.human_review_required:
-        translation_ref = f"published/{state.job.job_id}/translation.json"
+        translation_ref = job_path(state.job, "published", "translation.json")
         write_model_artifact(runtime, translation_ref, translation)
     elif state.translation_failed:
-        translation_failure_ref = translation_failure_key(state.job.job_id)
+        translation_failure_ref = translation_failure_key(state.job)
         write_model_artifact(
             runtime,
             translation_failure_ref,
@@ -55,14 +57,14 @@ def publish_outputs(state: GraphState, runtime: WorkflowRuntime) -> tuple[Publis
             },
         )
 
-    trace_refs = (f"traces/{state.run_id}.jsonl",)
+    trace_refs = _publish_trace_artifact(state, runtime)
     memory_batch_refs = _refs_for_fact(state, "memory_batch_staged")
     memory_consolidation_refs = _refs_for_fact(state, "memory_batch_consolidated")
     prompt_evolution_refs = _refs_for_fact(state, "translation_prompt_evolution")
 
-    export_text_ref = f"exports/{state.job.job_id}.txt"
-    export_json_ref = f"exports/{state.job.job_id}.json"
-    downstream_ref = f"deliveries/{state.job.job_id}.json"
+    export_text_ref = job_path(state.job, "exports", "translation.txt")
+    export_json_ref = job_path(state.job, "exports", "translation.json")
+    downstream_ref = job_path(state.job, "deliveries", "translation.json")
 
     _write_text(
         runtime,
@@ -96,7 +98,7 @@ def publish_outputs(state: GraphState, runtime: WorkflowRuntime) -> tuple[Publis
         },
     )
 
-    scorecard_ref = f"published/{state.job.job_id}/scorecard.json"
+    scorecard_ref = job_path(state.job, "published", "scorecard.json")
     _write_json(
         runtime,
         scorecard_ref,
@@ -136,9 +138,24 @@ def publish_outputs(state: GraphState, runtime: WorkflowRuntime) -> tuple[Publis
         memory_consolidation_refs=memory_consolidation_refs,
         prompt_evolution_refs=prompt_evolution_refs,
     )
-    manifest_key = published_artifacts_key(state.job.job_id)
+    manifest_key = published_artifacts_key(state.job)
     manifest_ref = write_model_artifact(runtime, manifest_key, artifacts)
     return artifacts, manifest_ref
+
+
+def _publish_trace_artifact(
+    state: GraphState,
+    runtime: WorkflowRuntime,
+) -> tuple[str, ...]:
+    trace_path = getattr(runtime.trace_sink, "path", None)
+    if trace_path is None:
+        return ()
+    path = Path(trace_path)
+    if not path.exists():
+        return ()
+    trace_ref = job_path(state.job, "traces", f"{state.run_id}.jsonl")
+    runtime.blob_store.put_bytes(trace_ref, path.read_bytes())
+    return (trace_ref,)
 
 
 def _final_transcript(state: GraphState, runtime: WorkflowRuntime) -> TranscriptCandidate | None:
