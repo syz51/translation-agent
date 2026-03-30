@@ -1,25 +1,36 @@
-"""Adjudication nodes for the deterministic dry-run workflow."""
+"""Adjudication nodes for deterministic parser-backed review routing."""
 
 from __future__ import annotations
 
 from translation_agent.graph.runtime import WorkflowRuntime
 from translation_agent.graph.state import GraphState, RoutingFact
-from translation_agent.models import FinalTranscriptDecision, FinalTranslationDecision
+from translation_agent.models import (
+    AdjudicationContext,
+    FinalTranscriptDecision,
+    FinalTranslationDecision,
+)
 from translation_agent.nodes.common import (
     TRANSCRIPT_REVIEW_STAGE,
     TRANSLATION_REVIEW_STAGE,
+    build_memory_query,
     load_reviews,
     select_transcript_candidates,
     select_translation_candidates,
     transcript_decision_key,
+    transcript_investigation_key,
     translation_decision_key,
-    translation_sort_key,
+    translation_investigation_key,
     write_model_artifact,
+)
+from translation_agent.review import (
+    adjudicate_reviews,
+    adjudication_memory_bundle,
+    content_risk_class_for_scenario,
 )
 
 
 def adjudicate_transcript(state: GraphState, runtime: WorkflowRuntime) -> dict[str, object]:
-    """Create a deterministic transcript decision from normalized reviews."""
+    """Create a deterministic transcript decision from parsed reviewer bundles."""
 
     candidates = select_transcript_candidates(
         runtime,
@@ -31,57 +42,63 @@ def adjudicate_transcript(state: GraphState, runtime: WorkflowRuntime) -> dict[s
         stage=TRANSCRIPT_REVIEW_STAGE,
         review_ids=state.transcript_review_ids,
     )
-    preferred = _preferred_candidate_id(
-        candidate_ids=tuple(candidate.candidate_id for candidate in candidates),
-        preferred_review_ids=tuple(
-            review.candidate_preferences[0].candidate_id
-            for review in reviews
-            if review.candidate_preferences
-        ),
-        fallback=candidates[0].candidate_id,
+    adjudication_memory = runtime.memory_recall_backend.recall_memory(
+        build_memory_query(
+            state,
+            stage="adjudicate_transcript",
+            candidate_ids=state.transcript_candidate_ids,
+        )
     )
-
-    human_review_required = runtime.scenario == "transcript_escalation"
-    decision_mode = "human_review" if human_review_required else "automatic_finalize"
-    decision_confidence = 0.35 if human_review_required else (0.74 if len(candidates) == 1 else 0.9)
+    context = AdjudicationContext(
+        run_id=state.run_id,
+        stage=TRANSCRIPT_REVIEW_STAGE,
+        job=state.job,
+        candidate_ids=state.transcript_candidate_ids,
+        review_ids=state.transcript_review_ids,
+        memory_bundle=adjudication_memory_bundle(
+            stage=TRANSCRIPT_REVIEW_STAGE,
+            memory_bundle=adjudication_memory,
+        ),
+        content_risk_class=content_risk_class_for_scenario(runtime.scenario),
+    )
+    outcome = adjudicate_reviews(candidates=candidates, reviews=reviews, context=context)
+    investigation_ref = _persist_investigation(
+        runtime,
+        stage=TRANSCRIPT_REVIEW_STAGE,
+        job_id=state.job.job_id,
+        payload=outcome.investigation_payload,
+    )
     decision = FinalTranscriptDecision(
         job_id=state.job.job_id,
-        winner_candidate_id=None if human_review_required else preferred,
-        decision_mode=decision_mode,
-        decision_confidence=decision_confidence,
-        rationale_summary=(
-            "Transcript disagreement stayed unresolved in the dry-run path."
-            if human_review_required
-            else (
-                "Single surviving transcript candidate carried the run."
-                if len(candidates) == 1
-                else "Transcript reviewers aligned on the canonical candidate."
-            )
-        ),
+        winner_candidate_id=outcome.winner_candidate_id,
+        decision_mode=outcome.decision_mode,
+        decision_confidence=outcome.decision_confidence,
+        rationale_summary=outcome.rationale_summary,
         review_refs=state.transcript_review_ids,
-        escalated=human_review_required or len(candidates) == 1,
-        human_review_required=human_review_required,
+        investigation_ref=investigation_ref,
+        escalated=outcome.escalated,
+        human_review_required=outcome.human_review_required,
     )
     runtime.decision_store.save_transcript_decision(decision)
     decision_ref = write_model_artifact(
-        runtime, transcript_decision_key(state.job.job_id), decision
+        runtime,
+        transcript_decision_key(state.job.job_id),
+        decision,
     )
-
     return {
         "current_stage": "adjudicate_transcript",
-        "final_transcript_candidate_id": preferred,
+        "final_transcript_candidate_id": outcome.winner_candidate_id,
         "final_transcript_decision_ref": decision_ref,
         "pending_memory_source_stage": "transcript_adjudication",
         "escalation_pending": decision.escalated,
         "human_review_required": decision.human_review_required,
         "routing_facts": state.routing_facts
-        + (
-            RoutingFact(
-                stage="adjudicate_transcript",
-                fact_type="decision_mode",
-                value=decision.decision_mode,
-                source_ref=decision_ref,
-            ),
+        + _routing_facts(
+            stage="adjudicate_transcript",
+            decision_mode=decision.decision_mode,
+            decision_ref=decision_ref,
+            disagreement_bucket=outcome.disagreement_bucket,
+            investigation_ref=investigation_ref,
         ),
     }
 
@@ -99,100 +116,164 @@ def adjudicate_translation(state: GraphState, runtime: WorkflowRuntime) -> dict[
         stage=TRANSLATION_REVIEW_STAGE,
         review_ids=state.translation_review_ids,
     )
-    human_review_required = runtime.scenario == "translation_escalation"
-
     if not candidates:
         decision = FinalTranslationDecision(
             job_id=state.job.job_id,
             winner_candidate_id=None,
             decision_mode="automatic_finalize",
             decision_confidence=0.0,
-            rationale_summary="All translation variants failed; transcript preserved for recovery.",
+            rationale_summary=(
+                "All translation variants failed; transcript preserved for recovery."
+            ),
             review_refs=(),
             escalated=False,
             human_review_required=False,
             prompt_variant_winner=None,
             prompt_version_winner=None,
         )
-        translation_failed = True
-        winner_candidate_id = None
-    else:
-        preferred = _preferred_candidate_id(
-            candidate_ids=tuple(candidate.candidate_id for candidate in candidates),
-            preferred_review_ids=tuple(
-                review.candidate_preferences[0].candidate_id
-                for review in reviews
-                if review.candidate_preferences
+        runtime.decision_store.save_translation_decision(decision)
+        decision_ref = write_model_artifact(
+            runtime,
+            translation_decision_key(state.job.job_id),
+            decision,
+        )
+        return {
+            "current_stage": "adjudicate_translation",
+            "final_translation_candidate_id": None,
+            "final_translation_decision_ref": decision_ref,
+            "pending_memory_source_stage": "translation_adjudication",
+            "escalation_pending": False,
+            "human_review_required": False,
+            "translation_failed": True,
+            "routing_facts": state.routing_facts
+            + (
+                RoutingFact(
+                    stage="adjudicate_translation",
+                    fact_type="decision_mode",
+                    value=decision.decision_mode,
+                    source_ref=decision_ref,
+                ),
             ),
-            fallback=sorted(candidates, key=translation_sort_key)[0].candidate_id,
-        )
-        winner = next(candidate for candidate in candidates if candidate.candidate_id == preferred)
-        decision_mode = "human_review" if human_review_required else "automatic_finalize"
-        decision_confidence = (
-            0.42 if human_review_required else (0.7 if len(candidates) == 1 else 0.88)
-        )
-        decision = FinalTranslationDecision(
-            job_id=state.job.job_id,
-            winner_candidate_id=None if human_review_required else preferred,
-            decision_mode=decision_mode,
-            decision_confidence=decision_confidence,
-            rationale_summary=(
-                "Translation disagreement stayed unresolved in the dry-run path."
-                if human_review_required
-                else (
-                    "One surviving translation variant remained publishable."
-                    if len(candidates) == 1
-                    else "Translation reviewers aligned on the winning variant."
-                )
-            ),
-            review_refs=state.translation_review_ids,
-            escalated=human_review_required,
-            human_review_required=human_review_required,
-            prompt_variant_winner=None if human_review_required else winner.prompt_variant_id,
-            prompt_version_winner=None if human_review_required else winner.prompt_version,
-        )
-        translation_failed = False
-        winner_candidate_id = preferred
+        }
 
+    adjudication_memory = runtime.memory_recall_backend.recall_memory(
+        build_memory_query(
+            state,
+            stage="adjudicate_translation",
+            candidate_ids=state.translation_candidate_ids,
+        )
+    )
+    context = AdjudicationContext(
+        run_id=state.run_id,
+        stage=TRANSLATION_REVIEW_STAGE,
+        job=state.job,
+        candidate_ids=state.translation_candidate_ids,
+        review_ids=state.translation_review_ids,
+        memory_bundle=adjudication_memory_bundle(
+            stage=TRANSLATION_REVIEW_STAGE,
+            memory_bundle=adjudication_memory,
+        ),
+        content_risk_class=content_risk_class_for_scenario(runtime.scenario),
+    )
+    outcome = adjudicate_reviews(candidates=candidates, reviews=reviews, context=context)
+    winner = next(
+        (
+            candidate
+            for candidate in candidates
+            if candidate.candidate_id == outcome.winner_candidate_id
+        ),
+        None,
+    )
+    investigation_ref = _persist_investigation(
+        runtime,
+        stage=TRANSLATION_REVIEW_STAGE,
+        job_id=state.job.job_id,
+        payload=outcome.investigation_payload,
+    )
+    decision = FinalTranslationDecision(
+        job_id=state.job.job_id,
+        winner_candidate_id=outcome.winner_candidate_id,
+        decision_mode=outcome.decision_mode,
+        decision_confidence=outcome.decision_confidence,
+        rationale_summary=outcome.rationale_summary,
+        review_refs=state.translation_review_ids,
+        investigation_ref=investigation_ref,
+        escalated=outcome.escalated,
+        human_review_required=outcome.human_review_required,
+        prompt_variant_winner=winner.prompt_variant_id if winner is not None else None,
+        prompt_version_winner=winner.prompt_version if winner is not None else None,
+    )
     runtime.decision_store.save_translation_decision(decision)
     decision_ref = write_model_artifact(
-        runtime, translation_decision_key(state.job.job_id), decision
+        runtime,
+        translation_decision_key(state.job.job_id),
+        decision,
     )
-
     return {
         "current_stage": "adjudicate_translation",
-        "final_translation_candidate_id": winner_candidate_id,
+        "final_translation_candidate_id": outcome.winner_candidate_id,
         "final_translation_decision_ref": decision_ref,
         "pending_memory_source_stage": "translation_adjudication",
         "escalation_pending": decision.escalated,
         "human_review_required": decision.human_review_required,
-        "translation_failed": translation_failed,
+        "translation_failed": False,
         "routing_facts": state.routing_facts
-        + (
-            RoutingFact(
-                stage="adjudicate_translation",
-                fact_type="decision_mode",
-                value=decision.decision_mode,
-                source_ref=decision_ref,
-            ),
+        + _routing_facts(
+            stage="adjudicate_translation",
+            decision_mode=decision.decision_mode,
+            decision_ref=decision_ref,
+            disagreement_bucket=outcome.disagreement_bucket,
+            investigation_ref=investigation_ref,
         ),
     }
 
 
-def _preferred_candidate_id(
+def _persist_investigation(
+    runtime: WorkflowRuntime,
     *,
-    candidate_ids: tuple[str, ...],
-    preferred_review_ids: tuple[str, ...],
-    fallback: str,
-) -> str:
-    if not candidate_ids:
-        return fallback
-
-    counts = {candidate_id: 0 for candidate_id in candidate_ids}
-    for candidate_id in preferred_review_ids:
-        if candidate_id in counts:
-            counts[candidate_id] += 1
-    return max(
-        sorted(counts),
-        key=lambda candidate_id: (counts[candidate_id], -len(candidate_id)),
+    stage: str,
+    job_id: str,
+    payload: dict[str, object] | None,
+) -> str | None:
+    if payload is None:
+        return None
+    key = (
+        transcript_investigation_key(job_id)
+        if stage == TRANSCRIPT_REVIEW_STAGE
+        else translation_investigation_key(job_id)
     )
+    return write_model_artifact(runtime, key, payload)
+
+
+def _routing_facts(
+    *,
+    stage: str,
+    decision_mode: str,
+    decision_ref: str,
+    disagreement_bucket: str,
+    investigation_ref: str | None,
+) -> tuple[RoutingFact, ...]:
+    facts = [
+        RoutingFact(
+            stage=stage,
+            fact_type="decision_mode",
+            value=decision_mode,
+            source_ref=decision_ref,
+        ),
+        RoutingFact(
+            stage=stage,
+            fact_type="disagreement_bucket",
+            value=disagreement_bucket,
+            source_ref=decision_ref,
+        ),
+    ]
+    if investigation_ref is not None:
+        facts.append(
+            RoutingFact(
+                stage=stage,
+                fact_type="investigation_ref",
+                value=investigation_ref,
+                source_ref=investigation_ref,
+            )
+        )
+    return tuple(facts)

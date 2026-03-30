@@ -555,14 +555,26 @@ def _transcript_text_for_provider(provider_id: str, scenario: str) -> str:
 
 
 def _translation_text_for_variant(prompt_variant_id: str, scenario: str) -> str:
-    if scenario == "translation_escalation":
-        text_by_variant = {
-            "variant-a": "Bonjour a tous depuis le flux de travail.",
-            "variant-b": "Salut tout le monde depuis le pipeline.",
-        }
-    else:
-        text_by_variant = {
+    text_by_scenario = {
+        "happy": {
             "variant-a": "Bonjour tout le monde depuis le workflow.",
             "variant-b": "Salut tout le monde depuis le workflow.",
-        }
+        },
+        "translation_conflict": {
+            "variant-a": "Bonjour a tous depuis le flux de travail.",
+            "variant-b": "Salut tout le monde depuis le pipeline.",
+        },
+        "translation_high_risk": {
+            "variant-a": "Bonjour a tous depuis le flux de travail.",
+            "variant-b": "Salut tout le monde depuis le pipeline.",
+        },
+        "translation_escalation": {
+            "variant-a": "Bonjour a tous. Le flux de travail annule le sens source.",
+            "variant-b": "Salut, on improvise le pipeline au lieu du workflow.",
+        },
+    }
+    text_by_variant = text_by_scenario.get(
+        scenario,
+        text_by_scenario["happy"],
+    )
     return text_by_variant[prompt_variant_id]

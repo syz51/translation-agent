@@ -149,6 +149,14 @@ def translation_decision_key(job_id: str) -> str:
     return f"decisions/translation/{job_id}.json"
 
 
+def transcript_investigation_key(job_id: str) -> str:
+    return f"investigations/transcript/{job_id}.json"
+
+
+def translation_investigation_key(job_id: str) -> str:
+    return f"investigations/translation/{job_id}.json"
+
+
 def memory_batch_key(batch_id: str) -> str:
     return f"memory/batches/{batch_id}.json"
 
@@ -194,16 +202,16 @@ def load_reviews(
     *,
     stage: str,
     review_ids: tuple[str, ...],
-) -> list[ReviewBundle]:
+) -> tuple[ReviewBundle, ...]:
     """Load review bundles from the blob store."""
 
     key_factory = (
         transcript_review_key if stage == TRANSCRIPT_REVIEW_STAGE else translation_review_key
     )
-    return [
+    return tuple(
         read_model_artifact(runtime, key_factory(review_id), ReviewBundle)
         for review_id in review_ids
-    ]
+    )
 
 
 def transcript_sort_key(candidate: TranscriptCandidate) -> tuple[int, str]:

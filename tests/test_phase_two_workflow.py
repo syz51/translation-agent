@@ -238,3 +238,53 @@ def test_phase_two_escalation_skips_translation_path(tmp_path: Path) -> None:
     executed_nodes = [record.node_name for record in run_store.list_node_executions("run-123")]
     assert "generate_translation_candidates" not in executed_nodes
     assert len(executed_nodes) == 8
+
+
+def test_phase_four_medium_disagreement_invokes_conflict_investigator(tmp_path: Path) -> None:
+    final_state, _, blob_store = _run_workflow(tmp_path, scenario="translation_conflict")
+
+    assert final_state.human_review_required is False
+    assert final_state.final_translation_candidate_id is not None
+    assert blob_store.exists("published/job-phase-two/translation.json")
+    assert blob_store.exists("investigations/translation/job-phase-two.json")
+    assert any(
+        fact.fact_type == "decision_mode" and fact.value == "conflict_investigation"
+        for fact in final_state.routing_facts
+    )
+    assert any(
+        fact.fact_type == "disagreement_bucket" and fact.value == "medium"
+        for fact in final_state.routing_facts
+    )
+
+
+def test_phase_four_high_risk_invokes_stronger_adjudicator(tmp_path: Path) -> None:
+    final_state, _, blob_store = _run_workflow(tmp_path, scenario="translation_high_risk")
+
+    assert final_state.human_review_required is False
+    assert final_state.final_translation_candidate_id is not None
+    assert blob_store.exists("published/job-phase-two/translation.json")
+    assert blob_store.exists("investigations/translation/job-phase-two.json")
+    assert any(
+        fact.fact_type == "decision_mode" and fact.value == "stronger_adjudicator"
+        for fact in final_state.routing_facts
+    )
+    assert any(
+        fact.fact_type == "disagreement_bucket" and fact.value == "high"
+        for fact in final_state.routing_facts
+    )
+
+
+def test_phase_four_translation_escalation_uses_stronger_adjudicator(
+    tmp_path: Path,
+) -> None:
+    final_state, _, blob_store = _run_workflow(tmp_path, scenario="translation_escalation")
+
+    assert final_state.human_review_required is False
+    assert final_state.final_translation_candidate_id is not None
+    assert final_state.final_translation_decision_ref is not None
+    assert blob_store.exists("published/job-phase-two/translation.json")
+    assert blob_store.exists("investigations/translation/job-phase-two.json")
+    assert any(
+        fact.fact_type == "decision_mode" and fact.value == "stronger_adjudicator"
+        for fact in final_state.routing_facts
+    )

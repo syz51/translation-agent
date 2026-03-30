@@ -1,4 +1,4 @@
-"""Review nodes for the deterministic dry-run workflow."""
+"""Review nodes for deterministic prose review and parser-backed bundles."""
 
 from __future__ import annotations
 
@@ -8,33 +8,42 @@ from translation_agent.graph.runtime import WorkflowRuntime
 from translation_agent.graph.state import GraphState, RoutingFact
 from translation_agent.models import (
     CandidatePreference,
-    QuotedEvidence,
     ReviewBundle,
-    SuggestedFix,
+    TranscriptCandidate,
+    TranslationCandidate,
 )
+from translation_agent.models.review import ReviewStage
 from translation_agent.nodes.common import (
     TRANSCRIPT_REVIEW_STAGE,
     TRANSLATION_REVIEW_STAGE,
     build_memory_query,
     select_transcript_candidates,
     select_translation_candidates,
+    transcript_candidate_key,
     transcript_review_key,
-    transcript_sort_key,
+    translation_candidate_key,
     translation_review_key,
-    translation_sort_key,
     write_model_artifact,
+)
+from translation_agent.review import (
+    PARSER_VERSION,
+    build_review_context,
+    build_review_prompt,
+    parse_reviewer_output,
+    render_reviewer_output,
+    reviewer_roles_for_stage,
 )
 
 
 def review_transcripts(state: GraphState, runtime: WorkflowRuntime) -> dict[str, object]:
-    """Produce deterministic transcript review bundles from normalized candidates."""
+    """Generate transcript reviewer prose and persist parsed bundles."""
 
     candidates = select_transcript_candidates(
         runtime,
         job_id=state.job.job_id,
         candidate_ids=state.transcript_candidate_ids,
     )
-    _ = runtime.memory_recall_backend.recall_memory(
+    memory_bundle = runtime.memory_recall_backend.recall_memory(
         build_memory_query(
             state,
             stage="review_transcripts",
@@ -44,78 +53,19 @@ def review_transcripts(state: GraphState, runtime: WorkflowRuntime) -> dict[str,
     if not candidates:
         raise RuntimeError("review_transcripts requires at least one normalized candidate")
 
-    preferred = sorted(candidates, key=transcript_sort_key)[0]
-    review_ids = (
-        _persist_review(
-            runtime,
-            ReviewBundle(
-                review_id=f"rev-tr-{uuid4().hex}",
-                job_id=state.job.job_id,
-                stage=TRANSCRIPT_REVIEW_STAGE,
-                reviewer_role="accuracy_reviewer",
-                candidate_preferences=(
-                    CandidatePreference(
-                        candidate_id=preferred.candidate_id,
-                        rank=1,
-                        rationale="Most stable transcript candidate.",
-                    ),
-                ),
-                confidence=0.91 if len(candidates) > 1 else 0.72,
-                raw_review_text=f"Winner: {preferred.candidate_id}",
-                quoted_evidence=(
-                    QuotedEvidence(
-                        quote=preferred.full_text,
-                        candidate_id=preferred.candidate_id,
-                    ),
-                ),
-                issue_categories=("accuracy",),
-                suggested_fixes=(
-                    SuggestedFix(
-                        issue_category="accuracy",
-                        candidate_id=preferred.candidate_id,
-                        description="Retain deterministic speaker labels.",
-                    ),
-                ),
-                escalation_signal=runtime.scenario == "transcript_escalation",
-                parser_version="phase-2",
-            ),
-        ),
-        _persist_review(
-            runtime,
-            ReviewBundle(
-                review_id=f"rev-tr-{uuid4().hex}",
-                job_id=state.job.job_id,
-                stage=TRANSCRIPT_REVIEW_STAGE,
-                reviewer_role="coherence_reviewer",
-                candidate_preferences=(
-                    CandidatePreference(
-                        candidate_id=preferred.candidate_id,
-                        rank=1,
-                        rationale="Most coherent transcript for dry-run publishing.",
-                    ),
-                ),
-                confidence=0.89 if len(candidates) > 1 else 0.68,
-                raw_review_text=f"Winner: {preferred.candidate_id}",
-                quoted_evidence=(
-                    QuotedEvidence(
-                        quote=preferred.full_text,
-                        candidate_id=preferred.candidate_id,
-                    ),
-                ),
-                issue_categories=("formatting",),
-                suggested_fixes=(
-                    SuggestedFix(
-                        issue_category="formatting",
-                        candidate_id=preferred.candidate_id,
-                        description="Preserve sentence spacing during export.",
-                    ),
-                ),
-                escalation_signal=runtime.scenario == "transcript_escalation",
-                parser_version="phase-2",
-            ),
-        ),
+    review_ids = tuple(
+        _review_stage(
+            state=state,
+            runtime=runtime,
+            stage=TRANSCRIPT_REVIEW_STAGE,
+            reviewer_role=spec.reviewer_role,
+            candidates=candidates,
+            memory_bundle=memory_bundle,
+            final_transcript=None,
+        )
+        for spec in reviewer_roles_for_stage(TRANSCRIPT_REVIEW_STAGE)
     )
-
+    first_review_ref = transcript_review_key(review_ids[0])
     return {
         "current_stage": "review_transcripts",
         "transcript_review_ids": review_ids,
@@ -125,21 +75,21 @@ def review_transcripts(state: GraphState, runtime: WorkflowRuntime) -> dict[str,
                 stage="review_transcripts",
                 fact_type="review_count",
                 value=str(len(review_ids)),
-                source_ref=transcript_review_key(review_ids[0]),
+                source_ref=first_review_ref,
             ),
         ),
     }
 
 
 def review_translations(state: GraphState, runtime: WorkflowRuntime) -> dict[str, object]:
-    """Produce deterministic translation review bundles from normalized candidates."""
+    """Generate translation reviewer prose and persist parsed bundles."""
 
     candidates = select_translation_candidates(
         runtime,
         job_id=state.job.job_id,
         candidate_ids=state.translation_candidate_ids,
     )
-    _ = runtime.memory_recall_backend.recall_memory(
+    memory_bundle = runtime.memory_recall_backend.recall_memory(
         build_memory_query(
             state,
             stage="review_translations",
@@ -161,84 +111,20 @@ def review_translations(state: GraphState, runtime: WorkflowRuntime) -> dict[str
             ),
         }
 
-    ordered_candidates = sorted(candidates, key=translation_sort_key)
-    first = ordered_candidates[0]
-    second = ordered_candidates[-1]
-    disagreement = runtime.scenario == "translation_escalation" and len(ordered_candidates) > 1
-    winning_candidate_id = second.candidate_id if disagreement else first.candidate_id
-    winning_text = second.full_text if disagreement else first.full_text
-
-    review_ids = (
-        _persist_review(
-            runtime,
-            ReviewBundle(
-                review_id=f"rev-tl-{uuid4().hex}",
-                job_id=state.job.job_id,
-                stage=TRANSLATION_REVIEW_STAGE,
-                reviewer_role="faithfulness_reviewer",
-                candidate_preferences=(
-                    CandidatePreference(
-                        candidate_id=first.candidate_id,
-                        rank=1,
-                        rationale="Best preserves the transcript semantics.",
-                    ),
-                ),
-                confidence=0.9 if len(ordered_candidates) > 1 else 0.7,
-                raw_review_text=f"Winner: {first.candidate_id}",
-                quoted_evidence=(
-                    QuotedEvidence(
-                        quote=first.full_text,
-                        candidate_id=first.candidate_id,
-                    ),
-                ),
-                issue_categories=("faithfulness",),
-                suggested_fixes=(
-                    SuggestedFix(
-                        issue_category="faithfulness",
-                        candidate_id=first.candidate_id,
-                        description="Preserve product terminology.",
-                    ),
-                ),
-                escalation_signal=disagreement,
-                parser_version="phase-2",
-            ),
-        ),
-        _persist_review(
-            runtime,
-            ReviewBundle(
-                review_id=f"rev-tl-{uuid4().hex}",
-                job_id=state.job.job_id,
-                stage=TRANSLATION_REVIEW_STAGE,
-                reviewer_role="style_reviewer",
-                candidate_preferences=(
-                    CandidatePreference(
-                        candidate_id=winning_candidate_id,
-                        rank=1,
-                        rationale="Most natural phrasing for the target language.",
-                    ),
-                ),
-                confidence=0.84 if len(ordered_candidates) > 1 else 0.66,
-                raw_review_text=f"Winner: {winning_candidate_id}",
-                quoted_evidence=(
-                    QuotedEvidence(
-                        quote=winning_text,
-                        candidate_id=winning_candidate_id,
-                    ),
-                ),
-                issue_categories=("style",),
-                suggested_fixes=(
-                    SuggestedFix(
-                        issue_category="style",
-                        candidate_id=winning_candidate_id,
-                        description="Keep audience tone consistent.",
-                    ),
-                ),
-                escalation_signal=disagreement,
-                parser_version="phase-2",
-            ),
-        ),
+    final_transcript = _load_final_transcript_candidate(state, runtime)
+    review_ids = tuple(
+        _review_stage(
+            state=state,
+            runtime=runtime,
+            stage=TRANSLATION_REVIEW_STAGE,
+            reviewer_role=spec.reviewer_role,
+            candidates=candidates,
+            memory_bundle=memory_bundle,
+            final_transcript=final_transcript,
+        )
+        for spec in reviewer_roles_for_stage(TRANSLATION_REVIEW_STAGE)
     )
-
+    first_review_ref = translation_review_key(review_ids[0])
     return {
         "current_stage": "review_translations",
         "translation_review_ids": review_ids,
@@ -248,10 +134,98 @@ def review_translations(state: GraphState, runtime: WorkflowRuntime) -> dict[str
                 stage="review_translations",
                 fact_type="review_count",
                 value=str(len(review_ids)),
-                source_ref=translation_review_key(review_ids[0]),
+                source_ref=first_review_ref,
             ),
         ),
     }
+
+
+def _review_stage(
+    *,
+    state: GraphState,
+    runtime: WorkflowRuntime,
+    stage: ReviewStage,
+    reviewer_role: str,
+    candidates: list[TranscriptCandidate] | list[TranslationCandidate],
+    memory_bundle,
+    final_transcript: TranscriptCandidate | None,
+) -> str:
+    review_context = build_review_context(
+        run_id=state.run_id,
+        stage=stage,
+        reviewer_role=reviewer_role,
+        job=state.job,
+        candidate_ids=tuple(candidate.candidate_id for candidate in candidates),
+        memory_bundle=memory_bundle,
+    )
+    candidate_refs = tuple(
+        transcript_candidate_key(candidate.candidate_id)
+        if stage == TRANSCRIPT_REVIEW_STAGE
+        else translation_candidate_key(candidate.candidate_id)
+        for candidate in candidates
+    )
+    raw_payload_refs = _raw_payload_refs(stage=stage, candidates=candidates)
+    prompt_text = build_review_prompt(
+        review_context,
+        candidate_refs=candidate_refs,
+        raw_payload_refs=raw_payload_refs,
+        final_transcript_ref=(
+            transcript_candidate_key(final_transcript.candidate_id)
+            if final_transcript is not None
+            else None
+        ),
+    )
+    raw_review_text = render_reviewer_output(
+        review_context,
+        candidates=candidates,
+        prompt_text=prompt_text,
+        final_transcript=final_transcript,
+    )
+    parsed = parse_reviewer_output(raw_review_text)
+    review = ReviewBundle(
+        review_id=_review_id(stage),
+        job_id=state.job.job_id,
+        stage=stage,
+        reviewer_role=reviewer_role,
+        candidate_preferences=(
+            CandidatePreference(
+                candidate_id=parsed.winner_candidate_id,
+                rank=1,
+                rationale=parsed.why,
+            ),
+        )
+        if parsed.winner_candidate_id is not None
+        else (),
+        confidence=parsed.confidence,
+        raw_review_text=raw_review_text,
+        quoted_evidence=parsed.quoted_evidence,
+        issue_categories=tuple(dict.fromkeys(issue.category for issue in parsed.issues)),
+        suggested_fixes=parsed.suggested_fixes,
+        escalation_signal=parsed.escalation_signal,
+        parser_version=PARSER_VERSION,
+    )
+    return _persist_review(runtime, review)
+
+
+def _load_final_transcript_candidate(
+    state: GraphState,
+    runtime: WorkflowRuntime,
+) -> TranscriptCandidate:
+    if state.final_transcript_candidate_id is None:
+        raise RuntimeError("translation review requires a final transcript candidate")
+    candidates = select_transcript_candidates(
+        runtime,
+        job_id=state.job.job_id,
+        candidate_ids=(state.final_transcript_candidate_id,),
+    )
+    if not candidates:
+        raise RuntimeError("final transcript candidate not found for translation review")
+    return candidates[0]
+
+
+def _review_id(stage: ReviewStage) -> str:
+    prefix = "rev-tr" if stage == TRANSCRIPT_REVIEW_STAGE else "rev-tl"
+    return f"{prefix}-{uuid4().hex}"
 
 
 def _persist_review(runtime: WorkflowRuntime, review: ReviewBundle) -> str:
@@ -262,3 +236,21 @@ def _persist_review(runtime: WorkflowRuntime, review: ReviewBundle) -> str:
     )
     write_model_artifact(runtime, key, review)
     return review.review_id
+
+
+def _raw_payload_refs(
+    *,
+    stage: ReviewStage,
+    candidates: list[TranscriptCandidate] | list[TranslationCandidate],
+) -> tuple[str, ...]:
+    if stage == TRANSCRIPT_REVIEW_STAGE:
+        return tuple(
+            candidate.raw_payload_ref
+            for candidate in candidates
+            if isinstance(candidate, TranscriptCandidate) and candidate.raw_payload_ref is not None
+        )
+    return tuple(
+        candidate.raw_response_ref
+        for candidate in candidates
+        if isinstance(candidate, TranslationCandidate) and candidate.raw_response_ref is not None
+    )
