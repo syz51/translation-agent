@@ -6,6 +6,7 @@ from translation_agent.graph.runtime import WorkflowRuntime
 from translation_agent.graph.state import GraphState, RoutingFact
 from translation_agent.models import (
     AdjudicationContext,
+    AdjudicationScorecard,
     FinalTranscriptDecision,
     FinalTranslationDecision,
 )
@@ -76,6 +77,12 @@ def adjudicate_transcript(state: GraphState, runtime: WorkflowRuntime) -> dict[s
         rationale_summary=outcome.rationale_summary,
         review_refs=state.transcript_review_ids,
         investigation_ref=investigation_ref,
+        disagreement_bucket=outcome.disagreement_bucket,
+        adjudication_scorecard=_scorecard(
+            outcome=outcome,
+            candidate_count=len(candidates),
+            content_risk_class=context.content_risk_class,
+        ),
         escalated=outcome.escalated,
         human_review_required=outcome.human_review_required,
     )
@@ -126,6 +133,19 @@ def adjudicate_translation(state: GraphState, runtime: WorkflowRuntime) -> dict[
                 "All translation variants failed; transcript preserved for recovery."
             ),
             review_refs=(),
+            disagreement_bucket="unresolved",
+            adjudication_scorecard=AdjudicationScorecard(
+                candidate_count=0,
+                preferred_candidate_id=None,
+                average_confidence=0.0,
+                confidence_spread=0.0,
+                contradictory_evidence_count=0,
+                highest_issue_severity="minor",
+                winner_mismatch=False,
+                escalation_signal_count=0,
+                total_score=0.0,
+                content_risk_class="standard",
+            ),
             escalated=False,
             human_review_required=False,
             prompt_variant_winner=None,
@@ -198,6 +218,12 @@ def adjudicate_translation(state: GraphState, runtime: WorkflowRuntime) -> dict[
         rationale_summary=outcome.rationale_summary,
         review_refs=state.translation_review_ids,
         investigation_ref=investigation_ref,
+        disagreement_bucket=outcome.disagreement_bucket,
+        adjudication_scorecard=_scorecard(
+            outcome=outcome,
+            candidate_count=len(candidates),
+            content_risk_class=context.content_risk_class,
+        ),
         escalated=outcome.escalated,
         human_review_required=outcome.human_review_required,
         prompt_variant_winner=winner.prompt_variant_id if winner is not None else None,
@@ -277,3 +303,24 @@ def _routing_facts(
             )
         )
     return tuple(facts)
+
+
+def _scorecard(
+    *,
+    outcome,
+    candidate_count: int,
+    content_risk_class: str,
+) -> AdjudicationScorecard:
+    assessment = outcome.assessment
+    return AdjudicationScorecard(
+        candidate_count=candidate_count,
+        preferred_candidate_id=assessment.preferred_candidate_id,
+        average_confidence=assessment.average_confidence,
+        confidence_spread=assessment.confidence_spread,
+        contradictory_evidence_count=assessment.contradictory_evidence_count,
+        highest_issue_severity=assessment.highest_issue_severity,
+        winner_mismatch=assessment.winner_mismatch,
+        escalation_signal_count=assessment.escalation_signal_count,
+        total_score=assessment.total_score,
+        content_risk_class=content_risk_class,
+    )

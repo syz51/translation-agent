@@ -18,6 +18,7 @@ DecisionMode = Literal[
     "stronger_adjudicator",
     "human_review",
 ]
+DisagreementBucket = Literal["low", "medium", "high", "unresolved"]
 
 
 class CandidatePreference(ContractModel):
@@ -80,6 +81,21 @@ class ReviewBundle(ContractModel):
     parser_version: NonEmptyStr
 
 
+class AdjudicationScorecard(ContractModel):
+    """Structured inputs used to reach an adjudication decision."""
+
+    candidate_count: int = Field(ge=0)
+    preferred_candidate_id: str | None = None
+    average_confidence: float = Field(ge=0.0, le=1.0)
+    confidence_spread: float = Field(ge=0.0, le=1.0)
+    contradictory_evidence_count: int = Field(ge=0)
+    highest_issue_severity: Literal["minor", "major", "critical"]
+    winner_mismatch: bool = False
+    escalation_signal_count: int = Field(ge=0)
+    total_score: float = Field(ge=0.0)
+    content_risk_class: str = "standard"
+
+
 class FinalTranscriptDecision(ContractModel):
     """Deterministic transcript adjudication output."""
 
@@ -90,6 +106,8 @@ class FinalTranscriptDecision(ContractModel):
     rationale_summary: NonEmptyStr
     review_refs: tuple[str, ...] = ()
     investigation_ref: str | None = None
+    disagreement_bucket: DisagreementBucket
+    adjudication_scorecard: AdjudicationScorecard
     escalated: bool = False
     human_review_required: bool = False
 
@@ -104,6 +122,8 @@ class FinalTranslationDecision(ContractModel):
     rationale_summary: NonEmptyStr
     review_refs: tuple[str, ...] = ()
     investigation_ref: str | None = None
+    disagreement_bucket: DisagreementBucket
+    adjudication_scorecard: AdjudicationScorecard
     escalated: bool = False
     human_review_required: bool = False
     prompt_variant_winner: str | None = None

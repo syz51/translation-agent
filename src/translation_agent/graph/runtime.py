@@ -24,17 +24,22 @@ from translation_agent.config import (
     validate_runtime_compatibility,
 )
 from translation_agent.graph._langgraph_compat import ensure_langgraph_runtime_supported
-from translation_agent.memory import MemoryRecallBackend, MemoryStagingBackend
+from translation_agent.memory import (
+    DeterministicMemoryConsolidationBackend,
+    DeterministicMemoryStagingBackend,
+    DeterministicPromptEvolutionBackend,
+    InMemoryLongTermMemoryStore,
+    LongTermMemoryRecallBackend,
+    MemoryConsolidationBackend,
+    MemoryRecallBackend,
+    MemoryStagingBackend,
+    PromptEvolutionBackend,
+)
 from translation_agent.models import (
     AudioArtifact,
     FinalTranscriptDecision,
     FinalTranslationDecision,
-    MemoryBundle,
-    MemoryEntry,
-    MemoryQuery,
-    MemoryWrite,
     MemoryWriteBatch,
-    ProviderCaveat,
     RequestContext,
     Segment,
     TranscriptCandidate,
@@ -62,6 +67,8 @@ class WorkflowRuntime:
     translation_adapter: TranslationAdapter
     memory_recall_backend: MemoryRecallBackend
     memory_staging_backend: MemoryStagingBackend
+    memory_consolidation_backend: MemoryConsolidationBackend
+    prompt_evolution_backend: PromptEvolutionBackend
     source_artifact_ref: str
     scenario: str = DEFAULT_SCENARIO
     adapter_mode: str = "fake"
@@ -269,80 +276,6 @@ class FakeTranslationAdapter:
         )
 
 
-class FakeMemoryRecallBackend:
-    """Dry-run recall backend returning a small deterministic memory slice."""
-
-    def recall_memory(self, query: MemoryQuery) -> MemoryBundle:
-        return MemoryBundle(
-            semantic_memory=(
-                MemoryEntry(
-                    memory_id=f"semantic:{query.stage}:{query.job.project_id}",
-                    kind="semantic",
-                    content="Preserve named entities and product terms.",
-                    source_ref="memory/semantic/dry-run",
-                    score=0.74,
-                ),
-            ),
-            glossary=(
-                MemoryEntry(
-                    memory_id=f"glossary:{query.job.target_language}",
-                    kind="glossary",
-                    content="OpenAI -> OpenAI",
-                    source_ref="memory/glossary/dry-run",
-                ),
-            ),
-            rules=(
-                MemoryEntry(
-                    memory_id=f"rule:{query.stage}",
-                    kind="rule",
-                    content=f"Prefer deterministic dry-run behavior for {query.stage}.",
-                    source_ref="memory/rules/dry-run",
-                ),
-            ),
-            provider_caveats=(
-                ProviderCaveat(
-                    provider_id="speechmatics",
-                    note="The fake provider can be disabled for degraded-path tests.",
-                ),
-            ),
-        )
-
-
-class FakeMemoryStagingBackend:
-    """Dry-run staging backend that emits deterministic memory write batches."""
-
-    def stage_memory_candidates(
-        self,
-        decision: FinalTranscriptDecision | FinalTranslationDecision,
-        *,
-        source_stage: str,
-    ) -> MemoryWriteBatch:
-        summary = decision.rationale_summary
-        semantic_writes: tuple[MemoryWrite, ...] = ()
-        if decision.winner_candidate_id is not None:
-            semantic_writes = (
-                MemoryWrite(
-                    kind="semantic",
-                    content=summary,
-                    source_ref=f"decisions/{source_stage}/{decision.job_id}.json",
-                ),
-            )
-        return MemoryWriteBatch(
-            batch_id=f"batch-{source_stage}-{decision.job_id}",
-            job_id=decision.job_id,
-            source_stage=source_stage,
-            semantic_writes=semantic_writes,
-            episodic_writes=(
-                MemoryWrite(
-                    kind="episodic",
-                    content=summary,
-                    source_ref=f"decisions/{source_stage}/{decision.job_id}.json",
-                ),
-            ),
-            dedupe_keys=(f"{source_stage}:{decision.job_id}",),
-        )
-
-
 def build_phase_two_runtime(
     *,
     blob_store: BlobStore,
@@ -353,6 +286,7 @@ def build_phase_two_runtime(
 ) -> WorkflowRuntime:
     """Construct the default dry-run runtime used by the public entrypoints."""
 
+    memory_store = InMemoryLongTermMemoryStore()
     return WorkflowRuntime(
         blob_store=blob_store,
         run_store=run_store,
@@ -366,8 +300,10 @@ def build_phase_two_runtime(
             FakeTranscriptionAdapter("deepgram", blob_store=blob_store),
         ),
         translation_adapter=FakeTranslationAdapter(blob_store=blob_store),
-        memory_recall_backend=FakeMemoryRecallBackend(),
-        memory_staging_backend=FakeMemoryStagingBackend(),
+        memory_recall_backend=LongTermMemoryRecallBackend(memory_store),
+        memory_staging_backend=DeterministicMemoryStagingBackend(),
+        memory_consolidation_backend=DeterministicMemoryConsolidationBackend(memory_store),
+        prompt_evolution_backend=DeterministicPromptEvolutionBackend(),
         source_artifact_ref=source_artifact_ref,
         scenario=scenario,
         adapter_mode="fake",
@@ -477,6 +413,7 @@ def build_phase_three_runtime(
         retry_policy=retry_policy,
     )
 
+    memory_store = InMemoryLongTermMemoryStore()
     return WorkflowRuntime(
         blob_store=blob_store,
         run_store=run_store,
@@ -486,8 +423,10 @@ def build_phase_three_runtime(
         audio_extractor=audio_extractor,
         transcription_adapters=transcription_adapters,
         translation_adapter=translation_adapter,
-        memory_recall_backend=FakeMemoryRecallBackend(),
-        memory_staging_backend=FakeMemoryStagingBackend(),
+        memory_recall_backend=LongTermMemoryRecallBackend(memory_store),
+        memory_staging_backend=DeterministicMemoryStagingBackend(),
+        memory_consolidation_backend=DeterministicMemoryConsolidationBackend(memory_store),
+        prompt_evolution_backend=DeterministicPromptEvolutionBackend(),
         source_artifact_ref=source_artifact_ref,
         scenario=scenario,
         adapter_mode="real",

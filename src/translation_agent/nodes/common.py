@@ -161,12 +161,24 @@ def memory_batch_key(batch_id: str) -> str:
     return f"memory/batches/{batch_id}.json"
 
 
+def memory_consolidation_key(consolidation_id: str) -> str:
+    return f"memory/consolidations/{consolidation_id}.json"
+
+
+def prompt_evolution_key(proposal_id: str) -> str:
+    return f"memory/prompt-evolution/{proposal_id}.json"
+
+
 def audio_artifact_key(job_id: str) -> str:
     return f"artifacts/audio/{job_id}.json"
 
 
 def published_artifacts_key(job_id: str) -> str:
     return f"published/{job_id}/artifacts.json"
+
+
+def translation_failure_key(job_id: str) -> str:
+    return f"published/{job_id}/translation-failed.json"
 
 
 def select_transcript_candidates(

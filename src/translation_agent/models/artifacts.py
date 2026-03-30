@@ -42,7 +42,11 @@ class PublishedArtifacts(ContractModel):
 
     final_transcript_ref: str | None = None
     final_translation_ref: str | None = None
+    recoverable_translation_failure_ref: str | None = None
     scorecard_refs: tuple[str, ...] = ()
     trace_refs: tuple[str, ...] = ()
     export_refs: tuple[str, ...] = ()
     downstream_delivery_refs: tuple[str, ...] = ()
+    memory_batch_refs: tuple[str, ...] = ()
+    memory_consolidation_refs: tuple[str, ...] = ()
+    prompt_evolution_refs: tuple[str, ...] = ()

@@ -17,7 +17,14 @@ def finalize_outputs(state: GraphState, runtime: WorkflowRuntime) -> dict[str, o
             manifest_ref,
             artifacts.final_transcript_ref,
             artifacts.final_translation_ref,
+            artifacts.recoverable_translation_failure_ref,
             *artifacts.scorecard_refs,
+            *artifacts.trace_refs,
+            *artifacts.export_refs,
+            *artifacts.downstream_delivery_refs,
+            *artifacts.memory_batch_refs,
+            *artifacts.memory_consolidation_refs,
+            *artifacts.prompt_evolution_refs,
         )
         if ref is not None
     )

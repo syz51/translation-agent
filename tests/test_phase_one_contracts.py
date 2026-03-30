@@ -15,16 +15,20 @@ from translation_agent.graph.state import GraphState, RoutingFact
 from translation_agent.memory import MemoryRecallBackend, MemoryStagingBackend
 from translation_agent.models import (
     AdjudicationContext,
+    AdjudicationScorecard,
     AudioArtifact,
     CandidatePreference,
     FinalTranscriptDecision,
     FinalTranslationDecision,
     JobContext,
     MemoryBundle,
+    MemoryConsolidation,
     MemoryEntry,
     MemoryQuery,
     MemoryWrite,
     MemoryWriteBatch,
+    PromptChange,
+    PromptEvolutionProposal,
     ProviderCaveat,
     PublishContext,
     PublishedArtifacts,
@@ -97,6 +101,21 @@ def _memory_bundle() -> MemoryBundle:
         provider_caveats=(
             ProviderCaveat(provider_id="assemblyai", note="Over-splits long pauses."),
         ),
+    )
+
+
+def _scorecard() -> AdjudicationScorecard:
+    return AdjudicationScorecard(
+        candidate_count=2,
+        preferred_candidate_id="tr-1",
+        average_confidence=0.83,
+        confidence_spread=0.08,
+        contradictory_evidence_count=1,
+        highest_issue_severity="major",
+        winner_mismatch=False,
+        escalation_signal_count=0,
+        total_score=1.8,
+        content_risk_class="standard",
     )
 
 
@@ -219,6 +238,8 @@ def test_phase_one_contract_models_round_trip_json() -> None:
         decision_confidence=0.88,
         rationale_summary="Agreement across transcript reviewers.",
         review_refs=("rev-tr-1",),
+        disagreement_bucket="low",
+        adjudication_scorecard=_scorecard(),
     )
     translation_decision = FinalTranslationDecision(
         job_id=job.job_id,
@@ -227,6 +248,10 @@ def test_phase_one_contract_models_round_trip_json() -> None:
         decision_confidence=0.89,
         rationale_summary="Translation reviewers aligned on tone and accuracy.",
         review_refs=(review_bundle.review_id,),
+        disagreement_bucket="low",
+        adjudication_scorecard=_scorecard().model_copy(
+            update={"preferred_candidate_id": translation_candidate.candidate_id}
+        ),
         prompt_variant_winner="variant-a",
         prompt_version_winner="v1",
     )
@@ -234,6 +259,13 @@ def test_phase_one_contract_models_round_trip_json() -> None:
         batch_id="batch-1",
         job_id=job.job_id,
         source_stage="translation_adjudication",
+        decision_ref="decisions/translation/job-123.json",
+        winner_candidate_id=translation_candidate.candidate_id,
+        decision_mode="automatic_finalize",
+        decision_confidence=0.89,
+        disagreement_bucket="low",
+        prompt_variant_winner="variant-a",
+        prompt_version_winner="v1",
         semantic_writes=(
             MemoryWrite(
                 kind="semantic",
@@ -242,6 +274,37 @@ def test_phase_one_contract_models_round_trip_json() -> None:
             ),
         ),
         dedupe_keys=("job-123:greeting",),
+        metadata={"tenant_id": job.tenant_id, "project_id": job.project_id},
+    )
+    consolidation = MemoryConsolidation(
+        consolidation_id="consolidation-1",
+        batch_id=write_batch.batch_id,
+        job_id=job.job_id,
+        source_stage="translation_adjudication",
+        source_decision_ref=write_batch.decision_ref,
+        source_decision_mode=write_batch.decision_mode,
+        source_disagreement_bucket=write_batch.disagreement_bucket,
+        source_prompt_variant_id=write_batch.prompt_variant_winner,
+        source_prompt_version=write_batch.prompt_version_winner,
+        semantic_memory_ids=("semantic:batch-1:1",),
+        episodic_memory_ids=("episodic:batch-1:1",),
+        procedural_write_count=1,
+    )
+    prompt_proposal = PromptEvolutionProposal(
+        proposal_id="proposal-1",
+        job_id=job.job_id,
+        source_consolidation_id=consolidation.consolidation_id,
+        prompt_family="translation",
+        target_model_id="gpt-5.4-mini",
+        target_prompt_version="v1-phase5",
+        target_prompt_variant_id="variant-a",
+        activation_mode="auto_activate_eligible",
+        auto_activate=True,
+        rationale="Consolidated outcomes favored variant-a under low disagreement.",
+        suggested_changes=(
+            PromptChange(section="system", instruction="Preserve terminology precisely."),
+        ),
+        evidence_refs=("memory/consolidations/consolidation-1.json",),
     )
     publish_context = PublishContext(
         run_id="run-123",
@@ -257,10 +320,14 @@ def test_phase_one_contract_models_round_trip_json() -> None:
     artifacts = PublishedArtifacts(
         final_transcript_ref=final_transcript_ref,
         final_translation_ref=final_translation_ref,
+        recoverable_translation_failure_ref=None,
         scorecard_refs=("published/job-123/scorecard.json",),
         trace_refs=("traces/run-123.jsonl",),
         export_refs=("exports/job-123.srt",),
         downstream_delivery_refs=("deliveries/job-123-cms.json",),
+        memory_batch_refs=("memory/batches/batch-1.json",),
+        memory_consolidation_refs=("memory/consolidations/consolidation-1.json",),
+        prompt_evolution_refs=("memory/prompt-evolution/proposal-1.json",),
     )
     state = GraphState(
         run_id="run-123",
@@ -301,6 +368,8 @@ def test_phase_one_contract_models_round_trip_json() -> None:
         transcript_decision,
         translation_decision,
         write_batch,
+        consolidation,
+        prompt_proposal,
         publish_context,
         artifacts,
         state,
@@ -497,6 +566,7 @@ def test_phase_one_protocols_accept_fake_implementations(tmp_path: Path) -> None
                 batch_id=f"batch:{decision.job_id}",
                 job_id=decision.job_id,
                 source_stage=source_stage,
+                disagreement_bucket=decision.disagreement_bucket,
             )
 
     job = _job_context()
@@ -543,6 +613,8 @@ def test_phase_one_protocols_accept_fake_implementations(tmp_path: Path) -> None
         decision_mode="automatic_finalize",
         decision_confidence=0.75,
         rationale_summary="single fake candidate",
+        disagreement_bucket="low",
+        adjudication_scorecard=_scorecard(),
     )
     translation_decision = FinalTranslationDecision(
         job_id=job.job_id,
@@ -550,6 +622,10 @@ def test_phase_one_protocols_accept_fake_implementations(tmp_path: Path) -> None
         decision_mode="automatic_finalize",
         decision_confidence=0.75,
         rationale_summary="single fake candidate",
+        disagreement_bucket="low",
+        adjudication_scorecard=_scorecard().model_copy(
+            update={"preferred_candidate_id": translation_candidate.candidate_id}
+        ),
     )
     decision_store.save_transcript_decision(transcript_decision)
     decision_store.save_translation_decision(translation_decision)

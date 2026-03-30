@@ -4,14 +4,18 @@ from .artifacts import AudioArtifact, PublishContext, PublishedArtifacts
 from .jobs import JobContext, RequestContext, RoutingContext
 from .memory import (
     MemoryBundle,
+    MemoryConsolidation,
     MemoryEntry,
     MemoryQuery,
     MemoryWrite,
     MemoryWriteBatch,
+    PromptChange,
+    PromptEvolutionProposal,
     ProviderCaveat,
 )
 from .review import (
     AdjudicationContext,
+    AdjudicationScorecard,
     CandidatePreference,
     FinalTranscriptDecision,
     FinalTranslationDecision,
@@ -25,16 +29,20 @@ from .translation import TranslationCandidate
 
 __all__ = [
     "AdjudicationContext",
+    "AdjudicationScorecard",
     "AudioArtifact",
     "CandidatePreference",
     "FinalTranscriptDecision",
     "FinalTranslationDecision",
     "JobContext",
     "MemoryBundle",
+    "MemoryConsolidation",
     "MemoryEntry",
     "MemoryQuery",
     "MemoryWrite",
     "MemoryWriteBatch",
+    "PromptChange",
+    "PromptEvolutionProposal",
     "ProviderCaveat",
     "PublishContext",
     "PublishedArtifacts",

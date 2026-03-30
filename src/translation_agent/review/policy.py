@@ -6,7 +6,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 
 from translation_agent.models import AdjudicationContext, ReviewBundle
-from translation_agent.models.review import DecisionMode, ReviewStage
+from translation_agent.models.review import DecisionMode, DisagreementBucket, ReviewStage
 from translation_agent.review.parser import IssueSeverity, ParsedReview, parse_reviewer_output
 
 _SEVERITY_WEIGHTS = {
@@ -52,7 +52,7 @@ class AdjudicationOutcome:
     human_review_required: bool
     escalated: bool
     investigation_payload: dict[str, object] | None
-    disagreement_bucket: str
+    disagreement_bucket: DisagreementBucket
     assessment: DisagreementAssessment
 
 
@@ -230,7 +230,7 @@ def _highest_issue_severity(parsed_reviews: tuple[ParsedReview, ...]) -> IssueSe
     return highest
 
 
-def _bucket_for_score(assessment: DisagreementAssessment) -> str:
+def _bucket_for_score(assessment: DisagreementAssessment) -> DisagreementBucket:
     if assessment.decision_mode == "human_review":
         return "unresolved"
     if assessment.decision_mode == "stronger_adjudicator":

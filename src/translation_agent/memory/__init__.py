@@ -1,6 +1,24 @@
 """Memory package."""
 
-from .recall import MemoryRecallBackend
-from .staging import MemoryStagingBackend
+from .consolidation import (
+    DeterministicMemoryConsolidationBackend,
+    MemoryConsolidationBackend,
+)
+from .prompt_evolution import (
+    DeterministicPromptEvolutionBackend,
+    PromptEvolutionBackend,
+)
+from .recall import InMemoryLongTermMemoryStore, LongTermMemoryRecallBackend, MemoryRecallBackend
+from .staging import DeterministicMemoryStagingBackend, MemoryStagingBackend
 
-__all__ = ["MemoryRecallBackend", "MemoryStagingBackend"]
+__all__ = [
+    "DeterministicMemoryConsolidationBackend",
+    "DeterministicMemoryStagingBackend",
+    "DeterministicPromptEvolutionBackend",
+    "InMemoryLongTermMemoryStore",
+    "LongTermMemoryRecallBackend",
+    "MemoryConsolidationBackend",
+    "MemoryRecallBackend",
+    "MemoryStagingBackend",
+    "PromptEvolutionBackend",
+]
