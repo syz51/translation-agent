@@ -30,11 +30,13 @@ class GraphState(ContractModel):
     source_video_ref: NonEmptyStr
     source_artifact_ref: str | None = None
     audio_artifact_ref: str | None = None
+    raw_transcript_payload_refs: tuple[str, ...] = ()
     raw_transcript_candidate_refs: tuple[str, ...] = ()
     transcript_candidate_ids: tuple[str, ...] = ()
     transcript_review_ids: tuple[str, ...] = ()
     final_transcript_candidate_id: str | None = None
     final_transcript_decision_ref: str | None = None
+    raw_translation_payload_refs: tuple[str, ...] = ()
     raw_translation_candidate_refs: tuple[str, ...] = ()
     translation_candidate_ids: tuple[str, ...] = ()
     translation_review_ids: tuple[str, ...] = ()

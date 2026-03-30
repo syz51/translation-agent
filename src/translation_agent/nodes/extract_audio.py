@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from translation_agent.adapters import AudioBytesExtractionAdapter
 from translation_agent.graph.runtime import WorkflowRuntime
 from translation_agent.graph.state import GraphState, RoutingFact
 from translation_agent.nodes.common import (
@@ -12,15 +13,22 @@ from translation_agent.nodes.common import (
 
 
 def extract_audio(state: GraphState, runtime: WorkflowRuntime) -> dict[str, object]:
-    """Create and persist a deterministic stub audio artifact."""
+    """Extract audio, persist the blob payload, and store artifact metadata."""
 
     request_context = build_request_context(state, runtime)
-    artifact = runtime.audio_extractor.extract_audio(state.source_video_ref, request_context)
-
-    runtime.blob_store.put_bytes(
-        artifact.blob_ref,
-        f"stub audio for {state.job.job_id}\n".encode(),
-    )
+    if isinstance(runtime.audio_extractor, AudioBytesExtractionAdapter):
+        artifact, audio_bytes = runtime.audio_extractor.extract_audio_bytes(
+            state.source_video_ref,
+            request_context,
+        )
+        runtime.blob_store.put_bytes(artifact.blob_ref, audio_bytes)
+    else:
+        artifact = runtime.audio_extractor.extract_audio(state.source_video_ref, request_context)
+    if not runtime.blob_store.exists(artifact.blob_ref):
+        runtime.blob_store.put_bytes(
+            artifact.blob_ref,
+            f"stub audio for {state.job.job_id}\n".encode(),
+        )
     metadata_ref = write_model_artifact(runtime, audio_artifact_key(state.job.job_id), artifact)
 
     return {

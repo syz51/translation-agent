@@ -1,10 +1,15 @@
 {
+  "adapter_mode": "fake",
   "checked_paths": [
     "<data_dir>",
     "<blob_dir>",
     "<trace_dir>"
   ],
   "ok": false,
+  "provider_config_error": null,
+  "provider_config_ok": true,
+  "runtime_compatibility_error": null,
+  "runtime_compatibility_ok": true,
   "state_backend": "postgres",
   "state_db_error": "TA_STATE_DB_DSN is required",
   "state_db_ok": false,

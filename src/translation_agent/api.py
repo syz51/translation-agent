@@ -9,7 +9,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from translation_agent.config import Settings, load_settings, validate_environment
-from translation_agent.graph import GraphState, build_phase_two_runtime, run_workflow
+from translation_agent.graph import GraphState, build_runtime, run_workflow
 from translation_agent.models import JobContext
 from translation_agent.observability.events import (
     configure_structured_logging,
@@ -99,7 +99,8 @@ def run_job(request: RunJobRequest, settings: Settings | None = None) -> RunJobR
     trace_path = trace_dir / f"{run_id}.jsonl"
     with JsonlTraceSink(trace_path) as trace_sink:
         runtime_run_store = PostgresRunStore(state_db_dsn)
-        runtime = build_phase_two_runtime(
+        runtime = build_runtime(
+            settings=settings,
             blob_store=blob_store,
             run_store=runtime_run_store,
             trace_sink=trace_sink,

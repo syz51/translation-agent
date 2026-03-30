@@ -4,15 +4,12 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable
+from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel
 
-from translation_agent.graph.runtime import (
-    PHASE_TWO_NORMALIZATION_VERSION,
-    WorkflowRuntime,
-    runtime_metadata,
-)
+from translation_agent.graph.runtime import WorkflowRuntime, runtime_metadata
 from translation_agent.graph.state import GraphState, RoutingFact
 from translation_agent.models import (
     MemoryQuery,
@@ -20,6 +17,10 @@ from translation_agent.models import (
     ReviewBundle,
     TranscriptCandidate,
     TranslationCandidate,
+)
+from translation_agent.normalization import (
+    normalize_transcript_candidate,
+    normalize_translation_candidate,
 )
 
 TRANSCRIPT_REVIEW_STAGE = "transcript"
@@ -112,8 +113,24 @@ def transcript_candidate_key(candidate_id: str) -> str:
     return f"candidates/transcripts/{candidate_id}.json"
 
 
+def raw_transcript_candidate_key(job_id: str, provider_id: str) -> str:
+    return f"raw/transcript-candidates/{job_id}/{provider_id}.json"
+
+
 def translation_candidate_key(candidate_id: str) -> str:
     return f"candidates/translations/{candidate_id}.json"
+
+
+def raw_translation_candidate_key(job_id: str, prompt_variant_id: str) -> str:
+    return f"raw/translation-candidates/{job_id}/{prompt_variant_id}.json"
+
+
+def staged_transcript_candidate_key(candidate_id: str) -> str:
+    return f"staging/transcripts/{candidate_id}.json"
+
+
+def staged_translation_candidate_key(candidate_id: str) -> str:
+    return f"staging/translations/{candidate_id}.json"
 
 
 def transcript_review_key(review_id: str) -> str:
@@ -200,20 +217,32 @@ def translation_sort_key(candidate: TranslationCandidate) -> tuple[str, str]:
 def normalized_transcript(candidate: TranscriptCandidate) -> TranscriptCandidate:
     """Apply the canonical dry-run normalization tweaks."""
 
-    return candidate.model_copy(
-        update={
-            "full_text": " ".join(candidate.full_text.split()),
-            "normalization_version": PHASE_TWO_NORMALIZATION_VERSION,
-        }
-    )
+    return normalize_transcript_candidate(candidate)
 
 
 def normalized_translation(candidate: TranslationCandidate) -> TranslationCandidate:
     """Apply the canonical dry-run normalization tweaks."""
 
-    return candidate.model_copy(
-        update={
-            "full_text": " ".join(candidate.full_text.split()),
-            "normalization_version": PHASE_TWO_NORMALIZATION_VERSION,
-        }
-    )
+    return normalize_translation_candidate(candidate)
+
+
+def strip_private_metadata(payload: dict[str, Any]) -> dict[str, Any]:
+    """Drop transport-only metadata entries before persistence."""
+
+    return {key: value for key, value in payload.items() if not key.startswith("_")}
+
+
+def cleanup_local_path(path_value: str | None) -> None:
+    """Best-effort cleanup for temporary local files created during adapter execution."""
+
+    if not path_value:
+        return
+    path = Path(path_value)
+    if path.exists():
+        path.unlink()
+    parent = path.parent
+    if parent.exists():
+        try:
+            parent.rmdir()
+        except OSError:
+            return

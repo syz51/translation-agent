@@ -1,6 +1,7 @@
 # Important
 
 Use uv for python
+Always run ruff after code written
 
 ## Verification
 

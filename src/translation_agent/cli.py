@@ -37,6 +37,11 @@ def main(argv: list[str] | None = None) -> int:
             "state_backend": result.state_backend,
             "state_db_ok": result.state_db_ok,
             "state_db_target": result.state_db_target,
+            "adapter_mode": result.adapter_mode,
+            "runtime_compatibility_ok": result.runtime_compatibility_ok,
+            "runtime_compatibility_error": result.runtime_compatibility_error,
+            "provider_config_ok": result.provider_config_ok,
+            "provider_config_error": result.provider_config_error,
             "state_db_error": result.state_db_error,
         }
         if args.as_json:
@@ -49,7 +54,18 @@ def main(argv: list[str] | None = None) -> int:
             for path in payload["checked_paths"]:
                 print(path)
             print(f"{result.state_backend}: {result.state_db_target}")
+            print(f"adapter_mode: {result.adapter_mode}")
             print(db_connectivity)
+            print(
+                "runtime compatibility ok"
+                if result.runtime_compatibility_ok
+                else "runtime compatibility failed"
+            )
+            print(
+                "provider configuration ok"
+                if result.provider_config_ok
+                else "provider configuration failed"
+            )
             if result.state_db_error:
                 print(result.state_db_error)
         return 0 if result.ok else 1

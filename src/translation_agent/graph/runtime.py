@@ -1,16 +1,29 @@
-"""Phase 2 workflow runtime dependencies and fake implementations."""
+"""Workflow runtime dependencies plus fake and real adapter builders."""
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
 from translation_agent.adapters import (
+    AssemblyAITranscriptionAdapter,
     AudioExtractionAdapter,
+    DeepgramTranscriptionAdapter,
+    FFmpegAudioExtractionAdapter,
+    OpenAITranslationAdapter,
+    RetryPolicy,
+    SpeechmaticsTranscriptionAdapter,
     TranscriptionAdapter,
     TranslationAdapter,
 )
+from translation_agent.config import (
+    Settings,
+    validate_provider_configuration,
+    validate_runtime_compatibility,
+)
+from translation_agent.graph._langgraph_compat import ensure_langgraph_runtime_supported
 from translation_agent.memory import MemoryRecallBackend, MemoryStagingBackend
 from translation_agent.models import (
     AudioArtifact,
@@ -31,6 +44,7 @@ from translation_agent.observability import TraceSink
 from translation_agent.storage import BlobStore, DecisionStore, MemoryBatchStore, RunStore
 
 PHASE_TWO_NORMALIZATION_VERSION = "2026-03-30-phase-2"
+PHASE_THREE_NORMALIZATION_VERSION = "2026-03-30-phase-3"
 DEFAULT_SCENARIO = "happy"
 
 
@@ -50,6 +64,17 @@ class WorkflowRuntime:
     memory_staging_backend: MemoryStagingBackend
     source_artifact_ref: str
     scenario: str = DEFAULT_SCENARIO
+    adapter_mode: str = "fake"
+    normalization_version: str = PHASE_TWO_NORMALIZATION_VERSION
+
+
+@dataclass(slots=True)
+class RealRuntimeOverrides:
+    """Optional real-adapter overrides used in tests."""
+
+    audio_extractor: AudioExtractionAdapter | None = None
+    transcription_adapters: tuple[TranscriptionAdapter, ...] | None = None
+    translation_adapter: TranslationAdapter | None = None
 
 
 class InMemoryDecisionStore:
@@ -138,8 +163,9 @@ class FakeAudioExtractionAdapter:
 class FakeTranscriptionAdapter:
     """Deterministic STT adapter with scenario-driven failure injection."""
 
-    def __init__(self, provider_id: str) -> None:
+    def __init__(self, provider_id: str, *, blob_store: BlobStore) -> None:
         self.provider_id = provider_id
+        self._blob_store = blob_store
 
     def transcribe(
         self,
@@ -152,6 +178,15 @@ class FakeTranscriptionAdapter:
             raise RuntimeError(f"simulated transcription failure for {self.provider_id}")
 
         text = _transcript_text_for_provider(self.provider_id, scenario)
+        raw_payload_ref = (
+            f"raw/provider-payloads/{request_context.job.job_id}/{self.provider_id}.json"
+        )
+        self._blob_store.put_bytes(
+            raw_payload_ref,
+            (
+                json.dumps({"provider": self.provider_id, "text": text}, sort_keys=True) + "\n"
+            ).encode("utf-8"),
+        )
         return TranscriptCandidate(
             candidate_id=f"tr-{self.provider_id}-{request_context.job.job_id}",
             job_id=request_context.job.job_id,
@@ -170,7 +205,7 @@ class FakeTranscriptionAdapter:
             full_text=text,
             speaker_map={"speaker-1": "Host"},
             timing_resolution="segment",
-            raw_payload_ref=f"raw/transcripts/{request_context.job.job_id}/{self.provider_id}.json",
+            raw_payload_ref=raw_payload_ref,
             normalization_version=PHASE_TWO_NORMALIZATION_VERSION,
             metadata={"provider_rank": _provider_rank(self.provider_id)},
         )
@@ -179,7 +214,10 @@ class FakeTranscriptionAdapter:
 class FakeTranslationAdapter:
     """Deterministic translation adapter with scenario-driven failure injection."""
 
-    model_id = "gpt-5.4-mini"
+    model_id = "gpt-5-mini"
+
+    def __init__(self, *, blob_store: BlobStore) -> None:
+        self._blob_store = blob_store
 
     def generate_translation(
         self,
@@ -193,6 +231,19 @@ class FakeTranslationAdapter:
             raise RuntimeError(f"simulated translation failure for {prompt_variant_id}")
 
         text = _translation_text_for_variant(prompt_variant_id, scenario)
+        raw_response_ref = (
+            f"raw/provider-payloads/{request_context.job.job_id}/openai-{prompt_variant_id}.json"
+        )
+        self._blob_store.put_bytes(
+            raw_response_ref,
+            (
+                json.dumps(
+                    {"translation": text, "variant": prompt_variant_id},
+                    sort_keys=True,
+                )
+                + "\n"
+            ).encode("utf-8"),
+        )
         return TranslationCandidate(
             candidate_id=f"tl-{prompt_variant_id}-{request_context.job.job_id}",
             job_id=request_context.job.job_id,
@@ -212,9 +263,7 @@ class FakeTranslationAdapter:
                 ),
             ),
             full_text=text,
-            raw_response_ref=(
-                f"raw/translations/{request_context.job.job_id}/{prompt_variant_id}.json"
-            ),
+            raw_response_ref=raw_response_ref,
             normalization_version=PHASE_TWO_NORMALIZATION_VERSION,
             metadata={"scenario": scenario},
         )
@@ -312,15 +361,137 @@ def build_phase_two_runtime(
         memory_batch_store=InMemoryMemoryBatchStore(),
         audio_extractor=FakeAudioExtractionAdapter(),
         transcription_adapters=(
-            FakeTranscriptionAdapter("assemblyai"),
-            FakeTranscriptionAdapter("speechmatics"),
-            FakeTranscriptionAdapter("deepgram"),
+            FakeTranscriptionAdapter("assemblyai", blob_store=blob_store),
+            FakeTranscriptionAdapter("speechmatics", blob_store=blob_store),
+            FakeTranscriptionAdapter("deepgram", blob_store=blob_store),
         ),
-        translation_adapter=FakeTranslationAdapter(),
+        translation_adapter=FakeTranslationAdapter(blob_store=blob_store),
         memory_recall_backend=FakeMemoryRecallBackend(),
         memory_staging_backend=FakeMemoryStagingBackend(),
         source_artifact_ref=source_artifact_ref,
         scenario=scenario,
+        adapter_mode="fake",
+        normalization_version=PHASE_TWO_NORMALIZATION_VERSION,
+    )
+
+
+def build_runtime(
+    *,
+    settings: Settings,
+    blob_store: BlobStore,
+    run_store: RunStore,
+    trace_sink: TraceSink,
+    source_artifact_ref: str,
+    scenario: str = DEFAULT_SCENARIO,
+    real_overrides: RealRuntimeOverrides | None = None,
+) -> WorkflowRuntime:
+    """Construct the configured runtime while preserving the Phase 2 fake path."""
+
+    if settings.adapter_mode == "fake":
+        return build_phase_two_runtime(
+            blob_store=blob_store,
+            run_store=run_store,
+            trace_sink=trace_sink,
+            source_artifact_ref=source_artifact_ref,
+            scenario=scenario,
+        )
+
+    return build_phase_three_runtime(
+        settings=settings,
+        blob_store=blob_store,
+        run_store=run_store,
+        trace_sink=trace_sink,
+        source_artifact_ref=source_artifact_ref,
+        scenario=scenario,
+        overrides=real_overrides,
+    )
+
+
+def build_phase_three_runtime(
+    *,
+    settings: Settings,
+    blob_store: BlobStore,
+    run_store: RunStore,
+    trace_sink: TraceSink,
+    source_artifact_ref: str,
+    scenario: str = DEFAULT_SCENARIO,
+    overrides: RealRuntimeOverrides | None = None,
+) -> WorkflowRuntime:
+    """Construct the real-adapter Phase 3 runtime."""
+
+    config_error = validate_provider_configuration(settings)
+    if config_error is not None:
+        raise RuntimeError(config_error)
+    compatibility_error = validate_runtime_compatibility(settings)
+    if compatibility_error is not None:
+        raise RuntimeError(compatibility_error)
+    ensure_langgraph_runtime_supported()
+
+    retry_policy = RetryPolicy(
+        max_attempts=settings.adapter_retry_attempts,
+        initial_backoff_seconds=settings.adapter_initial_backoff_seconds,
+        max_backoff_seconds=settings.adapter_max_backoff_seconds,
+        poll_interval_seconds=settings.adapter_poll_interval_seconds,
+        max_polls=settings.adapter_poll_attempts,
+    )
+    overrides = overrides or RealRuntimeOverrides()
+    audio_extractor = overrides.audio_extractor or FFmpegAudioExtractionAdapter(
+        blob_store=blob_store,
+        binary=settings.ffmpeg_binary,
+        retry_policy=RetryPolicy(
+            max_attempts=settings.adapter_retry_attempts,
+            initial_backoff_seconds=settings.adapter_initial_backoff_seconds,
+            max_backoff_seconds=settings.adapter_max_backoff_seconds,
+        ),
+    )
+    transcription_adapters = overrides.transcription_adapters or (
+        AssemblyAITranscriptionAdapter(
+            blob_store=blob_store,
+            api_key=_required_setting(settings.assemblyai_api_key, "TA_ASSEMBLYAI_API_KEY"),
+            base_url=settings.assemblyai_base_url,
+            timeout_seconds=settings.provider_timeout_seconds,
+            retry_policy=retry_policy,
+        ),
+        SpeechmaticsTranscriptionAdapter(
+            blob_store=blob_store,
+            api_key=_required_setting(settings.speechmatics_api_key, "TA_SPEECHMATICS_API_KEY"),
+            base_url=settings.speechmatics_base_url,
+            timeout_seconds=settings.provider_timeout_seconds,
+            retry_policy=retry_policy,
+        ),
+        DeepgramTranscriptionAdapter(
+            blob_store=blob_store,
+            api_key=_required_setting(settings.deepgram_api_key, "TA_DEEPGRAM_API_KEY"),
+            base_url=settings.deepgram_base_url,
+            timeout_seconds=settings.provider_timeout_seconds,
+            retry_policy=retry_policy,
+        ),
+    )
+    translation_adapter = overrides.translation_adapter or OpenAITranslationAdapter(
+        blob_store=blob_store,
+        api_key=_required_setting(settings.openai_api_key, "TA_OPENAI_API_KEY"),
+        model_id=settings.translation_model_id,
+        prompt_version=settings.translation_prompt_version,
+        base_url=settings.openai_base_url,
+        timeout_seconds=settings.provider_timeout_seconds,
+        retry_policy=retry_policy,
+    )
+
+    return WorkflowRuntime(
+        blob_store=blob_store,
+        run_store=run_store,
+        trace_sink=trace_sink,
+        decision_store=InMemoryDecisionStore(),
+        memory_batch_store=InMemoryMemoryBatchStore(),
+        audio_extractor=audio_extractor,
+        transcription_adapters=transcription_adapters,
+        translation_adapter=translation_adapter,
+        memory_recall_backend=FakeMemoryRecallBackend(),
+        memory_staging_backend=FakeMemoryStagingBackend(),
+        source_artifact_ref=source_artifact_ref,
+        scenario=scenario,
+        adapter_mode="real",
+        normalization_version=PHASE_THREE_NORMALIZATION_VERSION,
     )
 
 
@@ -330,7 +501,23 @@ def runtime_metadata(base_metadata: dict[str, Any], runtime: WorkflowRuntime) ->
     return {
         **base_metadata,
         "scenario": runtime.scenario,
+        "adapter_mode": runtime.adapter_mode,
+        "blob_root": _blob_root(runtime.blob_store),
+        "normalization_version": runtime.normalization_version,
     }
+
+
+def _required_setting(value: str | None, env_var: str) -> str:
+    if value:
+        return value
+    raise RuntimeError(f"{env_var} is required when TA_ADAPTER_MODE=real")
+
+
+def _blob_root(blob_store: BlobStore) -> str | None:
+    root = getattr(blob_store, "root", None)
+    if root is None:
+        return None
+    return str(root)
 
 
 def _provider_rank(provider_id: str) -> int:
