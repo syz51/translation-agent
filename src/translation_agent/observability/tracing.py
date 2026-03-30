@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import json
-from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import Lock
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 from .events import _json_default
 
@@ -33,27 +32,28 @@ class TraceEvent:
         }
 
 
-class TraceSink(ABC):
-    @abstractmethod
+@runtime_checkable
+class TraceSink(Protocol):
+    def record(self, event: TraceEvent) -> None: ...
+
+    def close(self) -> None: ...
+
+
+class NoOpTraceSink:
     def record(self, event: TraceEvent) -> None:
-        raise NotImplementedError
+        return None
 
     def close(self) -> None:
         return None
 
-    def __enter__(self) -> TraceSink:
+    def __enter__(self) -> NoOpTraceSink:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
 
 
-class NoOpTraceSink(TraceSink):
-    def record(self, event: TraceEvent) -> None:
-        return None
-
-
-class JsonlTraceSink(TraceSink):
+class JsonlTraceSink:
     def __init__(self, path: str | Path) -> None:
         self._path = Path(path)
         self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -71,3 +71,9 @@ class JsonlTraceSink(TraceSink):
         with self._lock:
             if not self._handle.closed:
                 self._handle.close()
+
+    def __enter__(self) -> JsonlTraceSink:
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()

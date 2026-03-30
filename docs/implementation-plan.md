@@ -105,6 +105,7 @@ Implement next:
 - routing logic
 - stub node implementations
 - CLI entrypoint for running a job
+- keep node inputs/outputs on the Phase 1 typed contracts and keep graph state ref-only
 
 Exit criteria:
 
@@ -119,6 +120,7 @@ Implement:
 - Speechmatics adapter
 - Deepgram adapter
 - OpenAI translation adapter
+- make concrete adapters satisfy the Phase 1 protocol surface in `translation_agent.adapters`
 
 Exit criteria:
 
@@ -149,6 +151,7 @@ Implement:
 - async consolidation pipeline
 - translation prompt evolution logic
 - artifact publishing
+- keep long-term memory inputs scoped to Phase 1 memory queries and write batches instead of loose dict payloads
 
 Exit criteria:
 
