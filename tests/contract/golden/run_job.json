@@ -5,6 +5,6 @@
   "source": "input.wav",
   "state_backend": "postgres",
   "state_db_target": "<state_db_target>",
-  "status": "bootstrapped",
+  "status": "completed",
   "trace_path": "<trace_path>"
 }

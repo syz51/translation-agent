@@ -1,4 +1,4 @@
-"""CLI entrypoint for the translation agent bootstrap."""
+"""CLI entrypoint for the translation agent dry-run workflow."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ def build_parser() -> argparse.ArgumentParser:
     validate_parser = subparsers.add_parser("validate-config", help="Validate local runtime config")
     validate_parser.add_argument("--json", action="store_true", dest="as_json")
 
-    run_parser = subparsers.add_parser("run-job", help="Bootstrap a local run record")
+    run_parser = subparsers.add_parser("run-job", help="Execute the local dry-run workflow")
     run_parser.add_argument("source")
     run_parser.add_argument("--job-id")
     run_parser.add_argument("--json", action="store_true", dest="as_json")
@@ -64,6 +64,7 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(payload))
         else:
             print(result.run_id)
+            print(result.status)
             print(f"{result.state_backend}: {result.state_db_target}")
             print(result.trace_path)
         return 0

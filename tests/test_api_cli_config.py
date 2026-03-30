@@ -107,23 +107,29 @@ def test_run_job_bootstraps_local_artifacts_and_postgres_record(
 
     result = run_job(RunJobRequest(source="input.mp4", job_id="job-123"))
 
-    assert result.status == "bootstrapped"
+    assert result.status == "completed"
     assert result.blob_root.exists()
     assert result.trace_path.exists()
     assert (result.blob_root / "jobs" / f"{result.run_id}-request.json").exists()
+    assert (result.blob_root / "published" / "job-123" / "transcript.json").exists()
+    assert (result.blob_root / "published" / "job-123" / "translation.json").exists()
     assert result.state_backend == "postgres"
     assert result.state_db_target == sanitize_db_target(migrated_postgres_dsn)
 
     with PostgresRunStore(migrated_postgres_dsn) as store:
         record = store.get_run(result.run_id)
+        node_executions = store.list_node_executions(result.run_id)
 
     assert record is not None
-    assert record.status == "bootstrapped"
+    assert record.status == "completed"
     assert record.input_data == {
         "artifact_ref": f"jobs/{result.run_id}-request.json",
         "job_id": "job-123",
         "source": "input.mp4",
     }
+    assert record.output_data is not None
+    assert record.output_data["final_stage"] == "finalize_outputs"
+    assert len(node_executions) == 13
 
 
 @pytest.mark.integration
@@ -153,11 +159,14 @@ def test_cli_run_job_json(migrated_postgres_dsn: str, monkeypatch, tmp_path: Pat
     payload = json.loads(capsys.readouterr().out)
     assert exit_code == 0
     assert payload["job_id"] == "job-123"
+    assert payload["status"] == "completed"
     assert payload["state_backend"] == "postgres"
     assert payload["state_db_target"] == sanitize_db_target(migrated_postgres_dsn)
     assert Path(payload["trace_path"]).exists()
 
     with PostgresRunStore(migrated_postgres_dsn) as store:
         record = store.get_run(payload["run_id"])
+        node_executions = store.list_node_executions(payload["run_id"])
 
     assert record is not None
+    assert len(node_executions) == 13
