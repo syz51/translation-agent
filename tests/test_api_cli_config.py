@@ -1,19 +1,23 @@
 from __future__ import annotations
 
 import json
+from argparse import Namespace
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
-from translation_agent.api import RunJobRequest, run_job
+from translation_agent.api import RunJobRequest, _final_status, run_job
 from translation_agent.cli import main
 from translation_agent.config import (
+    ValidationResult,
     load_settings,
     sanitize_db_target,
     validate_environment,
     validate_runtime_compatibility,
 )
+from translation_agent.graph import GraphState
+from translation_agent.graph.state import RoutingFact
 from translation_agent.models import JobContext
 from translation_agent.storage import PostgresRunStore, job_path, job_scope_token
 
@@ -201,6 +205,74 @@ def test_validate_environment_real_mode_requires_provider_credentials(
     assert result.runtime_compatibility_ok is True
 
 
+@pytest.mark.unit
+def test_cli_validate_config_human_readable_output_includes_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("TA_DATA_DIR", str(tmp_path / "runtime"))
+    monkeypatch.setenv(
+        "TA_STATE_DB_DSN",
+        "postgresql://user:secret@127.0.0.1:1/translation_agent?connect_timeout=1",
+    )
+
+    exit_code = main(["validate-config"])
+
+    output = capsys.readouterr().out
+    assert exit_code == 1
+    assert "configuration invalid" in output
+    assert "postgres: postgresql://127.0.0.1:1/translation_agent" in output
+    assert "database connectivity failed" in output
+    assert "runtime compatibility ok" in output
+    assert "provider configuration ok" in output
+
+
+@pytest.mark.unit
+def test_cli_run_job_plain_output_reports_run_status_and_trace(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("TA_DATA_DIR", str(tmp_path / "runtime"))
+    monkeypatch.delenv("TA_STATE_DB_DSN", raising=False)
+
+    exit_code = main(["run-job", "input.wav", "--job-id", "job-plain"])
+
+    lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
+    assert exit_code == 0
+    assert len(lines) == 4
+    assert lines[1] == "completed"
+    assert lines[2] == f"sqlite: {(tmp_path / 'runtime' / 'state.sqlite3').resolve()}"
+    assert Path(lines[3]).exists()
+
+
+@pytest.mark.unit
+def test_cli_unsupported_command_uses_parser_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeParser:
+        def __init__(self) -> None:
+            self.messages: list[str] = []
+
+        def parse_args(self, argv: list[str] | None) -> Namespace:
+            del argv
+            return Namespace(command="mystery")
+
+        def error(self, message: str) -> None:
+            self.messages.append(message)
+            raise SystemExit(2)
+
+    parser = FakeParser()
+    monkeypatch.setattr("translation_agent.cli.build_parser", lambda: parser)
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(["mystery"])
+
+    assert exc_info.value.code == 2
+    assert parser.messages == ["unsupported command: mystery"]
+
+
 @pytest.mark.integration
 def test_run_job_bootstraps_local_artifacts_and_postgres_record(
     migrated_postgres_dsn: str, monkeypatch, tmp_path: Path
@@ -252,6 +324,68 @@ def test_run_job_defaults_to_local_sqlite_runtime(
     local_job = _job_context(job_id="job-local")
     assert (result.blob_root / Path(job_path(local_job, "published", "transcript.json"))).exists()
     assert (result.blob_root / Path(job_path(local_job, "published", "translation.json"))).exists()
+
+
+@pytest.mark.unit
+def test_run_job_rejects_invalid_runtime_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    settings = load_settings().model_copy(update={"data_dir": tmp_path / "runtime"})
+    validation = ValidationResult(
+        ok=False,
+        checked_paths=(tmp_path / "runtime",),
+        state_backend="sqlite",
+        state_db_ok=True,
+        state_db_target=str((tmp_path / "runtime" / "state.sqlite3").resolve()),
+        adapter_mode="real",
+        runtime_compatibility_ok=False,
+        provider_config_ok=False,
+        state_db_error=None,
+        runtime_compatibility_error="runtime blocked",
+        provider_config_error="missing provider keys",
+    )
+    monkeypatch.setattr("translation_agent.api.validate_environment", lambda _: validation)
+
+    with pytest.raises(RuntimeError, match="invalid runtime configuration"):
+        run_job(RunJobRequest(source="input.mp4"), settings=settings)
+
+
+@pytest.mark.unit
+def test_final_status_prefers_translation_failure_then_human_review_then_degraded() -> None:
+    base = GraphState(
+        run_id="run-status",
+        job=_job_context(),
+        current_stage="finalize_outputs",
+        source_video_ref="input.mp4",
+    )
+
+    assert (
+        _final_status(
+            base.model_copy(update={"translation_failed": True, "human_review_required": True})
+        )
+        == "translation_failed"
+    )
+    assert _final_status(base.model_copy(update={"human_review_required": True})) == (
+        "human_review_required"
+    )
+    assert (
+        _final_status(
+            base.model_copy(
+                update={
+                    "routing_facts": (
+                        RoutingFact(
+                            stage="fanout_transcription",
+                            fact_type="transcription_provider_failed",
+                            value="speechmatics",
+                        ),
+                    )
+                }
+            )
+        )
+        == "completed_with_degraded_transcription"
+    )
+    assert _final_status(base) == "completed"
 
 
 @pytest.mark.unit

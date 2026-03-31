@@ -7,9 +7,11 @@ import pytest
 from psycopg.types.json import Jsonb
 
 from translation_agent.storage import PostgresRunStore
-from translation_agent.storage.migrations import upgrade_database
-
-pytestmark = [pytest.mark.integration, pytest.mark.migration]
+from translation_agent.storage.migrations import (
+    _build_alembic_config,
+    normalize_sqlalchemy_url,
+    upgrade_database,
+)
 
 _CREATE_RUNS_TABLE = """
 CREATE TABLE runs (
@@ -41,6 +43,8 @@ CREATE TABLE node_executions (
 """
 
 
+@pytest.mark.integration
+@pytest.mark.migration
 def test_upgrade_database_bootstraps_schema_on_empty_database(postgres_dsn: str) -> None:
     upgrade_database(postgres_dsn)
 
@@ -77,6 +81,8 @@ def test_upgrade_database_bootstraps_schema_on_empty_database(postgres_dsn: str)
     assert node.run_id == run.run_id
 
 
+@pytest.mark.integration
+@pytest.mark.migration
 def test_upgrade_database_preserves_existing_legacy_data(postgres_dsn: str) -> None:
     _create_legacy_schema(postgres_dsn)
     now = datetime.now(UTC)
@@ -152,3 +158,36 @@ def _create_legacy_schema(dsn: str) -> None:
     with psycopg.connect(dsn, autocommit=True) as conn:
         conn.execute(_CREATE_RUNS_TABLE)
         conn.execute(_CREATE_NODE_EXECUTIONS_TABLE)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("dsn", "expected"),
+    [
+        (
+            "postgresql://user:secret@db.example.com/app",
+            "postgresql+psycopg://user:secret@db.example.com/app",
+        ),
+        (
+            "postgres://user:secret@db.example.com/app",
+            "postgresql+psycopg://user:secret@db.example.com/app",
+        ),
+        (
+            "postgresql+psycopg://user:secret@db.example.com/app",
+            "postgresql+psycopg://user:secret@db.example.com/app",
+        ),
+        ("sqlite:///tmp/state.sqlite3", "sqlite:///tmp/state.sqlite3"),
+    ],
+)
+def test_normalize_sqlalchemy_url_preserves_supported_shapes(dsn: str, expected: str) -> None:
+    assert normalize_sqlalchemy_url(dsn) == expected
+
+
+@pytest.mark.unit
+def test_build_alembic_config_uses_repo_alembic_ini_and_escapes_percent_signs() -> None:
+    dsn = "postgresql://user:secret@db.example.com/app?sslmode=require%2Fstrict"
+    config = _build_alembic_config(dsn)
+
+    assert config.config_file_name is not None
+    assert config.config_file_name.endswith("alembic.ini")
+    assert config.get_main_option("sqlalchemy.url") == normalize_sqlalchemy_url(dsn)

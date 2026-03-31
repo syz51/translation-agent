@@ -344,3 +344,64 @@ def test_postgres_operational_store_isolates_same_raw_job_id_by_scoped_storage_k
             )
             == decision_b
         )
+
+
+@pytest.mark.unit
+def test_sqlite_operational_store_persists_run_and_node_execution_lifecycle(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.sqlite3"
+
+    with SQLiteOperationalStore(db_path) as store:
+        run = store.create_run(
+            run_id="run-local",
+            tenant_id="tenant-1",
+            project_id="project-1",
+            status="queued",
+            input_data={"source": "input.mp4"},
+            metadata={"phase": "local"},
+        )
+        node = store.create_node_execution(
+            run_id=run.run_id,
+            node_name="ingest_job",
+            input_data={"step": "ingest"},
+        )
+        updated_run = store.update_run(
+            run.run_id,
+            status="completed",
+            output_data={"published": 2},
+            error={"code": "none"},
+        )
+        updated_node = store.update_node_execution(
+            node.execution_id,
+            status="succeeded",
+            output_data={"artifact_ref": "jobs/run-local-request.json"},
+            error={"code": "none"},
+        )
+
+    with SQLiteOperationalStore(db_path) as reopened:
+        assert reopened.get_run(run.run_id) == updated_run
+        assert reopened.list_runs() == [updated_run]
+        assert reopened.get_node_execution(node.execution_id) == updated_node
+        assert reopened.list_node_executions(run.run_id) == [updated_node]
+
+
+@pytest.mark.unit
+def test_sqlite_operational_store_missing_lookups_and_updates_are_explicit(
+    tmp_path: Path,
+) -> None:
+    with SQLiteOperationalStore(tmp_path / "state.sqlite3") as store:
+        assert store.get_run("missing-run") is None
+        assert store.get_node_execution("missing-node") is None
+        assert store.get_transcript_decision("missing-job") is None
+        assert store.get_translation_decision("missing-job") is None
+        assert store.get_investigation(job_id="missing-job", stage="translation") is None
+        assert store.get_batch("missing-batch") is None
+        assert store.list_transcript_candidates("missing-job") == []
+        assert store.list_translation_candidates("missing-job") == []
+        assert store.list_batches("missing-job") == []
+
+        with pytest.raises(KeyError, match="missing-run"):
+            store.update_run("missing-run", status="failed")
+        with pytest.raises(KeyError, match="missing-node"):
+            store.update_node_execution("missing-node", status="failed")

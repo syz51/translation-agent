@@ -128,3 +128,12 @@ def test_node_execution_foreign_key_behavior(migrated_postgres_dsn: str) -> None
         deleted_node = store.get_node_execution(node.execution_id)
 
     assert deleted_node is None
+
+
+def test_update_missing_records_raise_keyerror(migrated_postgres_dsn: str) -> None:
+    with PostgresRunStore(migrated_postgres_dsn) as store:
+        with pytest.raises(KeyError, match="missing-run"):
+            store.update_run("missing-run", status="failed")
+
+        with pytest.raises(KeyError, match="missing-exec"):
+            store.update_node_execution("missing-exec", status="failed")

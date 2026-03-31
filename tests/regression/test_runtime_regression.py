@@ -371,6 +371,51 @@ def test_replay_adjudication_uses_persisted_candidates_reviews_and_memory_refs(
     assert replayed_decision["adjudication_scorecard"] == stored_decision["adjudication_scorecard"]
 
 
+def test_replay_adjudication_supports_transcript_stage_regression(tmp_path: Path) -> None:
+    job = _job_context(job_id="job-replay-transcript")
+    final_state, blob_store = _run_workflow(
+        tmp_path,
+        run_id="run-replay-transcript",
+        scenario="happy",
+        job=job,
+    )
+    runtime = build_phase_two_runtime(
+        blob_store=blob_store,
+        run_store=InMemoryRunStore(),
+        trace_sink=NoOpTraceSink(),
+        source_artifact_ref=f"jobs/{final_state.run_id}-request.json",
+        scenario="happy",
+    )
+
+    replayed = replay_adjudication(
+        runtime,
+        ReplayAdjudicationRequest(
+            run_id=final_state.run_id,
+            job=job,
+            stage="transcript",
+            candidate_refs=tuple(
+                job_path(job, "candidates", "transcripts", f"{candidate_id}.json")
+                for candidate_id in final_state.transcript_candidate_ids
+            ),
+            review_refs=tuple(
+                job_path(job, "reviews", "transcript", f"{review_id}.json")
+                for review_id in final_state.transcript_review_ids
+            ),
+            memory_ref=next(
+                fact.source_ref
+                for fact in final_state.routing_facts
+                if fact.fact_type == "adjudication_memory_bundle"
+                and fact.stage == "adjudicate_transcript"
+                and fact.source_ref is not None
+            ),
+            content_risk_class=content_risk_class_for_scenario("happy"),
+        ),
+    )
+
+    assert replayed.decision.decision_mode == "automatic_finalize"
+    assert replayed.decision.winner_candidate_id == final_state.final_transcript_candidate_id
+
+
 def test_replay_adjudication_preserves_timeout_escalation_regression(tmp_path: Path) -> None:
     job = _job_context(job_id="job-replay-timeout")
     final_state, blob_store = _run_workflow(
@@ -415,3 +460,49 @@ def test_replay_adjudication_preserves_timeout_escalation_regression(tmp_path: P
     assert replayed.decision.decision_mode == "human_review"
     assert replayed.decision.winner_candidate_id is None
     assert replayed.decision.disagreement_bucket == "unresolved"
+
+
+def test_replay_adjudication_ignores_missing_timeout_artifact_regression(tmp_path: Path) -> None:
+    job = _job_context(job_id="job-replay-missing-timeout")
+    final_state, blob_store = _run_workflow(
+        tmp_path,
+        run_id="run-replay-missing-timeout",
+        scenario="translation_conflict_timeout",
+        job=job,
+    )
+    blob_store.delete(job_path(job, "investigations", "translation.json"))
+    runtime = build_phase_two_runtime(
+        blob_store=blob_store,
+        run_store=InMemoryRunStore(),
+        trace_sink=NoOpTraceSink(),
+        source_artifact_ref=f"jobs/{final_state.run_id}-request.json",
+        scenario="translation_conflict_timeout",
+    )
+
+    replayed = replay_adjudication(
+        runtime,
+        ReplayAdjudicationRequest(
+            run_id=final_state.run_id,
+            job=job,
+            stage="translation",
+            candidate_refs=tuple(
+                job_path(job, "candidates", "translations", f"{candidate_id}.json")
+                for candidate_id in final_state.translation_candidate_ids
+            ),
+            review_refs=tuple(
+                job_path(job, "reviews", "translation", f"{review_id}.json")
+                for review_id in final_state.translation_review_ids
+            ),
+            memory_ref=next(
+                fact.source_ref
+                for fact in final_state.routing_facts
+                if fact.fact_type == "adjudication_memory_bundle"
+                and fact.stage == "adjudicate_translation"
+                and fact.source_ref is not None
+            ),
+            content_risk_class=content_risk_class_for_scenario("translation_conflict_timeout"),
+        ),
+    )
+
+    assert replayed.decision.decision_mode == "conflict_investigation"
+    assert replayed.decision.human_review_required is False
