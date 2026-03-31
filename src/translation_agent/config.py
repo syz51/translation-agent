@@ -6,7 +6,7 @@ import os
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 
 import psycopg
 from psycopg.conninfo import conninfo_to_dict
@@ -15,6 +15,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from translation_agent.storage import SQLiteOperationalStore
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_ENV_FILE = PROJECT_ROOT / ".env"
+_USE_DEFAULT_ENV_FILE = object()
+
 
 class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
@@ -22,6 +26,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="TA_",
         env_nested_delimiter="__",
+        env_file_encoding="utf-8",
         extra="ignore",
     )
 
@@ -90,10 +95,17 @@ class ValidationResult:
     provider_config_error: str | None = None
 
 
-def load_settings() -> Settings:
-    """Load settings from the process environment."""
+def load_settings(*, env_file: Path | str | None | object = _USE_DEFAULT_ENV_FILE) -> Settings:
+    """Load settings from the process environment and the repo-root dotenv file."""
 
-    return Settings()
+    if env_file is _USE_DEFAULT_ENV_FILE:
+        env_file = DEFAULT_ENV_FILE
+    resolved_env_file: Path | str | None
+    if isinstance(env_file, Path):
+        resolved_env_file = env_file.expanduser().resolve()
+    else:
+        resolved_env_file = cast("Path | str | None", env_file)
+    return Settings(_env_file=resolved_env_file)  # pyright: ignore[reportCallIssue]
 
 
 def validate_environment(settings: Settings, *, create_dirs: bool = True) -> ValidationResult:

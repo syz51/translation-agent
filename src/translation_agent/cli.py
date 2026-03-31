@@ -7,7 +7,8 @@ import json
 from dataclasses import asdict
 
 from translation_agent.api import RunJobRequest, run_job
-from translation_agent.config import load_settings, validate_environment
+from translation_agent.config import load_settings, sanitize_db_target, validate_environment
+from translation_agent.storage.migrations import upgrade_database
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -16,6 +17,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     validate_parser = subparsers.add_parser("validate-config", help="Validate local runtime config")
     validate_parser.add_argument("--json", action="store_true", dest="as_json")
+
+    migrate_parser = subparsers.add_parser("migrate-db", help="Apply Postgres migrations")
+    migrate_parser.add_argument("--revision", default="head")
 
     run_parser = subparsers.add_parser("run-job", help="Execute the local dry-run workflow")
     run_parser.add_argument("source")
@@ -69,6 +73,15 @@ def main(argv: list[str] | None = None) -> int:
             if result.state_db_error:
                 print(result.state_db_error)
         return 0 if result.ok else 1
+
+    if args.command == "migrate-db":
+        settings = load_settings()
+        if settings.state_db_dsn is None:
+            print("TA_STATE_DB_DSN is required for migrate-db")
+            return 1
+        upgrade_database(settings.state_db_dsn, revision=args.revision)
+        print(f"migrated {sanitize_db_target(settings.state_db_dsn)} to {args.revision}")
+        return 0
 
     if args.command == "run-job":
         result = run_job(RunJobRequest(source=args.source, job_id=args.job_id))

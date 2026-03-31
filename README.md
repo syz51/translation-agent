@@ -50,7 +50,6 @@ Notes:
 ### Local Dry Run
 
 ```bash
-uv sync
 uv run translation-agent validate-config --json
 uv run translation-agent run-job input.wav --job-id demo --json
 ```
@@ -65,13 +64,26 @@ Defaults:
 ### Postgres-Backed Runtime
 
 ```bash
-docker compose up -d postgres
-export TA_STATE_DB_DSN=postgresql://translation_agent:translation_agent@127.0.0.1:55432/translation_agent
-uv run alembic upgrade head
+docker compose up --build
 uv run translation-agent validate-config --json
 ```
 
-`compose.yaml` starts a local Postgres 18 instance on port `55432` by default.
+What `docker compose up --build` now does:
+
+- loads repo-root `.env`
+- starts Postgres 18 on port `55432`
+- runs `translation-agent migrate-db` automatically after Postgres is healthy
+- keeps an `app` container alive with the repo mounted, a Linux virtualenv cached in a named volume, and `validate-config` already checked
+
+If you want to run the CLI on the host after the stack is up, no manual `export` is needed. `translation-agent` auto-loads the repo-root `.env`, so `uv run translation-agent ...` will use the Postgres DSN from that file by default.
+
+If you want to run the CLI inside the container instead, use:
+
+```bash
+docker compose exec app uv run translation-agent run-job input.wav --job-id demo --json
+```
+
+The tracked example is [`.env.example`](./.env.example). This workspace also includes a local `.env` with the same safe development defaults.
 
 ### Real Adapter Mode
 
@@ -222,6 +234,12 @@ The settings model accepts more fields than most users need. These are the ones 
 | `TA_TRANSLATION_PROMPT_VERSION` | translation prompt version recorded in outputs |
 
 The settings model also exposes `TA_WORKSPACE_DIR`, `TA_LOG_LEVEL`, `TA_EMIT_CONSOLE_LOGS`, and provider base URL overrides. At the moment those are configuration surface area, but the repo’s behavior is primarily driven by the variables listed above.
+
+Environment loading order:
+
+- process environment variables
+- repo-root `.env`
+- model defaults
 
 ## Testing And Verification
 

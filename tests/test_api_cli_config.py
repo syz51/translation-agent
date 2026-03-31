@@ -59,6 +59,57 @@ def test_load_settings_reads_environment(monkeypatch, tmp_path: Path) -> None:
 
 
 @pytest.mark.unit
+def test_load_settings_autoloads_repo_env_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "\n".join(
+            [
+                f"TA_DATA_DIR={tmp_path / 'runtime-from-dotenv'}",
+                "TA_ADAPTER_MODE=fake",
+                "TA_STATE_DB_DSN=postgresql://dotenv:secret@127.0.0.1:55432/translation_agent",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("translation_agent.config.DEFAULT_ENV_FILE", env_file)
+
+    settings = load_settings()
+
+    assert settings.data_dir == tmp_path / "runtime-from-dotenv"
+    assert settings.state_db_dsn == ("postgresql://dotenv:secret@127.0.0.1:55432/translation_agent")
+
+
+@pytest.mark.unit
+def test_environment_variables_override_repo_env_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "\n".join(
+            [
+                f"TA_DATA_DIR={tmp_path / 'runtime-from-dotenv'}",
+                "TA_STATE_DB_DSN=postgresql://dotenv:secret@127.0.0.1:55432/translation_agent",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("translation_agent.config.DEFAULT_ENV_FILE", env_file)
+    monkeypatch.setenv("TA_DATA_DIR", str(tmp_path / "runtime-from-env"))
+    monkeypatch.setenv(
+        "TA_STATE_DB_DSN", "postgresql://env:secret@127.0.0.1:55433/translation_agent"
+    )
+
+    settings = load_settings()
+
+    assert settings.data_dir == tmp_path / "runtime-from-env"
+    assert settings.state_db_dsn == "postgresql://env:secret@127.0.0.1:55433/translation_agent"
+
+
+@pytest.mark.unit
 def test_validate_environment_defaults_to_local_sqlite_without_state_db_dsn(
     monkeypatch, tmp_path: Path
 ) -> None:
@@ -226,6 +277,39 @@ def test_cli_validate_config_human_readable_output_includes_failures(
     assert "database connectivity failed" in output
     assert "runtime compatibility ok" in output
     assert "provider configuration ok" in output
+
+
+@pytest.mark.unit
+def test_cli_migrate_db_requires_postgres_dsn(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.delenv("TA_STATE_DB_DSN", raising=False)
+
+    exit_code = main(["migrate-db"])
+
+    output = capsys.readouterr().out
+    assert exit_code == 1
+    assert "TA_STATE_DB_DSN is required for migrate-db" in output
+
+
+@pytest.mark.unit
+def test_cli_migrate_db_runs_upgrade_with_loaded_settings(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    calls: list[tuple[str, str]] = []
+    dsn = "postgresql://user:secret@127.0.0.1:55432/translation_agent"
+    monkeypatch.setenv("TA_STATE_DB_DSN", dsn)
+    monkeypatch.setattr(
+        "translation_agent.cli.upgrade_database",
+        lambda received_dsn, *, revision: calls.append((received_dsn, revision)),
+    )
+
+    exit_code = main(["migrate-db", "--revision", "head"])
+
+    output = capsys.readouterr().out
+    assert exit_code == 0
+    assert calls == [(dsn, "head")]
+    assert "migrated postgresql://127.0.0.1:55432/translation_agent to head" in output
 
 
 @pytest.mark.unit
