@@ -249,6 +249,7 @@ Useful commands:
 
 ```bash
 uv run ruff check .
+uv run detect-secrets scan > .secrets.baseline
 uv run pre-commit run --all-files
 uv run pyright
 uv run pytest -m "unit or slice"
@@ -256,6 +257,8 @@ uv run pytest -m contract
 uv run pytest -m "integration or migration" -n 2 --dist=loadfile
 uv run pytest -m "regression and not staging_only"
 ```
+
+The pre-commit suite now includes `detect-secrets` with [`.secrets.baseline`](./.secrets.baseline) so new credential-like additions are blocked while the current fake/test fixtures stay allowlisted. Regenerate the baseline only when you intentionally add or change known non-secret fixtures.
 
 The highest-signal workflow coverage lives in:
 
