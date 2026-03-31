@@ -16,7 +16,10 @@ from translation_agent.nodes.adjudicate import adjudicate_transcript, adjudicate
 from translation_agent.nodes.extract_audio import extract_audio
 from translation_agent.nodes.finalize import finalize_outputs
 from translation_agent.nodes.ingest import ingest_job
-from translation_agent.nodes.memory_pipeline import background_memory_pipeline
+from translation_agent.nodes.memory_pipeline import (
+    background_memory_pipeline,
+    drain_background_memory,
+)
 from translation_agent.nodes.normalize import normalize_transcripts, normalize_translations
 from translation_agent.nodes.review import review_transcripts, review_translations
 from translation_agent.nodes.transcription import fanout_transcription
@@ -111,8 +114,24 @@ def run_workflow(initial_state: GraphState, runtime: WorkflowRuntime) -> GraphSt
     compiled = build_workflow_graph(runtime)
     result = compiled.invoke(initial_state)
     final_state = GraphState.model_validate(result)
+    try:
+        final_state = drain_background_memory(final_state, runtime)
+    except Exception as exc:
+        runtime.trace_sink.record(
+            TraceEvent(
+                run_id=final_state.run_id,
+                name="memory_pipeline.failed",
+                attributes={"error": str(exc)},
+            )
+        )
     _sync_trace_artifact(final_state, runtime)
     return final_state
+
+
+def sync_trace_artifact(state: GraphState, runtime: WorkflowRuntime) -> None:
+    """Synchronize a published trace artifact with the current trace sink contents."""
+
+    _sync_trace_artifact(state, runtime)
 
 
 def _instrumented_node(name: str, runtime: WorkflowRuntime, node_fn: NodeFn):

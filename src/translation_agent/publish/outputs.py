@@ -163,7 +163,7 @@ def _final_transcript(state: GraphState, runtime: WorkflowRuntime) -> Transcript
         return None
     transcript_candidates = select_transcript_candidates(
         runtime,
-        job_id=state.job.job_id,
+        job=state.job,
         candidate_ids=(state.final_transcript_candidate_id,),
     )
     if transcript_candidates:
@@ -176,7 +176,7 @@ def _final_translation(state: GraphState, runtime: WorkflowRuntime) -> Translati
         return None
     translation_candidates = select_translation_candidates(
         runtime,
-        job_id=state.job.job_id,
+        job=state.job,
         candidate_ids=(state.final_translation_candidate_id,),
     )
     if translation_candidates:

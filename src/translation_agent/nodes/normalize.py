@@ -13,6 +13,7 @@ from translation_agent.nodes.common import (
     translation_candidate_key,
     write_model_artifact,
 )
+from translation_agent.storage import operational_job_key
 
 
 def normalize_transcripts(state: GraphState, runtime: WorkflowRuntime) -> dict[str, object]:
@@ -22,7 +23,10 @@ def normalize_transcripts(state: GraphState, runtime: WorkflowRuntime) -> dict[s
     for raw_ref in state.raw_transcript_candidate_refs:
         candidate = read_model_artifact(runtime, raw_ref, TranscriptCandidate)
         normalized = normalized_transcript(candidate)
-        runtime.decision_store.save_transcript_candidate(normalized)
+        runtime.decision_store.save_transcript_candidate(
+            normalized,
+            storage_job_id=operational_job_key(state.job),
+        )
         write_model_artifact(
             runtime,
             transcript_candidate_key(state.job, normalized.candidate_id),
@@ -55,7 +59,10 @@ def normalize_translations(state: GraphState, runtime: WorkflowRuntime) -> dict[
     for raw_ref in state.raw_translation_candidate_refs:
         candidate = read_model_artifact(runtime, raw_ref, TranslationCandidate)
         normalized = normalized_translation(candidate)
-        runtime.decision_store.save_translation_candidate(normalized)
+        runtime.decision_store.save_translation_candidate(
+            normalized,
+            storage_job_id=operational_job_key(state.job),
+        )
         candidate_key = translation_candidate_key(state.job, normalized.candidate_id)
         write_model_artifact(runtime, candidate_key, normalized)
         candidates.append(normalized)

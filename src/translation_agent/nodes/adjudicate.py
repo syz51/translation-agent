@@ -32,6 +32,7 @@ from translation_agent.review import (
     adjudication_memory_bundle,
     content_risk_class_for_scenario,
 )
+from translation_agent.storage import operational_job_key
 
 
 def adjudicate_transcript(state: GraphState, runtime: WorkflowRuntime) -> dict[str, object]:
@@ -39,7 +40,7 @@ def adjudicate_transcript(state: GraphState, runtime: WorkflowRuntime) -> dict[s
 
     candidates = select_transcript_candidates(
         runtime,
-        job_id=state.job.job_id,
+        job=state.job,
         candidate_ids=state.transcript_candidate_ids,
     )
     reviews = load_reviews(
@@ -96,7 +97,10 @@ def adjudicate_transcript(state: GraphState, runtime: WorkflowRuntime) -> dict[s
         escalated=outcome.escalated,
         human_review_required=outcome.human_review_required,
     )
-    runtime.decision_store.save_transcript_decision(decision)
+    runtime.decision_store.save_transcript_decision(
+        decision,
+        storage_job_id=operational_job_key(state.job),
+    )
     decision_ref = write_model_artifact(
         runtime,
         transcript_decision_key(state.job),
@@ -133,7 +137,7 @@ def adjudicate_translation(state: GraphState, runtime: WorkflowRuntime) -> dict[
 
     candidates = select_translation_candidates(
         runtime,
-        job_id=state.job.job_id,
+        job=state.job,
         candidate_ids=state.translation_candidate_ids,
     )
     reviews = load_reviews(
@@ -146,7 +150,7 @@ def adjudicate_translation(state: GraphState, runtime: WorkflowRuntime) -> dict[
         decision = FinalTranslationDecision(
             job_id=state.job.job_id,
             winner_candidate_id=None,
-            decision_mode="automatic_finalize",
+            decision_mode="human_review",
             decision_confidence=0.0,
             rationale_summary=(
                 "All translation variants failed; transcript preserved for recovery."
@@ -165,12 +169,15 @@ def adjudicate_translation(state: GraphState, runtime: WorkflowRuntime) -> dict[
                 total_score=0.0,
                 content_risk_class="standard",
             ),
-            escalated=False,
-            human_review_required=False,
+            escalated=True,
+            human_review_required=True,
             prompt_variant_winner=None,
             prompt_version_winner=None,
         )
-        runtime.decision_store.save_translation_decision(decision)
+        runtime.decision_store.save_translation_decision(
+            decision,
+            storage_job_id=operational_job_key(state.job),
+        )
         decision_ref = write_model_artifact(
             runtime,
             translation_decision_key(state.job),
@@ -180,18 +187,17 @@ def adjudicate_translation(state: GraphState, runtime: WorkflowRuntime) -> dict[
             "current_stage": "adjudicate_translation",
             "final_translation_candidate_id": None,
             "final_translation_decision_ref": decision_ref,
-            "pending_memory_source_stage": "translation_adjudication",
-            "escalation_pending": False,
-            "human_review_required": False,
+            "pending_memory_source_stage": None,
+            "escalation_pending": True,
+            "human_review_required": True,
             "translation_failed": True,
             "routing_facts": state.routing_facts
-            + (
-                RoutingFact(
-                    stage="adjudicate_translation",
-                    fact_type="decision_mode",
-                    value=decision.decision_mode,
-                    source_ref=decision_ref,
-                ),
+            + _routing_facts(
+                stage="adjudicate_translation",
+                decision_mode=decision.decision_mode,
+                decision_ref=decision_ref,
+                disagreement_bucket=decision.disagreement_bucket,
+                investigation_ref=None,
             ),
         }
 
@@ -280,7 +286,10 @@ def adjudicate_translation(state: GraphState, runtime: WorkflowRuntime) -> dict[
         prompt_variant_winner=winner.prompt_variant_id if winner is not None else None,
         prompt_version_winner=winner.prompt_version if winner is not None else None,
     )
-    runtime.decision_store.save_translation_decision(decision)
+    runtime.decision_store.save_translation_decision(
+        decision,
+        storage_job_id=operational_job_key(state.job),
+    )
     decision_ref = write_model_artifact(
         runtime,
         translation_decision_key(state.job),
@@ -333,7 +342,12 @@ def _persist_investigation(
 ) -> str | None:
     if payload is None:
         return None
-    runtime.decision_store.save_investigation(job_id=job.job_id, stage=stage, payload=payload)
+    runtime.decision_store.save_investigation(
+        job_id=job.job_id,
+        stage=stage,
+        payload=payload,
+        storage_job_id=operational_job_key(job),
+    )
     key = (
         transcript_investigation_key(job)
         if stage == TRANSCRIPT_REVIEW_STAGE

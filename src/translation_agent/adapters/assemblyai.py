@@ -17,7 +17,7 @@ from translation_agent.adapters.common import (
     poll_until_complete,
 )
 from translation_agent.models import AudioArtifact, RequestContext, Segment, TranscriptCandidate
-from translation_agent.storage import BlobStore, job_path
+from translation_agent.storage import BlobStore, job_path, job_scope_token
 
 JsonFetcher = Callable[[str], dict[str, Any]]
 
@@ -88,7 +88,7 @@ class AssemblyAITranscriptionAdapter:
         self._store_raw_payload(raw_payload_ref, final_payload)
         return _candidate_from_payload(
             final_payload,
-            job_id=request_context.job.job_id,
+            request_context=request_context,
             language=request_context.job.source_language,
             raw_payload_ref=raw_payload_ref,
         )
@@ -146,7 +146,7 @@ class AssemblyAITranscriptionAdapter:
 def _candidate_from_payload(
     payload: dict[str, Any],
     *,
-    job_id: str,
+    request_context: RequestContext,
     language: str,
     raw_payload_ref: str,
 ) -> TranscriptCandidate:
@@ -169,8 +169,10 @@ def _candidate_from_payload(
         segment.speaker: segment.speaker for segment in segments if segment.speaker is not None
     }
     return TranscriptCandidate(
-        candidate_id=f"tr-assemblyai-{job_id}",
-        job_id=job_id,
+        candidate_id=(
+            f"tr-assemblyai-{request_context.job.job_id}-{job_scope_token(request_context.job)}"
+        ),
+        job_id=request_context.job.job_id,
         provider_id="assemblyai",
         provider_request_id=transcript_id,
         language=language,

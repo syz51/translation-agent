@@ -8,10 +8,16 @@ from .prompt_evolution import (
     DeterministicPromptEvolutionBackend,
     PromptEvolutionBackend,
 )
-from .recall import InMemoryLongTermMemoryStore, LongTermMemoryRecallBackend, MemoryRecallBackend
+from .recall import (
+    BlobBackedLongTermMemoryStore,
+    InMemoryLongTermMemoryStore,
+    LongTermMemoryRecallBackend,
+    MemoryRecallBackend,
+)
 from .staging import DeterministicMemoryStagingBackend, MemoryStagingBackend
 
 __all__ = [
+    "BlobBackedLongTermMemoryStore",
     "DeterministicMemoryConsolidationBackend",
     "DeterministicMemoryStagingBackend",
     "DeterministicPromptEvolutionBackend",

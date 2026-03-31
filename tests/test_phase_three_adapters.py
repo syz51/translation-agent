@@ -40,7 +40,13 @@ from translation_agent.normalization import (
     normalize_translation_candidate,
 )
 from translation_agent.observability import NoOpTraceSink
-from translation_agent.storage import LocalBlobStore, NodeExecutionRecord, RunRecord, job_path
+from translation_agent.storage import (
+    LocalBlobStore,
+    NodeExecutionRecord,
+    RunRecord,
+    job_path,
+    job_scope_token,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -215,10 +221,11 @@ def _artifact_path(*parts: str) -> str:
 
 
 def _audio_artifact(job_id: str = "job-phase-three") -> AudioArtifact:
+    job = _job_context(job_id)
     return AudioArtifact(
         artifact_id=f"audio-{job_id}",
         job_id=job_id,
-        blob_ref=f"audio/{job_id}.wav",
+        blob_ref=job_path(job, "artifacts", "audio.wav"),
         duration_ms=1_000,
         sample_rate_hz=16_000,
         channels=1,
@@ -287,7 +294,7 @@ def test_ffmpeg_adapter_extracts_audio_and_persists_blob(tmp_path: Path) -> None
 
     artifact = adapter.extract_audio(str(source_path), _request_context())
 
-    assert artifact.blob_ref == "audio/job-phase-three.wav"
+    assert artifact.blob_ref == _artifact_path("artifacts", "audio.wav")
     assert blob_store.read_bytes(artifact.blob_ref).startswith(b"RIFF")
     assert artifact.duration_ms == 1000
     assert commands[0][:4] == ["ffmpeg", "-y", "-i", str(source_path)]
@@ -327,7 +334,7 @@ def test_ffmpeg_adapter_retries_retryable_timeout(tmp_path: Path) -> None:
     artifact = adapter.extract_audio(str(source_path), _request_context())
 
     assert attempts == 2
-    assert artifact.blob_ref == "audio/job-phase-three.wav"
+    assert artifact.blob_ref == _artifact_path("artifacts", "audio.wav")
 
 
 def test_ffmpeg_adapter_stops_after_retry_budget_exhausted(tmp_path: Path) -> None:
@@ -358,6 +365,34 @@ def test_ffmpeg_adapter_stops_after_retry_budget_exhausted(tmp_path: Path) -> No
         adapter.extract_audio(str(source_path), _request_context())
 
     assert attempts == 2
+
+
+def test_ffmpeg_adapter_scopes_temp_and_blob_paths_for_untrusted_job_ids(tmp_path: Path) -> None:
+    source_path = tmp_path / "input.mp4"
+    source_path.write_bytes(b"video")
+    blob_store = LocalBlobStore(tmp_path / "blobs")
+    request_context = _request_context("../tenant-breakout")
+
+    commands: list[list[str]] = []
+
+    def fake_runner(command: Sequence[str], timeout_seconds: float) -> FfmpegCompletedProcess:
+        commands.append(list(command))
+        with wave.open(str(Path(command[-1])), "wb") as handle:
+            handle.setnchannels(1)
+            handle.setsampwidth(2)
+            handle.setframerate(16_000)
+            handle.writeframes(b"\x00\x00" * 16_000)
+        assert timeout_seconds == 120.0
+        return FfmpegCompletedProcess(returncode=0, stderr=b"ok")
+
+    artifact = FFmpegAudioExtractionAdapter(
+        blob_store=blob_store,
+        command_runner=fake_runner,
+    ).extract_audio(str(source_path), request_context)
+
+    assert commands[0][-1].endswith(f"audio-{job_scope_token(request_context.job)}.wav")
+    assert ".." not in commands[0][-1]
+    assert artifact.blob_ref == job_path(request_context.job, "artifacts", "audio.wav")
 
 
 @pytest.mark.contract
@@ -981,6 +1016,68 @@ def test_openai_translation_adapter_rejects_non_json_output(tmp_path: Path) -> N
         adapter.generate_translation(_transcript_candidate(), "variant-a", _request_context())
 
 
+def test_openai_translation_adapter_rejects_partial_segment_payloads(tmp_path: Path) -> None:
+    blob_store = LocalBlobStore(tmp_path / "blobs")
+    transcript = TranscriptCandidate(
+        candidate_id=f"tr-openai-job-phase-three-{job_scope_token(_job_context())}",
+        job_id="job-phase-three",
+        provider_id="assemblyai",
+        provider_request_id="provider-job",
+        language="en",
+        segments=(
+            Segment(
+                segment_id="seg-1",
+                start_ms=0,
+                end_ms=900,
+                speaker="speaker-1",
+                source_text="Hello world",
+            ),
+            Segment(
+                segment_id="seg-2",
+                start_ms=900,
+                end_ms=1800,
+                speaker="speaker-1",
+                source_text="Goodbye world",
+            ),
+        ),
+        full_text="Hello world Goodbye world",
+        speaker_map={"speaker-1": "speaker-1"},
+        timing_resolution="segment",
+        raw_payload_ref=_artifact_path("raw", "provider-payloads", "assemblyai.json"),
+        normalization_version="raw",
+        metadata={},
+    )
+    transport = SequencedTransport(
+        [
+            _json_response(
+                {
+                    "output_text": json.dumps(
+                        {
+                            "full_text": "Bonjour le monde Au revoir le monde",
+                            "segments": [
+                                {
+                                    "segment_id": "seg-1",
+                                    "target_text": "Bonjour le monde",
+                                }
+                            ],
+                        }
+                    )
+                }
+            )
+        ]
+    )
+    adapter = OpenAITranslationAdapter(
+        api_key="test-key",
+        blob_store=blob_store,
+        transport=transport,
+        retry_policy=_retry_policy(),
+        sleep=lambda _: None,
+    )
+
+    with pytest.raises(AdapterError, match="missing segment translations"):
+        adapter.generate_translation(transcript, "variant-a", _request_context())
+
+
 def test_phase_three_normalization_helpers_canonicalize_candidates() -> None:
     transcript = TranscriptCandidate(
         candidate_id=" tr-1 ",
@@ -1307,8 +1404,16 @@ def test_phase_three_runtime_completes_workflow_with_real_adapters(tmp_path: Pat
     assert blob_store.exists(_artifact_path("raw", "provider-payloads", "deepgram.json"))
     assert blob_store.exists(_artifact_path("raw", "provider-payloads", "openai-variant-a.json"))
     assert blob_store.exists(
-        _artifact_path("candidates", "transcripts", "tr-assemblyai-job-phase-three.json")
+        _artifact_path(
+            "candidates",
+            "transcripts",
+            final_state.transcript_candidate_ids[0] + ".json",
+        )
     )
     assert blob_store.exists(
-        _artifact_path("candidates", "translations", "tl-variant-a-job-phase-three.json")
+        _artifact_path(
+            "candidates",
+            "translations",
+            final_state.final_translation_candidate_id + ".json",
+        )
     )

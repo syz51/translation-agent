@@ -23,7 +23,7 @@ from translation_agent.normalization import (
     normalize_transcript_candidate,
     normalize_translation_candidate,
 )
-from translation_agent.storage import job_path
+from translation_agent.storage import job_path, operational_job_key
 
 TRANSCRIPT_REVIEW_STAGE = "transcript"
 TRANSLATION_REVIEW_STAGE = "translation"
@@ -194,12 +194,15 @@ def translation_failure_key(job: JobContext) -> str:
 def select_transcript_candidates(
     runtime: WorkflowRuntime,
     *,
-    job_id: str,
+    job: JobContext,
     candidate_ids: tuple[str, ...],
 ) -> list[TranscriptCandidate]:
     """Read transcript candidates from the in-memory decision store."""
 
-    candidates = runtime.decision_store.list_transcript_candidates(job_id)
+    candidates = runtime.decision_store.list_transcript_candidates(
+        job.job_id,
+        storage_job_id=operational_job_key(job),
+    )
     selected_ids = set(candidate_ids)
     selected = [candidate for candidate in candidates if candidate.candidate_id in selected_ids]
     return sorted(selected, key=transcript_sort_key)
@@ -208,12 +211,15 @@ def select_transcript_candidates(
 def select_translation_candidates(
     runtime: WorkflowRuntime,
     *,
-    job_id: str,
+    job: JobContext,
     candidate_ids: tuple[str, ...],
 ) -> list[TranslationCandidate]:
     """Read translation candidates from the in-memory decision store."""
 
-    candidates = runtime.decision_store.list_translation_candidates(job_id)
+    candidates = runtime.decision_store.list_translation_candidates(
+        job.job_id,
+        storage_job_id=operational_job_key(job),
+    )
     selected_ids = set(candidate_ids)
     selected = [candidate for candidate in candidates if candidate.candidate_id in selected_ids]
     return sorted(selected, key=translation_sort_key)

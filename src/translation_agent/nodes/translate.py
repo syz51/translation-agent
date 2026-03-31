@@ -27,7 +27,7 @@ def generate_translation_candidates(
 
     candidates = select_transcript_candidates(
         runtime,
-        job_id=state.job.job_id,
+        job=state.job,
         candidate_ids=(state.final_transcript_candidate_id,),
     )
     if not candidates:

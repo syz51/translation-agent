@@ -15,7 +15,7 @@ from translation_agent.config import (
     validate_runtime_compatibility,
 )
 from translation_agent.models import JobContext
-from translation_agent.storage import PostgresRunStore, job_path
+from translation_agent.storage import PostgresRunStore, job_path, job_scope_token
 
 
 def _job_context(job_id: str = "job-123") -> JobContext:
@@ -252,6 +252,35 @@ def test_run_job_defaults_to_local_sqlite_runtime(
     local_job = _job_context(job_id="job-local")
     assert (result.blob_root / Path(job_path(local_job, "published", "transcript.json"))).exists()
     assert (result.blob_root / Path(job_path(local_job, "published", "translation.json"))).exists()
+
+
+@pytest.mark.unit
+def test_run_job_persists_long_term_memory_across_separate_runs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("TA_DATA_DIR", str(tmp_path / "runtime"))
+    monkeypatch.delenv("TA_STATE_DB_DSN", raising=False)
+
+    first = RunJobRequest(source="input.mp4", job_id="job-memory-a")
+    second = RunJobRequest(source="input.mp4", job_id="job-memory-b")
+
+    run_job(first)
+    second_result = run_job(second)
+
+    second_job = _job_context(job_id="job-memory-b")
+    memory_bundle = json.loads(
+        (
+            second_result.blob_root
+            / Path(job_path(second_job, "memory", "recall", "translation-review.json"))
+        ).read_text(encoding="utf-8")
+    )
+
+    expected_fragment = (
+        "translation adjudication trusted "
+        f"tl-variant-a-job-memory-a-{job_scope_token(_job_context(job_id='job-memory-a'))}"
+    )
+    assert any(expected_fragment in entry["content"] for entry in memory_bundle["semantic_memory"])
 
 
 @pytest.mark.integration

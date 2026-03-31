@@ -16,7 +16,12 @@ from translation_agent.models import (
     TranscriptCandidate,
     TranslationCandidate,
 )
-from translation_agent.storage import PostgresOperationalStore, SQLiteOperationalStore
+from translation_agent.storage import (
+    PostgresOperationalStore,
+    SQLiteOperationalStore,
+    job_scope_token,
+    operational_job_key,
+)
 
 
 def _job(job_id: str = "job-operational") -> JobContext:
@@ -216,3 +221,126 @@ def test_postgres_operational_store_persists_candidates_decisions_investigations
         assert reopened.get_translation_decision(job.job_id) == translation_decision
         assert reopened.get_investigation(job_id=job.job_id, stage="translation") == investigation
         assert reopened.get_batch(batch.batch_id) == batch
+
+
+@pytest.mark.unit
+def test_sqlite_operational_store_isolates_same_raw_job_id_by_scoped_storage_key(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.sqlite3"
+    tenant_a = _job("job-shared")
+    tenant_b = _job("job-shared").model_copy(update={"tenant_id": "tenant-2"})
+
+    transcript_a = _transcript_candidate(tenant_a.job_id).model_copy(
+        update={"candidate_id": f"tr-{tenant_a.job_id}-{job_scope_token(tenant_a)}"}
+    )
+    transcript_b = _transcript_candidate(tenant_b.job_id).model_copy(
+        update={"candidate_id": f"tr-{tenant_b.job_id}-{job_scope_token(tenant_b)}"}
+    )
+    decision_a = _transcript_decision(tenant_a.job_id)
+    decision_b = _transcript_decision(tenant_b.job_id).model_copy(
+        update={"winner_candidate_id": transcript_b.candidate_id}
+    )
+
+    with SQLiteOperationalStore(db_path) as store:
+        store.save_transcript_candidate(
+            transcript_a,
+            storage_job_id=operational_job_key(tenant_a),
+        )
+        store.save_transcript_candidate(
+            transcript_b,
+            storage_job_id=operational_job_key(tenant_b),
+        )
+        store.save_transcript_decision(
+            decision_a,
+            storage_job_id=operational_job_key(tenant_a),
+        )
+        store.save_transcript_decision(
+            decision_b,
+            storage_job_id=operational_job_key(tenant_b),
+        )
+
+    with SQLiteOperationalStore(db_path) as reopened:
+        assert reopened.list_transcript_candidates(
+            tenant_a.job_id,
+            storage_job_id=operational_job_key(tenant_a),
+        ) == [transcript_a]
+        assert reopened.list_transcript_candidates(
+            tenant_b.job_id,
+            storage_job_id=operational_job_key(tenant_b),
+        ) == [transcript_b]
+        assert (
+            reopened.get_transcript_decision(
+                tenant_a.job_id,
+                storage_job_id=operational_job_key(tenant_a),
+            )
+            == decision_a
+        )
+        assert (
+            reopened.get_transcript_decision(
+                tenant_b.job_id,
+                storage_job_id=operational_job_key(tenant_b),
+            )
+            == decision_b
+        )
+
+
+@pytest.mark.integration
+def test_postgres_operational_store_isolates_same_raw_job_id_by_scoped_storage_key(
+    migrated_postgres_dsn: str,
+) -> None:
+    tenant_a = _job("job-shared-postgres")
+    tenant_b = _job("job-shared-postgres").model_copy(update={"tenant_id": "tenant-2"})
+
+    transcript_a = _transcript_candidate(tenant_a.job_id).model_copy(
+        update={"candidate_id": f"tr-{tenant_a.job_id}-{job_scope_token(tenant_a)}"}
+    )
+    transcript_b = _transcript_candidate(tenant_b.job_id).model_copy(
+        update={"candidate_id": f"tr-{tenant_b.job_id}-{job_scope_token(tenant_b)}"}
+    )
+    decision_a = _transcript_decision(tenant_a.job_id)
+    decision_b = _transcript_decision(tenant_b.job_id).model_copy(
+        update={"winner_candidate_id": transcript_b.candidate_id}
+    )
+
+    with PostgresOperationalStore(migrated_postgres_dsn) as store:
+        store.save_transcript_candidate(
+            transcript_a,
+            storage_job_id=operational_job_key(tenant_a),
+        )
+        store.save_transcript_candidate(
+            transcript_b,
+            storage_job_id=operational_job_key(tenant_b),
+        )
+        store.save_transcript_decision(
+            decision_a,
+            storage_job_id=operational_job_key(tenant_a),
+        )
+        store.save_transcript_decision(
+            decision_b,
+            storage_job_id=operational_job_key(tenant_b),
+        )
+
+    with PostgresOperationalStore(migrated_postgres_dsn) as reopened:
+        assert reopened.list_transcript_candidates(
+            tenant_a.job_id,
+            storage_job_id=operational_job_key(tenant_a),
+        ) == [transcript_a]
+        assert reopened.list_transcript_candidates(
+            tenant_b.job_id,
+            storage_job_id=operational_job_key(tenant_b),
+        ) == [transcript_b]
+        assert (
+            reopened.get_transcript_decision(
+                tenant_a.job_id,
+                storage_job_id=operational_job_key(tenant_a),
+            )
+            == decision_a
+        )
+        assert (
+            reopened.get_transcript_decision(
+                tenant_b.job_id,
+                storage_job_id=operational_job_key(tenant_b),
+            )
+            == decision_b
+        )

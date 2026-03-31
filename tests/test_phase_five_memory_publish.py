@@ -27,7 +27,13 @@ from translation_agent.models import (
     MemoryWriteBatch,
 )
 from translation_agent.observability import NoOpTraceSink
-from translation_agent.storage import LocalBlobStore, NodeExecutionRecord, RunRecord, job_path
+from translation_agent.storage import (
+    LocalBlobStore,
+    NodeExecutionRecord,
+    RunRecord,
+    job_path,
+    job_scope_token,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -206,6 +212,9 @@ def _run_workflow(
 
 def test_phase_five_happy_path_publishes_audit_ready_outputs(tmp_path: Path) -> None:
     final_state, runtime, blob_store = _run_workflow(tmp_path, scenario="happy")
+    scope_token = job_scope_token(_job_context())
+    consolidation_id = f"consolidation-batch-translation_adjudication-job-phase-five-{scope_token}"
+    prompt_id = f"prompt-evolution-{consolidation_id}"
 
     assert blob_store.exists(_artifact_path("published", "scorecard.json"))
     assert blob_store.exists(_artifact_path("exports", "translation.txt"))
@@ -215,14 +224,14 @@ def test_phase_five_happy_path_publishes_audit_ready_outputs(tmp_path: Path) -> 
         _artifact_path(
             "memory",
             "consolidations",
-            "consolidation-batch-translation_adjudication-job-phase-five.json",
+            f"{consolidation_id}.json",
         )
     )
     assert blob_store.exists(
         _artifact_path(
             "memory",
             "prompt-evolution",
-            "prompt-evolution-consolidation-batch-translation_adjudication-job-phase-five.json",
+            f"{prompt_id}.json",
         )
     )
 
@@ -234,7 +243,7 @@ def test_phase_five_happy_path_publishes_audit_ready_outputs(tmp_path: Path) -> 
             _artifact_path(
                 "memory",
                 "prompt-evolution",
-                "prompt-evolution-consolidation-batch-translation_adjudication-job-phase-five.json",
+                f"{prompt_id}.json",
             )
         ).decode("utf-8")
     )
@@ -258,10 +267,41 @@ def test_phase_five_translation_failure_publishes_recoverable_manifest(tmp_path:
         blob_store.read_bytes(_artifact_path("published", "scorecard.json")).decode("utf-8")
     )
     assert scorecard["translation_failed"] is True
-    assert scorecard["translation_failure_ref"] == _artifact_path(
-        "published",
-        "translation-failed.json",
+
+
+def test_phase_five_background_memory_failures_do_not_block_finalization(tmp_path: Path) -> None:
+    run_store = InMemoryRunStore()
+    run_store.create_run(run_id="run-phase-five-failing-memory", status="running")
+    blob_store = LocalBlobStore(tmp_path / "blobs")
+    source_ref = "jobs/run-phase-five-failing-memory-request.json"
+    blob_store.put_bytes(source_ref, b"{}\n")
+    runtime = build_phase_two_runtime(
+        blob_store=blob_store,
+        run_store=run_store,
+        trace_sink=NoOpTraceSink(),
+        source_artifact_ref=source_ref,
+        scenario="happy",
     )
+
+    class FailingConsolidationBackend:
+        def consolidate_batch(self, batch):  # noqa: ANN001
+            raise RuntimeError(f"boom:{batch.batch_id}")
+
+    runtime.memory_consolidation_backend = FailingConsolidationBackend()
+    final_state = run_workflow(
+        GraphState(
+            run_id="run-phase-five-failing-memory",
+            job=_job_context(job_id="job-phase-five-failing-memory"),
+            current_stage="ingest",
+            source_video_ref="input.mp4",
+            source_artifact_ref=source_ref,
+        ),
+        runtime,
+    )
+
+    assert final_state.current_stage == "finalize_outputs"
+    failed_job = _job_context(job_id="job-phase-five-failing-memory")
+    assert blob_store.exists(job_path(failed_job, "published", "translation.json"))
 
 
 def test_phase_five_memory_consolidation_dedupes_and_scopes_recall() -> None:

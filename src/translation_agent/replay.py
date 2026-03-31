@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+from dataclasses import dataclass, replace
 from typing import cast
 
 from translation_agent.graph.runtime import WorkflowRuntime
@@ -17,7 +18,7 @@ from translation_agent.models import (
     TranslationCandidate,
 )
 from translation_agent.models.review import DisagreementBucket, ReviewStage
-from translation_agent.nodes.common import read_model_artifact
+from translation_agent.nodes.common import read_model_artifact, translation_investigation_key
 from translation_agent.review import AdjudicationOutcome, adjudicate_reviews
 
 
@@ -96,6 +97,11 @@ def replay_adjudication(
         )
     else:
         translation_candidates = cast(tuple[TranslationCandidate, ...], candidates)
+        outcome = _replay_translation_timeout_escalation(
+            runtime=runtime,
+            job=request.job,
+            outcome=outcome,
+        )
         winner = next(
             (
                 candidate
@@ -129,6 +135,36 @@ def replay_adjudication(
         outcome=outcome,
         decision=decision,
         disagreement_bucket=outcome.disagreement_bucket,
+    )
+
+
+def _replay_translation_timeout_escalation(
+    *,
+    runtime: WorkflowRuntime,
+    job: JobContext,
+    outcome: AdjudicationOutcome,
+) -> AdjudicationOutcome:
+    try:
+        payload = json.loads(
+            runtime.blob_store.read_bytes(translation_investigation_key(job)).decode("utf-8")
+        )
+    except Exception:
+        return outcome
+    if not isinstance(payload, dict) or payload.get("status") != "timed_out":
+        return outcome
+    return replace(
+        outcome,
+        winner_candidate_id=None,
+        decision_mode="human_review",
+        decision_confidence=0.0,
+        rationale_summary=(
+            "Translation conflict investigation timed out after medium disagreement, "
+            "so the run escalated to human review."
+        ),
+        disagreement_bucket="unresolved",
+        escalated=True,
+        human_review_required=True,
+        investigation_payload=payload,
     )
 
 

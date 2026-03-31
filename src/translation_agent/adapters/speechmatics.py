@@ -20,7 +20,7 @@ from translation_agent.adapters.common import (
     poll_until_complete,
 )
 from translation_agent.models import AudioArtifact, RequestContext, Segment, TranscriptCandidate
-from translation_agent.storage import BlobStore, job_path
+from translation_agent.storage import BlobStore, job_path, job_scope_token
 
 
 class SpeechmaticsTranscriptionAdapter:
@@ -92,7 +92,7 @@ class SpeechmaticsTranscriptionAdapter:
         )
         return _candidate_from_payload(
             transcript_payload,
-            job_id=request_context.job.job_id,
+            request_context=request_context,
             provider_request_id=job_id,
             language=request_context.job.source_language,
             raw_payload_ref=raw_payload_ref,
@@ -158,7 +158,7 @@ class SpeechmaticsTranscriptionAdapter:
 def _candidate_from_payload(
     payload: dict[str, Any],
     *,
-    job_id: str,
+    request_context: RequestContext,
     provider_request_id: str,
     language: str,
     raw_payload_ref: str,
@@ -187,8 +187,10 @@ def _candidate_from_payload(
             retryable=False,
         )
     return TranscriptCandidate(
-        candidate_id=f"tr-speechmatics-{job_id}",
-        job_id=job_id,
+        candidate_id=(
+            f"tr-speechmatics-{request_context.job.job_id}-{job_scope_token(request_context.job)}"
+        ),
+        job_id=request_context.job.job_id,
         provider_id="speechmatics",
         provider_request_id=provider_request_id,
         language=language,

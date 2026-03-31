@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Protocol, runtime_checkable
 
-from translation_agent.memory.recall import InMemoryLongTermMemoryStore
+from translation_agent.memory.recall import MemoryEntryStore
 from translation_agent.models import MemoryConsolidation, MemoryEntry, MemoryWrite, MemoryWriteBatch
 
 
@@ -18,7 +18,7 @@ class MemoryConsolidationBackend(Protocol):
 class DeterministicMemoryConsolidationBackend:
     """Reference consolidation backend with stable dedupe semantics."""
 
-    def __init__(self, store: InMemoryLongTermMemoryStore) -> None:
+    def __init__(self, store: MemoryEntryStore) -> None:
         self._store = store
 
     def consolidate_batch(self, batch: MemoryWriteBatch) -> MemoryConsolidation:

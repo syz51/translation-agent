@@ -199,7 +199,12 @@ class PostgresOperationalStore(PostgresRunStore):
     def __enter__(self) -> PostgresOperationalStore:
         return self
 
-    def save_transcript_candidate(self, candidate: TranscriptCandidate) -> None:
+    def save_transcript_candidate(
+        self,
+        candidate: TranscriptCandidate,
+        *,
+        storage_job_id: str | None = None,
+    ) -> None:
         payload = candidate.model_dump(mode="json")
         now = _utc_now()
         with self._conn.transaction():
@@ -213,10 +218,21 @@ class PostgresOperationalStore(PostgresRunStore):
                     candidate_json = EXCLUDED.candidate_json,
                     updated_at = EXCLUDED.updated_at
                 """,
-                (candidate.candidate_id, candidate.job_id, _encode_json(payload), now, now),
+                (
+                    candidate.candidate_id,
+                    storage_job_id or candidate.job_id,
+                    _encode_json(payload),
+                    now,
+                    now,
+                ),
             )
 
-    def list_transcript_candidates(self, job_id: str) -> list[TranscriptCandidate]:
+    def list_transcript_candidates(
+        self,
+        job_id: str,
+        *,
+        storage_job_id: str | None = None,
+    ) -> list[TranscriptCandidate]:
         rows = self._conn.execute(
             """
             SELECT candidate_json
@@ -224,30 +240,45 @@ class PostgresOperationalStore(PostgresRunStore):
             WHERE job_id = %s
             ORDER BY candidate_id ASC
             """,
-            (job_id,),
+            (storage_job_id or job_id,),
         ).fetchall()
         return [
             TranscriptCandidate.model_validate(_decode_db_json(row["candidate_json"]))
             for row in rows
         ]
 
-    def save_transcript_decision(self, decision: FinalTranscriptDecision) -> None:
+    def save_transcript_decision(
+        self,
+        decision: FinalTranscriptDecision,
+        *,
+        storage_job_id: str | None = None,
+    ) -> None:
         self._save_singleton_model(
             table="transcript_decisions",
-            job_id=decision.job_id,
+            job_id=storage_job_id or decision.job_id,
             payload=decision.model_dump(mode="json"),
         )
 
-    def get_transcript_decision(self, job_id: str) -> FinalTranscriptDecision | None:
+    def get_transcript_decision(
+        self,
+        job_id: str,
+        *,
+        storage_job_id: str | None = None,
+    ) -> FinalTranscriptDecision | None:
         payload = self._get_singleton_model(
             table="transcript_decisions",
-            job_id=job_id,
+            job_id=storage_job_id or job_id,
         )
         if payload is None:
             return None
         return FinalTranscriptDecision.model_validate(payload)
 
-    def save_translation_candidate(self, candidate: TranslationCandidate) -> None:
+    def save_translation_candidate(
+        self,
+        candidate: TranslationCandidate,
+        *,
+        storage_job_id: str | None = None,
+    ) -> None:
         payload = candidate.model_dump(mode="json")
         now = _utc_now()
         with self._conn.transaction():
@@ -261,10 +292,21 @@ class PostgresOperationalStore(PostgresRunStore):
                     candidate_json = EXCLUDED.candidate_json,
                     updated_at = EXCLUDED.updated_at
                 """,
-                (candidate.candidate_id, candidate.job_id, _encode_json(payload), now, now),
+                (
+                    candidate.candidate_id,
+                    storage_job_id or candidate.job_id,
+                    _encode_json(payload),
+                    now,
+                    now,
+                ),
             )
 
-    def list_translation_candidates(self, job_id: str) -> list[TranslationCandidate]:
+    def list_translation_candidates(
+        self,
+        job_id: str,
+        *,
+        storage_job_id: str | None = None,
+    ) -> list[TranslationCandidate]:
         rows = self._conn.execute(
             """
             SELECT candidate_json
@@ -272,24 +314,34 @@ class PostgresOperationalStore(PostgresRunStore):
             WHERE job_id = %s
             ORDER BY candidate_id ASC
             """,
-            (job_id,),
+            (storage_job_id or job_id,),
         ).fetchall()
         return [
             TranslationCandidate.model_validate(_decode_db_json(row["candidate_json"]))
             for row in rows
         ]
 
-    def save_translation_decision(self, decision: FinalTranslationDecision) -> None:
+    def save_translation_decision(
+        self,
+        decision: FinalTranslationDecision,
+        *,
+        storage_job_id: str | None = None,
+    ) -> None:
         self._save_singleton_model(
             table="translation_decisions",
-            job_id=decision.job_id,
+            job_id=storage_job_id or decision.job_id,
             payload=decision.model_dump(mode="json"),
         )
 
-    def get_translation_decision(self, job_id: str) -> FinalTranslationDecision | None:
+    def get_translation_decision(
+        self,
+        job_id: str,
+        *,
+        storage_job_id: str | None = None,
+    ) -> FinalTranslationDecision | None:
         payload = self._get_singleton_model(
             table="translation_decisions",
-            job_id=job_id,
+            job_id=storage_job_id or job_id,
         )
         if payload is None:
             return None
@@ -301,10 +353,11 @@ class PostgresOperationalStore(PostgresRunStore):
         job_id: str,
         stage: ReviewStage,
         payload: dict[str, object],
+        storage_job_id: str | None = None,
     ) -> None:
         self._save_stage_payload(
             table="investigations",
-            job_id=job_id,
+            job_id=storage_job_id or job_id,
             stage=stage,
             payload=payload,
         )
@@ -314,17 +367,23 @@ class PostgresOperationalStore(PostgresRunStore):
         *,
         job_id: str,
         stage: ReviewStage,
+        storage_job_id: str | None = None,
     ) -> dict[str, object] | None:
         payload = self._get_stage_payload(
             table="investigations",
-            job_id=job_id,
+            job_id=storage_job_id or job_id,
             stage=stage,
         )
         if payload is None:
             return None
         return cast(dict[str, object], payload)
 
-    def save_batch(self, batch: MemoryWriteBatch) -> None:
+    def save_batch(
+        self,
+        batch: MemoryWriteBatch,
+        *,
+        storage_job_id: str | None = None,
+    ) -> None:
         payload = batch.model_dump(mode="json")
         now = _utc_now()
         with self._conn.transaction():
@@ -338,7 +397,7 @@ class PostgresOperationalStore(PostgresRunStore):
                     batch_json = EXCLUDED.batch_json,
                     updated_at = EXCLUDED.updated_at
                 """,
-                (batch.batch_id, batch.job_id, _encode_json(payload), now, now),
+                (batch.batch_id, storage_job_id or batch.job_id, _encode_json(payload), now, now),
             )
 
     def get_batch(self, batch_id: str) -> MemoryWriteBatch | None:
@@ -350,7 +409,12 @@ class PostgresOperationalStore(PostgresRunStore):
             return None
         return MemoryWriteBatch.model_validate(_decode_db_json(row["batch_json"]))
 
-    def list_batches(self, job_id: str) -> list[MemoryWriteBatch]:
+    def list_batches(
+        self,
+        job_id: str,
+        *,
+        storage_job_id: str | None = None,
+    ) -> list[MemoryWriteBatch]:
         rows = self._conn.execute(
             """
             SELECT batch_json
@@ -358,7 +422,7 @@ class PostgresOperationalStore(PostgresRunStore):
             WHERE job_id = %s
             ORDER BY batch_id ASC
             """,
-            (job_id,),
+            (storage_job_id or job_id,),
         ).fetchall()
         return [MemoryWriteBatch.model_validate(_decode_db_json(row["batch_json"])) for row in rows]
 
@@ -617,69 +681,109 @@ class SQLiteOperationalStore(AbstractContextManager["SQLiteOperationalStore"]):
             )
         return _require_node_execution(self.get_node_execution(execution_id), execution_id)
 
-    def save_transcript_candidate(self, candidate: TranscriptCandidate) -> None:
+    def save_transcript_candidate(
+        self,
+        candidate: TranscriptCandidate,
+        *,
+        storage_job_id: str | None = None,
+    ) -> None:
         self._save_candidate(
             table="transcript_candidates",
             candidate_id=candidate.candidate_id,
-            job_id=candidate.job_id,
+            job_id=storage_job_id or candidate.job_id,
             payload=candidate.model_dump(mode="json"),
         )
 
-    def list_transcript_candidates(self, job_id: str) -> list[TranscriptCandidate]:
+    def list_transcript_candidates(
+        self,
+        job_id: str,
+        *,
+        storage_job_id: str | None = None,
+    ) -> list[TranscriptCandidate]:
         return [
             TranscriptCandidate.model_validate(payload)
             for payload in self._list_payloads(
                 table="transcript_candidates",
-                job_id=job_id,
+                job_id=storage_job_id or job_id,
                 column="candidate_json",
             )
         ]
 
-    def save_transcript_decision(self, decision: FinalTranscriptDecision) -> None:
+    def save_transcript_decision(
+        self,
+        decision: FinalTranscriptDecision,
+        *,
+        storage_job_id: str | None = None,
+    ) -> None:
         self._save_singleton_model(
             table="transcript_decisions",
-            job_id=decision.job_id,
+            job_id=storage_job_id or decision.job_id,
             payload=decision.model_dump(mode="json"),
         )
 
-    def get_transcript_decision(self, job_id: str) -> FinalTranscriptDecision | None:
+    def get_transcript_decision(
+        self,
+        job_id: str,
+        *,
+        storage_job_id: str | None = None,
+    ) -> FinalTranscriptDecision | None:
         payload = self._get_singleton_payload(
             table="transcript_decisions",
-            job_id=job_id,
+            job_id=storage_job_id or job_id,
         )
         if payload is None:
             return None
         return FinalTranscriptDecision.model_validate(payload)
 
-    def save_translation_candidate(self, candidate: TranslationCandidate) -> None:
+    def save_translation_candidate(
+        self,
+        candidate: TranslationCandidate,
+        *,
+        storage_job_id: str | None = None,
+    ) -> None:
         self._save_candidate(
             table="translation_candidates",
             candidate_id=candidate.candidate_id,
-            job_id=candidate.job_id,
+            job_id=storage_job_id or candidate.job_id,
             payload=candidate.model_dump(mode="json"),
         )
 
-    def list_translation_candidates(self, job_id: str) -> list[TranslationCandidate]:
+    def list_translation_candidates(
+        self,
+        job_id: str,
+        *,
+        storage_job_id: str | None = None,
+    ) -> list[TranslationCandidate]:
         return [
             TranslationCandidate.model_validate(payload)
             for payload in self._list_payloads(
                 table="translation_candidates",
-                job_id=job_id,
+                job_id=storage_job_id or job_id,
                 column="candidate_json",
             )
         ]
 
-    def save_translation_decision(self, decision: FinalTranslationDecision) -> None:
+    def save_translation_decision(
+        self,
+        decision: FinalTranslationDecision,
+        *,
+        storage_job_id: str | None = None,
+    ) -> None:
         self._save_singleton_model(
             table="translation_decisions",
-            job_id=decision.job_id,
+            job_id=storage_job_id or decision.job_id,
             payload=decision.model_dump(mode="json"),
         )
 
-    def get_translation_decision(self, job_id: str) -> FinalTranslationDecision | None:
+    def get_translation_decision(
+        self,
+        job_id: str,
+        *,
+        storage_job_id: str | None = None,
+    ) -> FinalTranslationDecision | None:
         payload = self._get_singleton_payload(
             table="translation_decisions",
-            job_id=job_id,
+            job_id=storage_job_id or job_id,
         )
         if payload is None:
             return None
@@ -691,10 +795,11 @@ class SQLiteOperationalStore(AbstractContextManager["SQLiteOperationalStore"]):
         job_id: str,
         stage: ReviewStage,
         payload: dict[str, object],
+        storage_job_id: str | None = None,
     ) -> None:
         self._save_stage_payload(
             table="investigations",
-            job_id=job_id,
+            job_id=storage_job_id or job_id,
             stage=stage,
             payload=payload,
         )
@@ -704,17 +809,23 @@ class SQLiteOperationalStore(AbstractContextManager["SQLiteOperationalStore"]):
         *,
         job_id: str,
         stage: ReviewStage,
+        storage_job_id: str | None = None,
     ) -> dict[str, object] | None:
         payload = self._get_stage_payload(
             table="investigations",
-            job_id=job_id,
+            job_id=storage_job_id or job_id,
             stage=stage,
         )
         if payload is None:
             return None
         return cast(dict[str, object], payload)
 
-    def save_batch(self, batch: MemoryWriteBatch) -> None:
+    def save_batch(
+        self,
+        batch: MemoryWriteBatch,
+        *,
+        storage_job_id: str | None = None,
+    ) -> None:
         payload = batch.model_dump(mode="json")
         now = _utc_now()
         with self._conn:
@@ -728,7 +839,13 @@ class SQLiteOperationalStore(AbstractContextManager["SQLiteOperationalStore"]):
                     batch_json = excluded.batch_json,
                     updated_at = excluded.updated_at
                 """,
-                (batch.batch_id, batch.job_id, _encode_sqlite_json(payload), now, now),
+                (
+                    batch.batch_id,
+                    storage_job_id or batch.job_id,
+                    _encode_sqlite_json(payload),
+                    now,
+                    now,
+                ),
             )
 
     def get_batch(self, batch_id: str) -> MemoryWriteBatch | None:
@@ -740,12 +857,17 @@ class SQLiteOperationalStore(AbstractContextManager["SQLiteOperationalStore"]):
             return None
         return MemoryWriteBatch.model_validate(_decode_sqlite_json(row["batch_json"]))
 
-    def list_batches(self, job_id: str) -> list[MemoryWriteBatch]:
+    def list_batches(
+        self,
+        job_id: str,
+        *,
+        storage_job_id: str | None = None,
+    ) -> list[MemoryWriteBatch]:
         return [
             MemoryWriteBatch.model_validate(payload)
             for payload in self._list_payloads(
                 table="memory_batches",
-                job_id=job_id,
+                job_id=storage_job_id or job_id,
                 column="batch_json",
             )
         ]

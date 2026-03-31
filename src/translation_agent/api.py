@@ -9,7 +9,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from translation_agent.config import Settings, load_settings, validate_environment
-from translation_agent.graph import GraphState, build_runtime, run_workflow
+from translation_agent.graph import GraphState, build_runtime, run_workflow, sync_trace_artifact
 from translation_agent.models import JobContext
 from translation_agent.observability.events import (
     configure_structured_logging,
@@ -188,6 +188,7 @@ def run_job(request: RunJobRequest, settings: Settings | None = None) -> RunJobR
                 },
             )
         )
+        sync_trace_artifact(final_state, runtime)
         runtime_run_store.close()
 
     log_structured_event(
@@ -237,10 +238,10 @@ def _serialize_request(request: RunJobRequest, created_at: datetime) -> str:
 
 
 def _final_status(state: GraphState) -> str:
-    if state.human_review_required:
-        return "human_review_required"
     if state.translation_failed:
         return "translation_failed"
+    if state.human_review_required:
+        return "human_review_required"
     failed_transcription_facts = [
         fact for fact in state.routing_facts if fact.fact_type == "transcription_provider_failed"
     ]

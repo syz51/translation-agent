@@ -25,10 +25,10 @@ from translation_agent.config import (
 )
 from translation_agent.graph._langgraph_compat import ensure_langgraph_runtime_supported
 from translation_agent.memory import (
+    BlobBackedLongTermMemoryStore,
     DeterministicMemoryConsolidationBackend,
     DeterministicMemoryStagingBackend,
     DeterministicPromptEvolutionBackend,
-    InMemoryLongTermMemoryStore,
     LongTermMemoryRecallBackend,
     MemoryConsolidationBackend,
     MemoryRecallBackend,
@@ -46,7 +46,14 @@ from translation_agent.models import (
     TranslationCandidate,
 )
 from translation_agent.observability import TraceSink
-from translation_agent.storage import BlobStore, DecisionStore, MemoryBatchStore, RunStore, job_path
+from translation_agent.storage import (
+    BlobStore,
+    DecisionStore,
+    MemoryBatchStore,
+    RunStore,
+    job_path,
+    job_scope_token,
+)
 
 PHASE_TWO_NORMALIZATION_VERSION = "2026-03-30-phase-2"
 PHASE_THREE_NORMALIZATION_VERSION = "2026-03-30-phase-3"
@@ -89,44 +96,94 @@ class InMemoryDecisionStore:
 
     def __init__(self) -> None:
         self._transcript_candidates: dict[str, TranscriptCandidate] = {}
+        self._transcript_candidate_job_ids: dict[str, str] = {}
         self._translation_candidates: dict[str, TranslationCandidate] = {}
+        self._translation_candidate_job_ids: dict[str, str] = {}
         self._transcript_decisions: dict[str, FinalTranscriptDecision] = {}
         self._translation_decisions: dict[str, FinalTranslationDecision] = {}
         self._investigations: dict[tuple[str, str], dict[str, object]] = {}
 
-    def save_transcript_candidate(self, candidate: TranscriptCandidate) -> None:
+    def save_transcript_candidate(
+        self,
+        candidate: TranscriptCandidate,
+        *,
+        storage_job_id: str | None = None,
+    ) -> None:
         self._transcript_candidates[candidate.candidate_id] = candidate
+        self._transcript_candidate_job_ids[candidate.candidate_id] = (
+            storage_job_id or candidate.job_id
+        )
 
-    def list_transcript_candidates(self, job_id: str) -> list[TranscriptCandidate]:
+    def list_transcript_candidates(
+        self,
+        job_id: str,
+        *,
+        storage_job_id: str | None = None,
+    ) -> list[TranscriptCandidate]:
+        resolved_job_id = storage_job_id or job_id
         candidates = [
             candidate
             for candidate in self._transcript_candidates.values()
-            if candidate.job_id == job_id
+            if self._transcript_candidate_job_ids.get(candidate.candidate_id) == resolved_job_id
         ]
         return sorted(candidates, key=lambda candidate: candidate.candidate_id)
 
-    def save_transcript_decision(self, decision: FinalTranscriptDecision) -> None:
-        self._transcript_decisions[decision.job_id] = decision
+    def save_transcript_decision(
+        self,
+        decision: FinalTranscriptDecision,
+        *,
+        storage_job_id: str | None = None,
+    ) -> None:
+        self._transcript_decisions[storage_job_id or decision.job_id] = decision
 
-    def get_transcript_decision(self, job_id: str) -> FinalTranscriptDecision | None:
-        return self._transcript_decisions.get(job_id)
+    def get_transcript_decision(
+        self,
+        job_id: str,
+        *,
+        storage_job_id: str | None = None,
+    ) -> FinalTranscriptDecision | None:
+        return self._transcript_decisions.get(storage_job_id or job_id)
 
-    def save_translation_candidate(self, candidate: TranslationCandidate) -> None:
+    def save_translation_candidate(
+        self,
+        candidate: TranslationCandidate,
+        *,
+        storage_job_id: str | None = None,
+    ) -> None:
         self._translation_candidates[candidate.candidate_id] = candidate
+        self._translation_candidate_job_ids[candidate.candidate_id] = (
+            storage_job_id or candidate.job_id
+        )
 
-    def list_translation_candidates(self, job_id: str) -> list[TranslationCandidate]:
+    def list_translation_candidates(
+        self,
+        job_id: str,
+        *,
+        storage_job_id: str | None = None,
+    ) -> list[TranslationCandidate]:
+        resolved_job_id = storage_job_id or job_id
         candidates = [
             candidate
             for candidate in self._translation_candidates.values()
-            if candidate.job_id == job_id
+            if self._translation_candidate_job_ids.get(candidate.candidate_id) == resolved_job_id
         ]
         return sorted(candidates, key=lambda candidate: candidate.candidate_id)
 
-    def save_translation_decision(self, decision: FinalTranslationDecision) -> None:
-        self._translation_decisions[decision.job_id] = decision
+    def save_translation_decision(
+        self,
+        decision: FinalTranslationDecision,
+        *,
+        storage_job_id: str | None = None,
+    ) -> None:
+        self._translation_decisions[storage_job_id or decision.job_id] = decision
 
-    def get_translation_decision(self, job_id: str) -> FinalTranslationDecision | None:
-        return self._translation_decisions.get(job_id)
+    def get_translation_decision(
+        self,
+        job_id: str,
+        *,
+        storage_job_id: str | None = None,
+    ) -> FinalTranslationDecision | None:
+        return self._translation_decisions.get(storage_job_id or job_id)
 
     def save_investigation(
         self,
@@ -134,16 +191,18 @@ class InMemoryDecisionStore:
         job_id: str,
         stage: str,
         payload: dict[str, object],
+        storage_job_id: str | None = None,
     ) -> None:
-        self._investigations[(job_id, stage)] = payload
+        self._investigations[(storage_job_id or job_id, stage)] = payload
 
     def get_investigation(
         self,
         *,
         job_id: str,
         stage: str,
+        storage_job_id: str | None = None,
     ) -> dict[str, object] | None:
-        return self._investigations.get((job_id, stage))
+        return self._investigations.get((storage_job_id or job_id, stage))
 
 
 class InMemoryMemoryBatchStore:
@@ -151,15 +210,32 @@ class InMemoryMemoryBatchStore:
 
     def __init__(self) -> None:
         self._batches: dict[str, MemoryWriteBatch] = {}
+        self._batch_job_ids: dict[str, str] = {}
 
-    def save_batch(self, batch: MemoryWriteBatch) -> None:
+    def save_batch(
+        self,
+        batch: MemoryWriteBatch,
+        *,
+        storage_job_id: str | None = None,
+    ) -> None:
         self._batches[batch.batch_id] = batch
+        self._batch_job_ids[batch.batch_id] = storage_job_id or batch.job_id
 
     def get_batch(self, batch_id: str) -> MemoryWriteBatch | None:
         return self._batches.get(batch_id)
 
-    def list_batches(self, job_id: str) -> list[MemoryWriteBatch]:
-        batches = [batch for batch in self._batches.values() if batch.job_id == job_id]
+    def list_batches(
+        self,
+        job_id: str,
+        *,
+        storage_job_id: str | None = None,
+    ) -> list[MemoryWriteBatch]:
+        resolved_job_id = storage_job_id or job_id
+        batches = [
+            batch
+            for batch in self._batches.values()
+            if self._batch_job_ids.get(batch.batch_id) == resolved_job_id
+        ]
         return sorted(batches, key=lambda batch: batch.batch_id)
 
 
@@ -169,10 +245,11 @@ class FakeAudioExtractionAdapter:
     adapter_id = "fake-ffmpeg"
 
     def extract_audio(self, video_ref: str, job_context: RequestContext) -> AudioArtifact:
+        scope_token = job_scope_token(job_context.job)
         return AudioArtifact(
-            artifact_id=f"audio-{job_context.job.job_id}",
+            artifact_id=f"audio-{job_context.job.job_id}-{scope_token}",
             job_id=job_context.job.job_id,
-            blob_ref=f"audio/{job_context.job.job_id}.wav",
+            blob_ref=job_path(job_context.job, "artifacts", "audio.wav"),
             duration_ms=61_000,
             sample_rate_hz=16_000,
             channels=1,
@@ -215,8 +292,9 @@ class FakeTranscriptionAdapter:
                 json.dumps({"provider": self.provider_id, "text": text}, sort_keys=True) + "\n"
             ).encode("utf-8"),
         )
+        scope_token = job_scope_token(request_context.job)
         return TranscriptCandidate(
-            candidate_id=f"tr-{self.provider_id}-{request_context.job.job_id}",
+            candidate_id=f"tr-{self.provider_id}-{request_context.job.job_id}-{scope_token}",
             job_id=request_context.job.job_id,
             provider_id=self.provider_id,
             provider_request_id=f"req-{self.provider_id}-{request_context.run_id}",
@@ -275,8 +353,9 @@ class FakeTranslationAdapter:
                 + "\n"
             ).encode("utf-8"),
         )
+        scope_token = job_scope_token(request_context.job)
         return TranslationCandidate(
-            candidate_id=f"tl-{prompt_variant_id}-{request_context.job.job_id}",
+            candidate_id=f"tl-{prompt_variant_id}-{request_context.job.job_id}-{scope_token}",
             job_id=request_context.job.job_id,
             source_transcript_candidate_id=final_transcript.candidate_id,
             model_id=self.model_id,
@@ -312,7 +391,7 @@ def build_phase_two_runtime(
 ) -> WorkflowRuntime:
     """Construct the default dry-run runtime used by the public entrypoints."""
 
-    memory_store = InMemoryLongTermMemoryStore()
+    memory_store = BlobBackedLongTermMemoryStore(blob_store)
     resolved_decision_store = decision_store or _decision_store_for_run_store(run_store)
     resolved_memory_batch_store = memory_batch_store or _memory_batch_store_for_run_store(run_store)
     return WorkflowRuntime(
@@ -449,7 +528,7 @@ def build_phase_three_runtime(
         retry_policy=retry_policy,
     )
 
-    memory_store = InMemoryLongTermMemoryStore()
+    memory_store = BlobBackedLongTermMemoryStore(blob_store)
     resolved_decision_store = decision_store or _decision_store_for_run_store(run_store)
     resolved_memory_batch_store = memory_batch_store or _memory_batch_store_for_run_store(run_store)
     return WorkflowRuntime(

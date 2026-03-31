@@ -17,7 +17,7 @@ from translation_agent.adapters.common import (
     perform_with_retries,
 )
 from translation_agent.models import AudioArtifact, RequestContext
-from translation_agent.storage import BlobStore
+from translation_agent.storage import BlobStore, job_path, job_scope_token
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,7 +69,7 @@ class FFmpegAudioExtractionAdapter:
             )
 
         with tempfile.TemporaryDirectory(prefix="translation-agent-ffmpeg-") as temp_dir:
-            output_path = Path(temp_dir) / f"{job_context.job.job_id}.wav"
+            output_path = Path(temp_dir) / f"audio-{job_scope_token(job_context.job)}.wav"
             command = (
                 self._binary,
                 "-y",
@@ -93,10 +93,11 @@ class FFmpegAudioExtractionAdapter:
             data = output_path.read_bytes()
             duration_ms, sample_rate_hz, channels = _audio_stats(output_path)
 
-        blob_ref = f"audio/{job_context.job.job_id}.wav"
+        scope_token = job_scope_token(job_context.job)
+        blob_ref = job_path(job_context.job, "artifacts", "audio.wav")
         self._blob_store.put_bytes(blob_ref, data)
         return AudioArtifact(
-            artifact_id=f"audio-{job_context.job.job_id}",
+            artifact_id=f"audio-{job_context.job.job_id}-{scope_token}",
             job_id=job_context.job.job_id,
             blob_ref=blob_ref,
             duration_ms=duration_ms,

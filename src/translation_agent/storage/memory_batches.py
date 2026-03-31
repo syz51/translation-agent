@@ -11,8 +11,18 @@ from translation_agent.models import MemoryWriteBatch
 class MemoryBatchStore(Protocol):
     """Persistence contract for adjudication-time memory write batches."""
 
-    def save_batch(self, batch: MemoryWriteBatch) -> None: ...
+    def save_batch(
+        self,
+        batch: MemoryWriteBatch,
+        *,
+        storage_job_id: str | None = None,
+    ) -> None: ...
 
     def get_batch(self, batch_id: str) -> MemoryWriteBatch | None: ...
 
-    def list_batches(self, job_id: str) -> list[MemoryWriteBatch]: ...
+    def list_batches(
+        self,
+        job_id: str,
+        *,
+        storage_job_id: str | None = None,
+    ) -> list[MemoryWriteBatch]: ...

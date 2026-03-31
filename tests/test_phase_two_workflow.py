@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -7,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from translation_agent.graph import GraphState, build_phase_two_runtime, run_workflow
-from translation_agent.models import JobContext
+from translation_agent.models import JobContext, Segment, TranscriptCandidate
 from translation_agent.observability import NoOpTraceSink
 from translation_agent.storage import LocalBlobStore, NodeExecutionRecord, RunRecord, job_path
 
@@ -227,6 +228,7 @@ def test_phase_two_translation_failure_preserves_transcript_outputs(tmp_path: Pa
     final_state, _, blob_store = _run_workflow(tmp_path, scenario="translation_failed")
 
     assert final_state.translation_failed is True
+    assert final_state.human_review_required is True
     assert final_state.final_translation_candidate_id is None
     assert final_state.final_translation_decision_ref is not None
     assert blob_store.exists(_artifact_path("published", "transcript.json"))
@@ -292,3 +294,76 @@ def test_phase_four_translation_escalation_uses_stronger_adjudicator(
         fact.fact_type == "decision_mode" and fact.value == "stronger_adjudicator"
         for fact in final_state.routing_facts
     )
+
+
+def test_phase_two_transcription_fanout_runs_in_parallel(tmp_path: Path) -> None:
+    run_store = InMemoryRunStore()
+    run_store.create_run(run_id="run-123", status="running")
+    blob_store = LocalBlobStore(tmp_path / "blobs")
+    source_ref = "jobs/run-123-request.json"
+    blob_store.put_bytes(source_ref, b"{}\n")
+    runtime = build_phase_two_runtime(
+        blob_store=blob_store,
+        run_store=run_store,
+        trace_sink=NoOpTraceSink(),
+        source_artifact_ref=source_ref,
+        scenario="happy",
+    )
+
+    class SlowAdapter:
+        def __init__(self, provider_id: str, rank: int) -> None:
+            self.provider_id = provider_id
+            self.rank = rank
+
+        def transcribe(self, audio_artifact, request_context):  # noqa: ANN001
+            del audio_artifact
+            time.sleep(0.2)
+            return TranscriptCandidate(
+                candidate_id=f"tr-{self.provider_id}-{request_context.job.job_id}",
+                job_id=request_context.job.job_id,
+                provider_id=self.provider_id,
+                provider_request_id=f"req-{self.provider_id}",
+                language=request_context.job.source_language,
+                segments=(
+                    Segment(
+                        segment_id=f"seg-{self.provider_id}-1",
+                        start_ms=0,
+                        end_ms=1000,
+                        speaker="speaker-1",
+                        source_text=f"text-{self.provider_id}",
+                    ),
+                ),
+                full_text=f"text-{self.provider_id}",
+                speaker_map={"speaker-1": "Host"},
+                timing_resolution="segment",
+                raw_payload_ref=job_path(
+                    request_context.job,
+                    "raw",
+                    "provider-payloads",
+                    f"{self.provider_id}.json",
+                ),
+                normalization_version="test",
+                metadata={"provider_rank": self.rank},
+            )
+
+    runtime.transcription_adapters = (
+        SlowAdapter("assemblyai", 0),
+        SlowAdapter("speechmatics", 1),
+        SlowAdapter("deepgram", 2),
+    )
+
+    started = time.monotonic()
+    final_state = run_workflow(
+        GraphState(
+            run_id="run-123",
+            job=_job_context(),
+            current_stage="ingest",
+            source_video_ref="input.mp4",
+            source_artifact_ref=source_ref,
+        ),
+        runtime,
+    )
+    elapsed = time.monotonic() - started
+
+    assert final_state.current_stage == "finalize_outputs"
+    assert elapsed < 0.45

@@ -41,7 +41,7 @@ def review_transcripts(state: GraphState, runtime: WorkflowRuntime) -> dict[str,
 
     candidates = select_transcript_candidates(
         runtime,
-        job_id=state.job.job_id,
+        job=state.job,
         candidate_ids=state.transcript_candidate_ids,
     )
     memory_bundle = runtime.memory_recall_backend.recall_memory(
@@ -98,7 +98,7 @@ def review_translations(state: GraphState, runtime: WorkflowRuntime) -> dict[str
 
     candidates = select_translation_candidates(
         runtime,
-        job_id=state.job.job_id,
+        job=state.job,
         candidate_ids=state.translation_candidate_ids,
     )
     memory_bundle = runtime.memory_recall_backend.recall_memory(
@@ -243,7 +243,7 @@ def _load_final_transcript_candidate(
         raise RuntimeError("translation review requires a final transcript candidate")
     candidates = select_transcript_candidates(
         runtime,
-        job_id=state.job.job_id,
+        job=state.job,
         candidate_ids=(state.final_transcript_candidate_id,),
     )
     if not candidates:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+
 from translation_agent.adapters import RawPayloadTranscriptionAdapter
 from translation_agent.graph.runtime import WorkflowRuntime
 from translation_agent.graph.state import GraphState, RoutingFact
@@ -26,56 +28,59 @@ def fanout_transcription(state: GraphState, runtime: WorkflowRuntime) -> dict[st
     staged_refs: list[str] = []
     routing_facts = list(state.routing_facts)
 
-    for adapter in runtime.transcription_adapters:
-        try:
-            raw_payload: dict[str, object] | None = None
-            if isinstance(adapter, RawPayloadTranscriptionAdapter):
-                candidate, raw_payload = adapter.transcribe_with_payload(
-                    audio_artifact, request_context
+    with ThreadPoolExecutor(max_workers=max(1, len(runtime.transcription_adapters))) as executor:
+        futures = [
+            (
+                adapter,
+                executor.submit(_transcribe_adapter, adapter, audio_artifact, request_context),
+            )
+            for adapter in runtime.transcription_adapters
+        ]
+
+        for adapter, future in futures:
+            try:
+                candidate, raw_payload = future.result()
+            except Exception as exc:
+                routing_facts.append(
+                    RoutingFact(
+                        stage="fanout_transcription",
+                        fact_type="transcription_provider_failed",
+                        value=adapter.provider_id,
+                        source_ref=str(exc),
+                    )
                 )
-            else:
-                candidate = adapter.transcribe(audio_artifact, request_context)
-        except Exception as exc:
+                continue
+
+            raw_payload_ref = candidate.raw_payload_ref or raw_transcript_candidate_key(
+                state.job, adapter.provider_id
+            )
+            if raw_payload is None:
+                raw_payload = candidate.metadata.get("_raw_payload")
+            if raw_payload is not None:
+                payload_refs.append(write_model_artifact(runtime, raw_payload_ref, raw_payload))
+            elif runtime.blob_store.exists(raw_payload_ref):
+                payload_refs.append(raw_payload_ref)
+            staged_candidate = candidate.model_copy(
+                update={
+                    "raw_payload_ref": raw_payload_ref,
+                    "metadata": strip_private_metadata(candidate.metadata),
+                }
+            )
+            staged_refs.append(
+                write_model_artifact(
+                    runtime,
+                    staged_transcript_candidate_key(state.job, staged_candidate.candidate_id),
+                    staged_candidate,
+                )
+            )
             routing_facts.append(
                 RoutingFact(
                     stage="fanout_transcription",
-                    fact_type="transcription_provider_failed",
+                    fact_type="transcription_provider_succeeded",
                     value=adapter.provider_id,
-                    source_ref=str(exc),
+                    source_ref=raw_payload_ref,
                 )
             )
-            continue
-
-        raw_payload_ref = candidate.raw_payload_ref or raw_transcript_candidate_key(
-            state.job, adapter.provider_id
-        )
-        if raw_payload is None:
-            raw_payload = candidate.metadata.get("_raw_payload")
-        if raw_payload is not None:
-            payload_refs.append(write_model_artifact(runtime, raw_payload_ref, raw_payload))
-        elif runtime.blob_store.exists(raw_payload_ref):
-            payload_refs.append(raw_payload_ref)
-        staged_candidate = candidate.model_copy(
-            update={
-                "raw_payload_ref": raw_payload_ref,
-                "metadata": strip_private_metadata(candidate.metadata),
-            }
-        )
-        staged_refs.append(
-            write_model_artifact(
-                runtime,
-                staged_transcript_candidate_key(state.job, staged_candidate.candidate_id),
-                staged_candidate,
-            )
-        )
-        routing_facts.append(
-            RoutingFact(
-                stage="fanout_transcription",
-                fact_type="transcription_provider_succeeded",
-                value=adapter.provider_id,
-                source_ref=raw_payload_ref,
-            )
-        )
 
     if not staged_refs:
         raise RuntimeError("all transcription providers failed")
@@ -86,3 +91,12 @@ def fanout_transcription(state: GraphState, runtime: WorkflowRuntime) -> dict[st
         "raw_transcript_candidate_refs": tuple(staged_refs),
         "routing_facts": tuple(routing_facts),
     }
+
+
+def _transcribe_adapter(adapter, audio_artifact: AudioArtifact, request_context):
+    raw_payload: dict[str, object] | None = None
+    if isinstance(adapter, RawPayloadTranscriptionAdapter):
+        candidate, raw_payload = adapter.transcribe_with_payload(audio_artifact, request_context)
+    else:
+        candidate = adapter.transcribe(audio_artifact, request_context)
+    return candidate, raw_payload

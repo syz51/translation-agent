@@ -1,6 +1,6 @@
 """Workflow graph package."""
 
-from .builder import build_workflow_graph, run_workflow
+from .builder import build_workflow_graph, run_workflow, sync_trace_artifact
 from .runtime import (
     DEFAULT_SCENARIO,
     PHASE_THREE_NORMALIZATION_VERSION,
@@ -30,4 +30,5 @@ __all__ = [
     "build_phase_two_runtime",
     "build_workflow_graph",
     "run_workflow",
+    "sync_trace_artifact",
 ]

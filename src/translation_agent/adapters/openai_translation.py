@@ -21,7 +21,7 @@ from translation_agent.models import (
     TranscriptCandidate,
     TranslationCandidate,
 )
-from translation_agent.storage import BlobStore, job_path
+from translation_agent.storage import BlobStore, job_path, job_scope_token
 
 
 class OpenAITranslationAdapter:
@@ -77,7 +77,7 @@ class OpenAITranslationAdapter:
             translation_payload,
             response_payload=raw_payload,
             final_transcript=final_transcript,
-            job_id=request_context.job.job_id,
+            request_context=request_context,
             language=request_context.job.target_language,
             prompt_variant_id=prompt_variant_id,
             prompt_version=self._prompt_version,
@@ -226,7 +226,7 @@ def _candidate_from_translation_payload(
     *,
     response_payload: dict[str, Any],
     final_transcript: TranscriptCandidate,
-    job_id: str,
+    request_context: RequestContext,
     language: str,
     prompt_variant_id: str,
     prompt_version: str,
@@ -246,8 +246,11 @@ def _candidate_from_translation_payload(
         payload.get("segments"),
     )
     return TranslationCandidate(
-        candidate_id=f"tl-{prompt_variant_id}-{job_id}",
-        job_id=job_id,
+        candidate_id=(
+            f"tl-{prompt_variant_id}-{request_context.job.job_id}-"
+            f"{job_scope_token(request_context.job)}"
+        ),
+        job_id=request_context.job.job_id,
         source_transcript_candidate_id=final_transcript.candidate_id,
         model_id=model_id,
         prompt_variant_id=prompt_variant_id,
@@ -283,16 +286,33 @@ def _merge_segments(
             segment_id = item.get("segment_id")
             target_text = item.get("target_text")
             if isinstance(segment_id, str) and isinstance(target_text, str):
-                translations_by_id[segment_id] = target_text.strip()
+                normalized_target = target_text.strip()
+                if normalized_target:
+                    translations_by_id[segment_id] = normalized_target
 
     translated: list[Segment] = []
+    missing_segment_ids: list[str] = []
     for segment in source_segments:
+        target_text = translations_by_id.get(segment.segment_id)
+        if target_text is None:
+            missing_segment_ids.append(segment.segment_id)
+            continue
         translated.append(
             segment.model_copy(
                 update={
-                    "target_text": translations_by_id.get(segment.segment_id, segment.source_text),
+                    "target_text": target_text,
                 }
             )
+        )
+    if missing_segment_ids:
+        raise AdapterError(
+            provider_id="openai",
+            message=(
+                "translation payload was missing segment translations for "
+                + ", ".join(missing_segment_ids)
+            ),
+            category="malformed_response",
+            retryable=False,
         )
     return tuple(translated)
 
