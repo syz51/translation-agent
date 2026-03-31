@@ -5,6 +5,7 @@ import wave
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -16,6 +17,18 @@ from translation_agent.adapters import (
     OpenAITranslationAdapter,
     RetryPolicy,
     SpeechmaticsTranscriptionAdapter,
+)
+from translation_agent.adapters import (
+    assemblyai as assemblyai_module,
+)
+from translation_agent.adapters import (
+    deepgram as deepgram_module,
+)
+from translation_agent.adapters import (
+    openai_translation as openai_translation_module,
+)
+from translation_agent.adapters import (
+    speechmatics as speechmatics_module,
 )
 from translation_agent.adapters.common import HttpRequest, HttpResponse
 from translation_agent.adapters.ffmpeg import FfmpegCompletedProcess
@@ -495,6 +508,35 @@ def test_assemblyai_adapter_rejects_malformed_payload(tmp_path: Path) -> None:
         adapter.transcribe(audio_artifact, _request_context())
 
 
+def test_assemblyai_helpers_cover_sparse_utterances_and_non_object_responses() -> None:
+    segments = assemblyai_module._segments_from_utterances(
+        [
+            "skip-me",
+            {
+                "start": -50,
+                "end": 100,
+                "speaker": " ",
+                "text": " Hello   world ",
+                "confidence": 0.5,
+            },
+        ]
+    )
+
+    assert len(segments) == 1
+    assert segments[0].start_ms == 0
+    assert segments[0].speaker is None
+    assert assemblyai_module._assemblyai_speaker_name(None) is None
+
+    class NonObjectJsonResponse:
+        status_code = 200
+
+        def json(self) -> object:
+            return []
+
+    with pytest.raises(AdapterError, match="JSON object"):
+        assemblyai_module._validated_json_response("assemblyai", NonObjectJsonResponse())
+
+
 def test_assemblyai_adapter_times_out_when_polling_never_completes(tmp_path: Path) -> None:
     blob_store = LocalBlobStore(tmp_path / "blobs")
     audio_artifact = _audio_artifact()
@@ -908,6 +950,50 @@ def test_deepgram_adapter_rejects_missing_channels(tmp_path: Path) -> None:
         adapter.transcribe(audio_artifact, _request_context())
 
 
+def test_deepgram_helpers_cover_malformed_shapes_and_content_type_variants() -> None:
+    class NonObjectResponse:
+        status_code = 200
+
+        def json(self) -> object:
+            return []
+
+    class NonObjectTransport:
+        def request(self, request: HttpRequest) -> HttpResponse:
+            del request
+            return cast(HttpResponse, NonObjectResponse())
+
+    with pytest.raises(AdapterError, match="JSON object"):
+        DeepgramTranscriptionAdapter(
+            api_key="test-key",
+            blob_store=LocalBlobStore(Path("/tmp/deepgram-blob-store")),
+            transport=NonObjectTransport(),
+            retry_policy=RetryPolicy(max_attempts=1),
+            sleep=lambda _: None,
+        )._transcribe_once(
+            _audio_artifact(),
+            b"audio-bytes",
+            _request_context(),
+        )
+
+    with pytest.raises(AdapterError, match="missing results"):
+        deepgram_module._extract_transcript_text({})
+    with pytest.raises(AdapterError, match="channel payload was malformed"):
+        deepgram_module._extract_transcript_text({"results": {"channels": [123]}})
+    with pytest.raises(AdapterError, match="missing alternatives"):
+        deepgram_module._extract_transcript_text({"results": {"channels": [{}]}})
+    with pytest.raises(AdapterError, match="alternative payload was malformed"):
+        deepgram_module._extract_transcript_text(
+            {"results": {"channels": [{"alternatives": [123]}]}}
+        )
+
+    assert deepgram_module._extract_utterances({}) == []
+    assert deepgram_module._content_type_for_blob("jobs/audio.mp3") == "audio/mpeg"
+    assert deepgram_module._content_type_for_blob("jobs/audio.bin") == "application/octet-stream"
+    assert deepgram_module._seconds_to_ms(None) == 0
+    assert deepgram_module._seconds_to_ms("not-a-number") == 0
+    assert deepgram_module._speaker_name(None) is None
+
+
 @pytest.mark.contract
 @pytest.mark.parametrize("prompt_variant_id", ["variant-a", "variant-b"])
 def test_openai_translation_adapter_tracks_prompt_metadata_for_variants(
@@ -1076,6 +1162,153 @@ def test_openai_translation_adapter_rejects_partial_segment_payloads(tmp_path: P
 
     with pytest.raises(AdapterError, match="missing segment translations"):
         adapter.generate_translation(transcript, "variant-a", _request_context())
+
+
+def test_openai_translation_helpers_cover_output_blocks_and_validation(tmp_path: Path) -> None:
+    blob_store = LocalBlobStore(tmp_path / "blobs")
+    adapter = OpenAITranslationAdapter(
+        api_key="test-key",
+        blob_store=blob_store,
+        transport=SequencedTransport(
+            [
+                _json_response(
+                    {
+                        "id": " resp-2 ",
+                        "output": [
+                            {
+                                "content": [
+                                    {
+                                        "text": json.dumps(
+                                            {
+                                                "full_text": " Bonjour le monde ",
+                                                "segments": [
+                                                    {
+                                                        "segment_id": "seg-1",
+                                                        "target_text": " Bonjour le monde ",
+                                                    }
+                                                ],
+                                            }
+                                        )
+                                    }
+                                ]
+                            }
+                        ],
+                    }
+                )
+            ]
+        ),
+        retry_policy=_retry_policy(),
+        sleep=lambda _: None,
+    )
+
+    candidate = adapter.generate_translation(
+        _transcript_candidate(),
+        "variant-a",
+        _request_context(),
+    )
+
+    assert candidate.full_text == "Bonjour le monde"
+    assert candidate.metadata["provider"]["provider_request_id"] == "resp-2"
+    assert openai_translation_module._provider_request_id({"id": "   "}) is None
+
+    with pytest.raises(AdapterError, match="output text"):
+        openai_translation_module._extract_translation_payload({"output": [{"content": [{}]}]})
+    with pytest.raises(AdapterError, match="JSON object"):
+        openai_translation_module._parse_model_json("[]")
+    with pytest.raises(AdapterError, match="missing full_text"):
+        openai_translation_module._candidate_from_translation_payload(
+            {"full_text": " ", "segments": [{"segment_id": "seg-1", "target_text": "Bonjour"}]},
+            response_payload={},
+            final_transcript=_transcript_candidate(),
+            request_context=_request_context(),
+            language="fr",
+            prompt_variant_id="variant-a",
+            prompt_version="phase-3-v1",
+            model_id="gpt-5.4-mini",
+            raw_response_ref=_artifact_path("raw", "provider-payloads", "openai-variant-a.json"),
+        )
+
+    class NonObjectResponse:
+        status_code = 200
+
+        def json(self) -> object:
+            return []
+
+    class NonObjectTransport:
+        def request(self, request: HttpRequest) -> HttpResponse:
+            del request
+            return cast(HttpResponse, NonObjectResponse())
+
+    with pytest.raises(AdapterError, match="JSON object"):
+        OpenAITranslationAdapter(
+            api_key="test-key",
+            blob_store=blob_store,
+            transport=NonObjectTransport(),
+            retry_policy=RetryPolicy(max_attempts=1),
+            sleep=lambda _: None,
+        ).generate_translation(_transcript_candidate(), "variant-a", _request_context())
+
+
+def test_openai_translation_merge_segments_ignores_invalid_entries() -> None:
+    translated = openai_translation_module._merge_segments(
+        _transcript_candidate().segments,
+        [
+            "skip-me",
+            {"segment_id": "seg-1", "target_text": " Bonjour le monde "},
+            {"segment_id": "seg-1", "target_text": "   "},
+            {"segment_id": 1, "target_text": "ignored"},
+        ],
+    )
+
+    assert translated[0].target_text == "Bonjour le monde"
+
+    with pytest.raises(AdapterError, match="missing segment translations"):
+        openai_translation_module._merge_segments(_transcript_candidate().segments, None)
+
+    with pytest.raises(AdapterError, match="output text"):
+        openai_translation_module._extract_translation_payload(
+            {"output": ["skip-me", {"content": "bad-shape"}, {"content": ["skip-me"]}]}
+        )
+
+
+def test_speechmatics_helpers_cover_sparse_results_and_validation() -> None:
+    with pytest.raises(AdapterError, match="did not contain any transcript segments"):
+        speechmatics_module._candidate_from_payload(
+            {
+                "results": [
+                    "skip-me",
+                    {"type": "entity", "alternatives": [{"content": "ignored"}]},
+                ]
+            },
+            request_context=_request_context(),
+            provider_request_id="sm-job",
+            language="en",
+            raw_payload_ref=_artifact_path("raw", "provider-payloads", "speechmatics.json"),
+        )
+
+    assert speechmatics_module._content_from_result({}) == ""
+    assert speechmatics_module._content_from_result({"alternatives": ["skip-me"]}) == ""
+    assert (
+        speechmatics_module._alternative_confidence(
+            {"alternatives": [{"content": "Hello", "confidence": "nope"}]}
+        )
+        is None
+    )
+    assert speechmatics_module._alternative_confidence({"alternatives": ["skip-me"]}) is None
+    assert speechmatics_module._speaker_name("") is None
+    assert speechmatics_module._seconds_to_ms(None) == 0
+    assert speechmatics_module._seconds_to_ms("not-a-number") == 0
+
+    class NonObjectJsonResponse:
+        status_code = 200
+
+        def json(self) -> object:
+            return []
+
+    with pytest.raises(AdapterError, match="JSON object"):
+        speechmatics_module._validated_json_response("speechmatics", NonObjectJsonResponse())
+    with pytest.raises(AdapterError, match="missing 'id'"):
+        speechmatics_module._require_string({}, "id", provider_id="speechmatics")
 
 
 def test_phase_three_normalization_helpers_canonicalize_candidates() -> None:

@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from http.client import HTTPMessage
+from io import BytesIO
+from urllib.error import HTTPError, URLError
 
 import pytest
 
+from translation_agent.adapters import common as common_module
 from translation_agent.adapters.common import (
     AdapterError,
     HttpRequest,
@@ -210,3 +214,122 @@ def test_transport_helpers_cover_url_validation_multipart_and_filename_logic() -
     assert blob_filename("https://cdn.example.com/media/audio.wav", "fallback.bin") == "audio.wav"
     assert blob_filename("https://cdn.example.com/media/", "fallback.bin") == "fallback.bin"
     assert normalize_whitespace(" hello\tworld \n again ") == "hello world again"
+
+
+def test_adapter_error_metadata_and_http_error_fallback_paths() -> None:
+    error = AdapterError(
+        provider_id="deepgram",
+        message="timed out",
+        category="timeout",
+        retryable=True,
+        status_code=504,
+    )
+
+    assert error.as_metadata() == {
+        "provider_id": "deepgram",
+        "category": "timeout",
+        "retryable": True,
+        "status_code": 504,
+        "message": "timed out",
+    }
+
+    nested_empty = classify_http_error(
+        "assemblyai",
+        HttpResponse(status_code=418, headers={}, body=b'{"error": {}}'),
+    )
+    parsed_non_object = classify_http_error(
+        "assemblyai",
+        HttpResponse(status_code=451, headers={}, body=b"[]"),
+    )
+
+    assert nested_empty is not None
+    assert str(nested_empty) == "http 418"
+    assert parsed_non_object is not None
+    assert str(parsed_non_object) == "http 451"
+
+
+def test_stdlib_http_transport_covers_success_http_error_network_and_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class SuccessfulResponse:
+        status = 201
+        headers = {"X-Test": "value"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            del exc_type, exc, tb
+
+        def read(self) -> bytes:
+            return b'{"ok": true}'
+
+    def successful_urlopen(request, *, timeout: float):
+        captured["url"] = request.full_url
+        captured["timeout"] = timeout
+        return SuccessfulResponse()
+
+    monkeypatch.setattr(common_module.urllib.request, "urlopen", successful_urlopen)
+
+    transport = StdlibHttpTransport()
+    success = transport.request(
+        HttpRequest(
+            method="POST",
+            url="https://api.example.com/jobs",
+            headers={"authorization": "Bearer token"},
+            body=b"payload",
+            timeout_seconds=9.5,
+        )
+    )
+
+    assert success.status_code == 201
+    assert success.headers == {"x-test": "value"}
+    assert success.body == b'{"ok": true}'
+    assert captured == {"url": "https://api.example.com/jobs", "timeout": 9.5}
+
+    def http_error_urlopen(request, *, timeout: float):
+        del timeout
+        headers = HTTPMessage()
+        headers["Retry-After"] = "1"
+        raise HTTPError(
+            request.full_url,
+            502,
+            "bad gateway",
+            headers,
+            BytesIO(b'{"error": {"message": "retry later"}}'),
+        )
+
+    monkeypatch.setattr(common_module.urllib.request, "urlopen", http_error_urlopen)
+    http_error_response = transport.request(
+        HttpRequest(method="GET", url="https://api.example.com/jobs/1", headers={})
+    )
+
+    assert http_error_response.status_code == 502
+    assert http_error_response.headers == {"retry-after": "1"}
+    assert http_error_response.body == b'{"error": {"message": "retry later"}}'
+
+    def url_error_urlopen(request, *, timeout: float):
+        del request, timeout
+        raise URLError("dns offline")
+
+    monkeypatch.setattr(common_module.urllib.request, "urlopen", url_error_urlopen)
+    with pytest.raises(AdapterError, match="network failure: dns offline") as url_error:
+        transport.request(
+            HttpRequest(method="GET", url="https://api.example.com/jobs/1", headers={})
+        )
+
+    assert url_error.value.retryable is True
+
+    def timeout_urlopen(request, *, timeout: float):
+        del request, timeout
+        raise TimeoutError
+
+    monkeypatch.setattr(common_module.urllib.request, "urlopen", timeout_urlopen)
+    with pytest.raises(AdapterError, match="request timed out") as timeout_error:
+        transport.request(
+            HttpRequest(method="GET", url="https://api.example.com/jobs/1", headers={})
+        )
+
+    assert timeout_error.value.retryable is True
