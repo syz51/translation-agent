@@ -1,283 +1,309 @@
 # Workflow
 
-## End-To-End Graph
+## Graph Topology
+
+The current graph is wired in `src/translation_agent/graph/builder.py`.
 
 ```mermaid
 flowchart TD
-    A["ingest_job"] --> B["extract_audio"]
+    A["ingest"] --> B["extract_audio"]
     B --> C["fanout_transcription"]
     C --> D["normalize_transcripts"]
     D --> E["review_transcripts"]
     E --> F["adjudicate_transcript"]
-    F --> G["generate_translation_candidates"]
-    G --> H["normalize_translations"]
-    H --> I["review_translations"]
-    I --> J["adjudicate_translation"]
-    J --> K["finalize_outputs"]
-    F --> L["background_memory_pipeline"]
-    J --> L
+    F --> G["background_memory_pipeline"]
+    G -->|transcript resolved| H["generate_translation_candidates"]
+    G -->|human review required or translation already decided| M["finalize_outputs"]
+    H --> I["normalize_translations"]
+    I --> J["review_translations"]
+    J --> K["adjudicate_translation"]
+    K --> L["background_memory_pipeline"]
+    L --> M["finalize_outputs"]
 ```
+
+After the graph finishes, `run_workflow()` performs a best-effort `drain_background_memory()` pass. That pass can consolidate staged batches, generate prompt-evolution proposals, and republish outputs so the final artifact manifest includes the new memory refs.
 
 ## Node Contracts
 
-### `ingest_job`
+### `ingest`
+
+Purpose:
+
+- establish the request artifact ref in graph state
+- append initial routing facts
 
 Inputs:
 
-- video path or URI
-- target language
-- project or tenant context
+- `run_id`
+- `JobContext`
+- source artifact ref
 
 Outputs:
 
-- `job_id`
-- resolved language settings
-- project profile ref
-- initialized run state
-
-Notes:
-
-- this is where tenant and project defaults are resolved
-- keep only lightweight refs in graph state
+- `current_stage="ingest"`
+- `source_artifact_ref`
+- routing facts for job initialization and scenario
 
 ### `extract_audio`
 
-Inputs:
+Purpose:
 
-- video reference
-- run context
+- call the configured audio extractor
+- write the audio blob if the extractor returns bytes
+- persist canonical audio metadata
 
 Outputs:
 
-- `AudioArtifact`
-- extraction metadata
-
-Rules:
-
-- use deterministic local tooling
-- call `ffmpeg`
-- fail terminally unless an alternate usable stream exists
+- audio blob ref
+- audio metadata artifact
+- routing fact describing the audio artifact
 
 ### `fanout_transcription`
 
-Inputs:
+Purpose:
 
-- audio artifact
-- transcription request context
+- run all configured STT adapters in parallel
+- persist raw payloads and staged transcript candidates
+- tolerate partial provider failure
 
-Outputs:
+Success rule:
 
-- raw transcript candidates from:
-  - `AssemblyAI`
-  - `Speechmatics`
-  - `Deepgram`
+- at least one transcript candidate must survive
 
-Rules:
+Failure rule:
 
-- run providers in parallel
-- bounded retry on adapter failure
-- partial success is acceptable if at least one valid candidate survives
+- if all transcription providers fail, the run errors out
+
+Routing facts:
+
+- `transcription_provider_succeeded`
+- `transcription_provider_failed`
 
 ### `normalize_transcripts`
 
-Inputs:
+Purpose:
 
-- raw provider outputs
+- load staged transcript candidates
+- normalize identifiers, segments, metadata, and full text
+- persist normalized candidates to the decision store and blob store
 
-Outputs:
+Failure rule:
 
-- canonical transcript candidates
-
-Normalization must standardize:
-
-- timestamps
-- speaker labels
-- whitespace
-- provider metadata
-- candidate IDs
+- if no candidates remain after normalization, the run errors out
 
 ### `review_transcripts`
 
-Inputs:
+Purpose:
 
-- normalized transcript candidates
-- scoped review context
-
-Outputs:
-
-- reviewer bundles from two reviewer agents
+- recall transcript-stage memory
+- render deterministic reviewer prose for two reviewer roles
+- parse that prose into canonical `ReviewBundle` models
 
 Reviewer roles:
 
-- Reviewer A: literal accuracy, names, speaker fidelity, timestamps, terminology
-- Reviewer B: omissions, additions, formatting, coherence, plausibility
+- `accuracy_reviewer`
+- `coherence_reviewer`
+
+Outputs:
+
+- transcript review IDs
+- persisted review-memory bundle
 
 ### `adjudicate_transcript`
 
-Inputs:
+Purpose:
 
-- transcript candidates
-- parsed reviewer bundles
-- adjudication context
-
-Outputs:
-
-- final transcript decision
-- escalation metadata if needed
-- memory candidate bundle
-
-Routing policy:
-
-- low disagreement: finalize
-- medium disagreement: run conflict investigator, then re-adjudicate
-- high disagreement: escalate to stronger adjudicator
-- unresolved: mark for human review
-
-### `generate_translation_candidates`
-
-Inputs:
-
-- final transcript
-- translation request context
+- load normalized transcript candidates and parsed reviews
+- recall a smaller adjudication memory slice
+- score disagreement and produce a deterministic decision
 
 Outputs:
 
-- candidate A from baseline prompt
-- candidate B from contrasted prompt
+- final transcript candidate ID
+- transcript decision ref
+- optional investigation ref
+- `pending_memory_source_stage="transcript_adjudication"`
+- escalation and human-review flags
 
-Rules:
+Possible decision modes:
 
-- both use `gpt-5.4-mini`
-- prompt B must meaningfully differ in style or decision boundary
-- retry failures per variant
-- if one variant fails, continue with reduced confidence
-- if both fail, preserve approved transcript and emit recoverable translation-failed state
-
-### `normalize_translations`
-
-Inputs:
-
-- raw translation candidates
-
-Outputs:
-
-- canonical translation candidates
-
-### `review_translations`
-
-Inputs:
-
-- final transcript
-- translation candidates
-- scoped translation review context
-
-Outputs:
-
-- reviewer bundles from two reviewer agents
-
-Reviewer roles:
-
-- Reviewer A: faithfulness, terminology, constraint preservation
-- Reviewer B: fluency, tone, style fit, readability
-
-### `adjudicate_translation`
-
-Inputs:
-
-- translation candidates
-- parsed review bundles
-- adjudication context
-
-Outputs:
-
-- final translation decision
-- escalation metadata if needed
-- memory candidate bundle
-
-Policy mirrors transcript adjudication.
-
-### `finalize_outputs`
-
-Inputs:
-
-- approved transcript decision
-- approved translation decision or failure state
-- scorecards
-- artifact references
-
-Outputs:
-
-- persisted canonical transcript
-- persisted canonical translation
-- exported outputs
-- trace refs
-- downstream payloads
+- `automatic_finalize`
+- `conflict_investigation`
+- `stronger_adjudicator`
+- `human_review`
 
 ### `background_memory_pipeline`
 
-Trigger points:
+Purpose:
 
-- after transcript adjudication
-- after translation adjudication
+- convert the most recent decision into a scoped `MemoryWriteBatch`
+- persist the batch without blocking on consolidation
 
-Responsibilities:
+Behavior:
 
-- extract memory candidates
-- consolidate and deduplicate
-- write approved semantic and episodic memory
-- propose translation prompt updates
+- after transcript adjudication, the router decides whether translation should run
+- after translation adjudication, the next step is always finalization
 
-## Reviewer Context Rules
+### `generate_translation_candidates`
 
-Transcript reviewers receive:
+Purpose:
 
-- transcript candidates
-- minimal project profile
-- glossary slice
-- transcription rules
-- provider caveats
-- small relevant episodic slice
+- load the winning transcript
+- generate one translation candidate per prompt variant
+- persist raw payloads and staged translation candidates
 
-Translation reviewers receive:
+Current prompt variants:
 
-- final transcript
-- translation candidates
-- project profile
-- glossary slice
-- translation rules
-- small relevant episodic slice
+- `variant-a`
+- `variant-b`
 
-Conflict investigator receives:
+Behavior:
 
-- disputed spans only
-- reviewer outputs
-- adjudication context
-- narrow memory slice
+- single-variant survival is allowed
+- if both variants fail, the node sets `translation_failed=True`
 
-## Reviewer Output Shape
+### `normalize_translations`
 
-Reviewer output stays human-readable prose but must contain these sections:
+Purpose:
 
-- `Winner`
-- `Confidence`
-- `Why`
-- `Key Errors By Candidate`
-- `Quoted Evidence`
-- `Suggested Fixes`
-- `Escalate?`
+- normalize translation candidate metadata, segment ordering, and full text
+- persist normalized translation candidates
 
-A deterministic parser must extract:
+Outputs:
 
-- preferred candidate
-- confidence
-- evidence spans
-- issue categories
-- escalation signal
+- zero or more normalized translation candidate IDs
 
-## Failure Policy
+### `review_translations`
 
-- `ffmpeg` failure is terminal unless an alternate usable stream exists.
-- Adapter failures retry with bounded backoff.
-- Single surviving transcript candidate is allowed but should bias adjudication toward escalation.
-- Single surviving translation candidate is allowed but should reduce confidence.
-- All escalations must preserve candidates, reviewer outputs, and recalled memory refs.
+Purpose:
+
+- recall translation-stage memory
+- include the final transcript ref in the review prompt context
+- render and parse deterministic reviewer output
+
+Reviewer roles:
+
+- `faithfulness_reviewer`
+- `style_reviewer`
+
+Behavior:
+
+- if there are no translation candidates, the node emits `review_skipped`
+
+### `adjudicate_translation`
+
+Purpose:
+
+- decide between surviving translation candidates or emit a recoverable failure state
+
+Special cases:
+
+- if there are no translation candidates, the node creates a `FinalTranslationDecision` with `human_review_required=True` and `translation_failed=True`
+- a translation conflict investigation can time out and be converted into `human_review`
+
+Outputs:
+
+- final translation candidate ID or `None`
+- translation decision ref
+- optional investigation ref
+- optional `pending_memory_source_stage="translation_adjudication"`
+- translation failure and human-review flags
+
+### `finalize_outputs`
+
+Purpose:
+
+- publish the current set of artifacts without waiting for memory consolidation
+
+Outputs:
+
+- published transcript when a transcript winner exists
+- published translation when a translation winner exists and human review is not required
+- recoverable translation failure manifest when translation generation failed
+- scorecard
+- exports
+- downstream delivery payload
+- published artifact manifest
+
+## Routing Rules
+
+The only conditional edge lives after `background_memory_pipeline`.
+
+`route_after_memory_pipeline()` currently behaves like this:
+
+- if `final_translation_decision_ref` exists, go to `finalize_outputs`
+- else if `human_review_required` is `True`, go to `finalize_outputs`
+- else go to `generate_translation_candidates`
+
+Implications:
+
+- transcript-stage escalation can skip the entire translation path
+- translation adjudication always leads to finalization
+
+## Status Semantics
+
+The API maps final graph state into these public statuses:
+
+- `completed`
+  The workflow reached finalization without human review and without transcription degradation.
+- `completed_with_degraded_transcription`
+  At least one transcription provider failed, but another candidate survived and the run completed.
+- `human_review_required`
+  The workflow escalated to a state that still requires human intervention.
+- `translation_failed`
+  All translation variants failed, the transcript was preserved, and a recoverable translation failure artifact was published.
+
+## Scenario-Driven Fake Runtime
+
+Fake mode uses a `scenario` metadata field to drive deterministic branch coverage.
+
+Implemented scenarios include:
+
+- `happy`
+- `degraded_stt`
+- `single_transcript_candidate`
+- `transcript_escalation`
+- `translation_single_variant`
+- `translation_failed`
+- `translation_conflict`
+- `translation_conflict_timeout`
+- `translation_high_risk`
+- `translation_escalation`
+
+These scenarios are used heavily by the phase and regression tests to keep routing behavior reproducible.
+
+## Published Outputs
+
+A successful translation run publishes:
+
+- `published/transcript.json`
+- `published/translation.json`
+- `published/scorecard.json`
+- `published/artifacts.json`
+- `exports/translation.txt`
+- `exports/translation.json`
+- `deliveries/translation.json`
+- `traces/<run_id>.jsonl`
+- memory batch, consolidation, and prompt-evolution refs when available
+
+A translation-failed run publishes:
+
+- `published/transcript.json`
+- `translation-failed.json`
+- `published/scorecard.json`
+- exports and delivery payloads with the failure status
+
+## Guarantees Exercised By Tests
+
+The most important workflow guarantees are covered by tests:
+
+- happy path end-to-end execution
+- degraded transcription with partial provider failure
+- single surviving translation variant
+- translation failure with transcript preservation
+- transcript-stage escalation that skips translation
+- medium disagreement conflict investigation
+- high-risk translation escalation
+- timeout-to-human-review regression behavior
+- trace publication into blob storage
+- tenant and language-pair artifact isolation

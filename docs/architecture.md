@@ -2,190 +2,302 @@
 
 ## System Shape
 
-V1 is a Python application with two public entrypoints:
+`translation-agent` is a Python application with two public entrypoints:
 
-- CLI for local and batch execution
-- Python API for programmatic use
+- a CLI in `translation_agent.cli`
+- a Python API in `translation_agent.api`
 
-The core runtime is a LangGraph workflow. Most execution is deterministic. Agents are used only where comparison, critique, or escalation adds value.
+Both entrypoints execute the same LangGraph workflow. The graph is implemented in `src/translation_agent/graph/` and operates on a ref-only `GraphState`, which keeps runtime state small and pushes durable artifacts into blob storage and the operational store.
 
-## Primary Design Choice
+## Runtime Modes
 
-Use a deterministic workflow to control:
+### Fake Runtime
 
-- artifact movement
-- provider calls
-- retries
+The default runtime is built by `build_phase_two_runtime()`.
+
+It uses:
+
+- deterministic fake audio extraction
+- three deterministic fake transcription adapters
+- one deterministic fake translation adapter with two prompt variants
+- blob-backed long-term memory
+- deterministic review rendering, parsing, adjudication, and prompt evolution
+
+This mode is intentionally rich enough to exercise:
+
+- routing and escalation
+- persistence and trace writing
+- output publishing
+- memory staging and consolidation
+- replay and regression behavior
+
+### Real Runtime
+
+The real-provider runtime is built by `build_runtime()` when `TA_ADAPTER_MODE=real`, which delegates to `build_phase_three_runtime()`.
+
+It uses:
+
+- `FFmpegAudioExtractionAdapter`
+- `AssemblyAITranscriptionAdapter`
+- `SpeechmaticsTranscriptionAdapter`
+- `DeepgramTranscriptionAdapter`
+- `OpenAITranslationAdapter`
+
+Real mode is gated by:
+
+- provider credential validation
+- the current LangGraph Python 3.14 compatibility guard
+- retry, backoff, timeout, and polling settings loaded from `Settings`
+
+## Deterministic Versus Agentic Boundary
+
+The current implementation is deterministic-first.
+
+Deterministic code owns:
+
+- workflow execution
+- node routing
+- provider invocation and retries
 - normalization
-- routing
-- persistence
+- candidate persistence
+- review parsing
+- adjudication scoring
 - memory staging
+- artifact publishing
+- replay
 
-Use agents to perform:
+The review layer is still structured around reviewer roles, but in the current fake runtime those roles are rendered deterministically into fixed-section prose and parsed back into structured review bundles. This matters because the design target is not “free-form multi-agent orchestration”; it is inspectable workflow execution with narrow judgment points.
 
-- transcript critique
-- translation critique
-- evidence-based comparison
-- targeted dispute investigation
+## Workflow Layering
 
-This keeps the system inspectable and replayable while still allowing agent judgment where it matters.
+### 1. Public API Layer
 
-## Runtime Layers
+`translation_agent.api.run_job()`:
 
-### 1. Workflow Layer
+- validates configuration
+- creates a request manifest in blob storage
+- inserts a run record into the operational store
+- configures structured logging and JSONL tracing
+- builds the runtime
+- runs the workflow
+- persists final run status and outputs
 
-Owns end-to-end job execution and state transitions.
+`translation_agent.cli.main()` is a thin wrapper over the API and config validation helpers.
 
-Responsibilities:
+### 2. Graph And Node Layer
 
-- receive job input
-- manage node execution
-- keep graph state lean
-- pass IDs or references instead of large blobs
+The graph is wired in `graph/builder.py` and executes these nodes:
 
-### 2. Tool And Provider Layer
+1. `ingest`
+2. `extract_audio`
+3. `fanout_transcription`
+4. `normalize_transcripts`
+5. `review_transcripts`
+6. `adjudicate_transcript`
+7. `background_memory_pipeline`
+8. conditional route to either translation generation or finalization
+9. `normalize_translations`
+10. `review_translations`
+11. `adjudicate_translation`
+12. `background_memory_pipeline`
+13. `finalize_outputs`
 
-Owns direct integrations.
+The graph itself stages memory synchronously, but best-effort memory consolidation happens after graph completion inside `run_workflow()`. This is an important implementation detail: finalization is not blocked on consolidation.
 
-V1 policy:
+### 3. Adapter Layer
 
-- `ffmpeg` runs as a direct local tool
-- transcription providers use direct Python adapters
-- OpenAI translation/review calls use a direct Python adapter
-- MCP is optional and limited to auxiliary tools
+The adapter layer is intentionally narrow:
 
-### 3. Agent Review Layer
+- audio extraction returns a canonical `AudioArtifact`
+- transcription returns canonical `TranscriptCandidate` values plus raw payload refs
+- translation returns canonical `TranslationCandidate` values plus raw response refs
 
-Owns candidate critique and conflict analysis.
+Shared retry and transport behavior lives in `adapters/common.py`. Real adapters write raw payloads into blob storage so normalization and replay can operate on stable refs instead of transient provider objects.
 
-Actors:
+### 4. Review And Adjudication Layer
 
-- Transcript Reviewer A
-- Transcript Reviewer B
-- Translation Reviewer A
-- Translation Reviewer B
-- Conflict Investigator
-- Stronger adjudicator model for high-risk escalation
+Review contracts are stage-specific and role-specific:
 
-### 4. Persistence And Artifact Layer
+- transcript reviewers: `accuracy_reviewer`, `coherence_reviewer`
+- translation reviewers: `faithfulness_reviewer`, `style_reviewer`
 
-Stores:
+Reviewer output is required to match a fixed prose shape with these sections:
 
-- operational records
-- provider payload references
-- candidate artifacts
-- final outputs
-- escalation records
-- memory write batches
+- `Winner`
+- `Confidence`
+- `Why`
+- `Key Errors By Candidate`
+- `Quoted Evidence`
+- `Suggested Fixes`
+- `Escalate?`
 
-### 5. Memory Layer
+Adjudication in `review/policy.py` scores disagreement using:
 
-Owns read/write policy across short-term and long-term memory stores.
+- winner mismatch
+- confidence spread
+- contradictory evidence count
+- highest issue severity
+- escalation signal count
+- content-risk multiplier
+
+Current thresholds:
+
+- score `< 3.0`: `automatic_finalize`
+- score `>= 3.0`: `conflict_investigation`
+- score `>= 5.2`: `stronger_adjudicator`
+- unresolved or high-risk cases: `human_review`
+
+The adjudication output is deterministic and yields:
+
+- final decision model
+- disagreement bucket
+- scorecard
+- escalation flags
+- optional investigation payload
+
+## Persistence Model
+
+The implementation uses two complementary persistence paths.
+
+### Blob Storage
+
+Blob storage is the durable source for:
+
+- request manifests
+- raw provider payloads
+- staged candidates
+- normalized candidates
+- reviews
+- decisions
+- investigations
+- memory artifacts
+- traces
+- published artifacts and exports
+
+By default the blob store is local filesystem storage rooted at `.translation-agent/blobs/`.
+
+### Operational Store
+
+The operational store tracks:
+
+- runs
+- node executions
+- transcript candidates
+- translation candidates
+- transcript decisions
+- translation decisions
+- investigations
+- memory batches
+
+It can run on:
+
+- SQLite by default
+- Postgres when `TA_STATE_DB_DSN` is set
+
+Postgres schema management is handled through Alembic migrations under `alembic/`.
+
+## Artifact Scoping
+
+Artifact keys are scoped by:
+
+- tenant
+- project
+- source language
+- target language
+- job ID
+
+This prevents collisions when:
+
+- the same job ID appears in different tenants
+- the same job ID is translated into different target languages
+
+The helper functions in `storage/paths.py` define this convention and should be treated as the source of truth for new artifact keys.
 
 ## Memory Architecture
 
-### Layer 0: Run-Local State
+The current memory implementation is local and blob-backed, but the workflow already enforces useful boundaries.
 
-LangGraph thread or checkpoint state for the active run.
+### Recall
 
-Use for:
+Recall is tenant, project, and language scoped. The recall backend returns:
 
-- current node outputs
-- IDs and lightweight refs
-- routing decisions
-
-### Layer 1: Human-Maintained Working Files
-
-Deep Agents `/memories/` files for:
-
-- project instructions
-- runbooks
-- correction ledgers
-- manual notes
-
-### Layer 2: Semantic Memory
-
-LangMem semantic storage for:
-
+- semantic memory
+- episodic memory
 - glossary entries
-- transcription rules
-- translation rules
+- rules
 - provider caveats
-- tenant or project preferences
 
-### Layer 3: Episodic Memory
+Review and adjudication then further narrow those slices so prompts stay bounded and deterministic.
 
-LangMem episodic storage for:
+### Staging
 
-- hard wins
-- hard failures
-- edge cases worth recalling later
+Memory staging happens at adjudication boundaries.
 
-### Layer 4: Procedural Memory
+The workflow creates `MemoryWriteBatch` artifacts that can include:
 
-LangMem storage for prompt improvement proposals, especially around translation prompt evolution.
+- semantic writes
+- episodic writes
+- procedural writes
 
-## Memory Write Boundaries
+Staging intentionally avoids writing raw transcript or translation bodies into long-term memory.
 
-- Review agents can read scoped memory slices.
-- Review and adjudication agents do not write long-term memory directly.
-- Adjudication emits the trusted memory-candidate bundle.
-- Background consolidation is the only writer to semantic and episodic long-term memory.
-- Translation prompt auto-evolution consumes consolidated outcomes, not raw reviewer prose alone.
+### Consolidation
 
-## Deterministic vs Agentic Boundary
+Consolidation is a best-effort background step that:
 
-### Deterministic Nodes Must Own
+- deduplicates writes
+- persists semantic and episodic entries
+- records skipped dedupe keys
+- counts procedural writes
 
-- media extraction
-- provider fanout
-- prompt variant selection
-- normalization
-- retries
-- persistence
-- escalation routing
-- memory batching
+### Prompt Evolution
 
-### Agentic Nodes Must Own
+Prompt evolution proposals are generated only from consolidated translation adjudication outcomes. The current implementation:
 
-- candidate critique
-- quoted evidence gathering
-- issue comparison
-- limited conflict investigation
+- never derives prompt changes directly from raw reviewer prose
+- only targets translation prompts
+- can mark low-disagreement translation outcomes as `auto_activate_eligible`
+- keeps reviewer and adjudicator prompt changes approval-gated
 
-## Adjudication Model
+## Observability
 
-Adjudication is deterministic-first.
+The repo emits:
 
-Flow:
+- structured logs through `observability/events.py`
+- JSONL traces through `observability/tracing.py`
+- node execution records in the operational store
 
-1. Parse reviewer outputs into structured signals.
-2. Compare winners, confidence, evidence quality, and severity.
-3. Finalize automatically when disagreement is low.
-4. Spawn a conflict investigation step when disagreement is medium.
-5. Escalate to a stronger adjudicator when disagreement is high or content risk is high.
-6. Mark for human review if still unresolved.
+This gives three complementary views of a run:
 
-## Core Non-Goals For V1
+- coarse run lifecycle
+- per-node execution status
+- append-only trace events with timestamps and attributes
 
-- operator supervisor in the runtime path
-- recursive multi-agent debate loops
-- human approval gates for normal runs
+## Replay And Inspectability
+
+`replay.py` reconstructs adjudication from persisted refs:
+
+- candidate refs
+- review refs
+- memory ref
+
+This is important for debugging because it lets you prove whether a decision changed because of:
+
+- normalized inputs
+- review parsing
+- adjudication policy
+- stored investigation artifacts
+
+Replay also preserves the translation conflict-timeout regression path when the stored investigation payload reports `status="timed_out"`.
+
+## Non-Goals Of The Current Implementation
+
+The repo does not yet provide:
+
+- a human-in-the-loop operator UI
+- runtime manual override workflows
+- free-form multi-agent orchestration
 - a second translation provider
-- mandatory LangSmith dependency
+- external vector or semantic databases for long-term memory
 
-## Suggested Package Boundaries
-
-The code should eventually separate into modules roughly like:
-
-- `translation_agent.cli`
-- `translation_agent.api`
-- `translation_agent.graph`
-- `translation_agent.nodes`
-- `translation_agent.adapters`
-- `translation_agent.models`
-- `translation_agent.review`
-- `translation_agent.memory`
-- `translation_agent.storage`
-- `translation_agent.publish`
-- `translation_agent.observability`
+Those remain roadmap items rather than hidden assumptions in the current code.

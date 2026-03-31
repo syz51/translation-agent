@@ -1,26 +1,260 @@
 # translation-agent
 
-Phase 0 bootstrap is in place. The implementation spec still lives in [`docs/README.md`](docs/README.md).
+`translation-agent` is a workflow-first translation pipeline built in Python on top of LangGraph. The repository is no longer a bootstrap scaffold: it already contains a runnable dry-run runtime, a real-adapter runtime, operational persistence, replay helpers, memory staging and consolidation, artifact publishing, and a test suite that exercises the end-to-end workflow.
 
-Quick start:
+## What It Does
 
-1. `uv sync`
-2. `uv run translation-agent validate-config --json`
-3. `uv run translation-agent run-job path/to/input.media --json`
-4. `uv run pytest`
+The current pipeline executes these stages:
 
-Optional Postgres-backed operational store:
+```text
+ingest
+-> extract_audio
+-> fanout_transcription
+-> normalize_transcripts
+-> review_transcripts
+-> adjudicate_transcript
+-> background_memory_pipeline
+-> generate_translation_candidates
+-> normalize_translations
+-> review_translations
+-> adjudicate_translation
+-> background_memory_pipeline
+-> finalize_outputs
+```
 
-1. `docker compose up -d postgres`
-2. `export TA_STATE_DB_DSN=postgresql://translation_agent:translation_agent@127.0.0.1:55432/translation_agent`
-3. `uv run alembic upgrade head`
-4. `uv run translation-agent validate-config --json`
+The workflow is deterministic-first:
 
-Recommended reading order:
+- orchestration, retries, routing, persistence, normalization, and memory staging are implemented as deterministic nodes
+- transcript and translation review are generated into a fixed prose contract and parsed back into structured review bundles
+- adjudication is deterministic scoring with explicit escalation modes: `automatic_finalize`, `conflict_investigation`, `stronger_adjudicator`, and `human_review`
+- translation failures are recoverable: the run can preserve the approved transcript, publish a failure manifest, and stop short of a final translation
 
-1. [`docs/README.md`](docs/README.md)
-2. [`docs/architecture.md`](docs/architecture.md)
-3. [`docs/workflow.md`](docs/workflow.md)
-4. [`docs/interfaces-and-data-models.md`](docs/interfaces-and-data-models.md)
-5. [`docs/implementation-plan.md`](docs/implementation-plan.md)
-6. [`docs/roadmap.md`](docs/roadmap.md)
+## Runtime Modes
+
+The repo supports two execution modes.
+
+| Mode | How it is selected | What it uses | Best for |
+| --- | --- | --- | --- |
+| `fake` | default | deterministic fake adapters and scenario-driven outputs | local development, docs examples, fast tests |
+| `real` | `TA_ADAPTER_MODE=real` | `ffmpeg`, AssemblyAI, Speechmatics, Deepgram, and OpenAI Responses API | real provider integration |
+
+Notes:
+
+- fake mode requires no provider credentials
+- real mode requires all four provider API keys
+- real mode is currently gated behind the LangGraph Python 3.14 compatibility check unless `TA_ALLOW_LANGGRAPH_PY314_WARNING=1` is set
+- fake mode still writes the full run record, trace, blob artifacts, scorecards, memory batches, consolidations, and prompt-evolution proposals
+
+## Quick Start
+
+### Local Dry Run
+
+```bash
+uv sync
+uv run translation-agent validate-config --json
+uv run translation-agent run-job input.wav --job-id demo --json
+```
+
+Defaults:
+
+- data root: `.translation-agent/`
+- blob root: `.translation-agent/blobs/`
+- local state DB: `.translation-agent/state.sqlite3`
+- traces: `.translation-agent/traces/`
+
+### Postgres-Backed Runtime
+
+```bash
+docker compose up -d postgres
+export TA_STATE_DB_DSN=postgresql://translation_agent:translation_agent@127.0.0.1:55432/translation_agent
+uv run alembic upgrade head
+uv run translation-agent validate-config --json
+```
+
+`compose.yaml` starts a local Postgres 18 instance on port `55432` by default.
+
+### Real Adapter Mode
+
+```bash
+export TA_ADAPTER_MODE=real
+export TA_ASSEMBLYAI_API_KEY=...
+export TA_SPEECHMATICS_API_KEY=...
+export TA_DEEPGRAM_API_KEY=...
+export TA_OPENAI_API_KEY=...
+export TA_ALLOW_LANGGRAPH_PY314_WARNING=1
+uv run translation-agent validate-config --json
+```
+
+If the LangGraph compatibility warning disappears in a future dependency update, the explicit opt-in should no longer be necessary.
+
+## CLI
+
+The CLI entrypoint is `translation-agent`.
+
+### `validate-config`
+
+```bash
+uv run translation-agent validate-config
+uv run translation-agent validate-config --json
+```
+
+It verifies:
+
+- runtime directories exist or can be created
+- SQLite or Postgres connectivity works
+- secrets are not leaked in DSN output
+- provider credentials are present when `TA_ADAPTER_MODE=real`
+- real mode is allowed by the current LangGraph compatibility gate
+
+### `run-job`
+
+```bash
+uv run translation-agent run-job input.wav --job-id demo
+uv run translation-agent run-job input.wav --job-id demo --json
+```
+
+The public result payload contains:
+
+- `run_id`
+- `job_id`
+- `status`
+- `source`
+- `blob_root`
+- `trace_path`
+- `state_backend`
+- `state_db_target`
+
+Final statuses currently emitted by the API are:
+
+- `completed`
+- `completed_with_degraded_transcription`
+- `human_review_required`
+- `translation_failed`
+
+## Python API
+
+```python
+from translation_agent.api import RunJobRequest, run_job
+
+result = run_job(
+    RunJobRequest(
+        source="input.wav",
+        job_id="demo",
+        tenant_id="tenant-local",
+        project_id="project-local",
+        source_language="en",
+        target_language="fr",
+    )
+)
+
+print(result.status)
+print(result.trace_path)
+```
+
+The API validates configuration first, persists a request manifest, creates a run record, executes the workflow, writes a JSONL trace, and returns the run summary.
+
+## Artifact Layout
+
+A sample successful dry-run writes artifacts like this under the blob root:
+
+```text
+jobs/<run_id>-request.json
+memory/long-term/store.json
+tenants/<tenant>/projects/<project>/languages/<src>-to-<dst>/jobs/<job_id>/
+  artifacts/audio.json
+  artifacts/audio.wav
+  staging/transcripts/*.json
+  staging/translations/*.json
+  raw/provider-payloads/*.json
+  candidates/transcripts/*.json
+  candidates/translations/*.json
+  reviews/transcript/*.json
+  reviews/translation/*.json
+  decisions/transcript.json
+  decisions/translation.json
+  investigations/*.json
+  memory/recall/*.json
+  memory/batches/*.json
+  memory/consolidations/*.json
+  memory/prompt-evolution/*.json
+  published/artifacts.json
+  published/scorecard.json
+  published/transcript.json
+  published/translation.json
+  exports/translation.txt
+  exports/translation.json
+  deliveries/translation.json
+  traces/<run_id>.jsonl
+```
+
+Important behavior:
+
+- artifact keys are scoped by tenant, project, source language, target language, and job ID
+- the same job ID can exist safely across tenants or language pairs
+- translation failure publishes `translation-failed.json` instead of `published/translation.json`
+- the scorecard includes routing facts, decision payloads, trace refs, export refs, downstream refs, memory refs, and prompt-evolution refs
+
+## Configuration
+
+The settings model accepts more fields than most users need. These are the ones that materially change current behavior.
+
+| Variable | Purpose |
+| --- | --- |
+| `TA_DATA_DIR` | root for local blobs, traces, and SQLite state |
+| `TA_BLOB_DIR` | override blob directory |
+| `TA_TRACE_DIR` | override trace directory |
+| `TA_STATE_DB_PATH` | override SQLite database path |
+| `TA_STATE_DB_DSN` | switch operational state to Postgres |
+| `TA_ADAPTER_MODE` | choose `fake` or `real` runtime |
+| `TA_ALLOW_LANGGRAPH_PY314_WARNING` | opt into real mode despite the current warning gate |
+| `TA_FFMPEG_BINARY` | override the `ffmpeg` executable path |
+| `TA_PROVIDER_TIMEOUT_SECONDS` | provider HTTP timeout |
+| `TA_ADAPTER_RETRY_ATTEMPTS` | retry attempts for provider calls |
+| `TA_ADAPTER_INITIAL_BACKOFF_SECONDS` | initial retry backoff |
+| `TA_ADAPTER_MAX_BACKOFF_SECONDS` | max retry backoff |
+| `TA_ADAPTER_POLL_INTERVAL_SECONDS` | poll interval for async providers |
+| `TA_ADAPTER_POLL_ATTEMPTS` | max provider polling attempts |
+| `TA_ASSEMBLYAI_API_KEY` | AssemblyAI credential for real mode |
+| `TA_SPEECHMATICS_API_KEY` | Speechmatics credential for real mode |
+| `TA_DEEPGRAM_API_KEY` | Deepgram credential for real mode |
+| `TA_OPENAI_API_KEY` | OpenAI credential for real mode |
+| `TA_TRANSLATION_MODEL_ID` | translation model ID for real mode |
+| `TA_TRANSLATION_PROMPT_VERSION` | translation prompt version recorded in outputs |
+
+The settings model also exposes `TA_WORKSPACE_DIR`, `TA_LOG_LEVEL`, `TA_EMIT_CONSOLE_LOGS`, and provider base URL overrides. At the moment those are configuration surface area, but the repo’s behavior is primarily driven by the variables listed above.
+
+## Testing And Verification
+
+Project conventions in [`AGENTS.md`](./AGENTS.md) require `uv` and `ruff`.
+
+Useful commands:
+
+```bash
+uv run ruff check .
+uv run pre-commit run --all-files
+uv run pyright
+uv run pytest -m "unit or slice"
+uv run pytest -m contract
+uv run pytest -m "integration or migration" -n 2 --dist=loadfile
+uv run pytest -m "regression and not staging_only"
+```
+
+The highest-signal workflow coverage lives in:
+
+- `tests/test_phase_two_workflow.py`
+- `tests/test_phase_three_adapters.py`
+- `tests/test_phase_four_review.py`
+- `tests/test_phase_five_memory_publish.py`
+- `tests/test_phase_six_hardening.py`
+- `tests/regression/test_runtime_regression.py`
+
+## Docs
+
+Implementation docs live under [`docs/`](./docs):
+
+1. [`docs/README.md`](./docs/README.md)
+2. [`docs/architecture.md`](./docs/architecture.md)
+3. [`docs/workflow.md`](./docs/workflow.md)
+4. [`docs/interfaces-and-data-models.md`](./docs/interfaces-and-data-models.md)
+5. [`docs/implementation-plan.md`](./docs/implementation-plan.md)
+6. [`docs/roadmap.md`](./docs/roadmap.md)

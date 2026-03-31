@@ -1,36 +1,39 @@
 # Roadmap
 
-This document records work intentionally deferred out of v1.
+This document tracks work intentionally deferred beyond the current implementation. The repo already has a runnable deterministic workflow, real-provider adapters, persistence, replay, and memory handling, so the items below are true future work rather than missing foundations.
 
-## Deferred Runtime Features
+## Product And Runtime Work Still Deferred
 
-- operator supervisor agent
-- interactive reruns
-- manual override UX
-- richer MCP integrations
-- LangSmith integration
+- operator-facing UI for reviewing escalations and rerunning jobs
+- explicit human approval workflows in the runtime path
+- richer manual override and guided recovery flows
+- a second translation provider
+- richer downstream delivery integrations
+- external long-term memory backends instead of the current blob-backed store
+- deeper observability beyond structured logs, node executions, and JSONL traces
 
-## Deferred Product Decisions
+## Engineering Improvements Worth Reopening Later
 
-- reevaluate transcription provider mix after v1 data
-- consider a second translation provider later
-- revisit escalation model selection after baseline metrics exist
+- remove the temporary LangGraph Python 3.14 real-mode gate once upstream compatibility is stable
+- decide whether fake-review rendering should be replaced by real model-backed review calls in non-test environments
+- expand contract coverage for exported artifacts and scorecards
+- formalize provider-specific runbooks and failure taxonomies for real mode
+- turn currently implicit scenario coverage into explicit developer-facing fixtures or docs
 
-## Why These Are Deferred
+## Why These Are Still Deferred
 
-V1 is optimizing for:
+The current implementation optimizes for:
 
-- a stable automated core workflow
-- inspectable routing and decision behavior
-- a small number of hard dependencies
-- enough observability to debug without building an operator platform first
+- deterministic, inspectable execution
+- replayable decisions
+- stable local development with fake adapters
+- minimal operator surface area
+- enough persistence and observability to debug without building a full control plane
 
-## Trigger To Reopen These Decisions
+## Signals That Should Reopen These Decisions
 
-Revisit deferred items when one of these becomes true:
-
-- unresolved escalations are too frequent
-- debugging needs exceed trace tables and stored artifacts
-- translation quality plateaus under the single-model, two-prompt strategy
-- provider failure rates or cost profiles justify a different mix
-- operators need guided reruns more than engineering needs more automation
+- unresolved escalations become common enough that manual triage needs tooling
+- debugging requires more than traces, routing facts, scorecards, and replay
+- the single-translation-provider strategy limits quality or resilience
+- blob-backed long-term memory becomes a bottleneck for recall quality or scale
+- downstream consumers need stronger delivery guarantees than the current artifact manifests provide

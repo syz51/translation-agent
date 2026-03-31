@@ -1,31 +1,51 @@
 # Interfaces And Data Models
 
-## Core Interface Contracts
+## Public Entry Points
 
-These are the implementation-facing interfaces from the plan. Keep them stable unless the architecture changes.
+### CLI
 
-```python
-extract_audio(video_ref, job_context) -> AudioArtifact
-transcribe(audio_artifact, provider_id, request_context) -> TranscriptCandidate
-normalize_transcript_candidates(candidates) -> list[TranscriptCandidate]
-review_transcripts(candidates, review_context) -> list[ReviewBundle]
-adjudicate_transcripts(candidates, reviews, adjudication_context) -> FinalTranscriptDecision
-generate_translation(final_transcript, prompt_variant_id, request_context) -> TranslationCandidate
-normalize_translation_candidates(candidates) -> list[TranslationCandidate]
-review_translations(candidates, review_context) -> list[ReviewBundle]
-adjudicate_translations(candidates, reviews, adjudication_context) -> FinalTranslationDecision
-recall_memory(memory_query) -> MemoryBundle
-stage_memory_candidates(adjudication_result) -> MemoryWriteBatch
-finalize_run(run_result) -> PublishedArtifacts
-```
+`translation_agent.cli` exposes:
 
-## Canonical Entity Set
+- `translation-agent validate-config [--json]`
+- `translation-agent run-job <source> [--job-id <id>] [--json]`
 
-These names should become concrete models early.
+### Python API
+
+`translation_agent.api` exposes:
+
+- `RunJobRequest`
+- `RunJobResult`
+- `run_job()`
+
+These are the stable entrypoints other tooling should build against.
+
+## Runtime Configuration Contract
+
+`translation_agent.config.Settings` is loaded from environment variables with the `TA_` prefix.
+
+The most important current settings are:
+
+- local path configuration
+- SQLite versus Postgres operational state
+- fake versus real adapter mode
+- provider credentials
+- retry, timeout, and polling controls
+- translation model ID and prompt version
+
+Configuration validation returns a `ValidationResult` with:
+
+- path checks
+- backend choice
+- connectivity result
+- provider-configuration result
+- runtime-compatibility result
+- sanitized database target
+
+## Core Runtime Models
 
 ### `JobContext`
 
-Fields should include:
+Immutable job identity and request facts:
 
 - `job_id`
 - `tenant_id`
@@ -37,9 +57,45 @@ Fields should include:
 - `created_at`
 - `profile_ref`
 
+### `RequestContext`
+
+Per-request runtime context for extraction, transcription, and translation:
+
+- `run_id`
+- `attempt`
+- `job`
+- `source_artifact_ref`
+- `metadata`
+
+### `GraphState`
+
+Lean ref-only workflow state:
+
+- run identity and current stage
+- request and source refs
+- audio, raw payload, candidate, review, decision, and published artifact refs
+- memory batch IDs
+- routing facts
+- escalation and failure flags
+
+The graph state is intentionally not a warehouse for large payloads. Durable data lives in blob storage and the operational store.
+
+### `RoutingFact`
+
+Small immutable fact record used to explain workflow decisions:
+
+- `stage`
+- `fact_type`
+- `value`
+- `source_ref`
+
+The scorecard publishes routing facts so runs remain inspectable after completion.
+
+## Canonical Artifact Models
+
 ### `AudioArtifact`
 
-Fields should include:
+Canonical output of audio extraction:
 
 - `artifact_id`
 - `job_id`
@@ -50,9 +106,21 @@ Fields should include:
 - `codec`
 - `extraction_metadata`
 
+### `Segment`
+
+Shared segment model for transcript and translation candidates:
+
+- `segment_id`
+- `start_ms`
+- `end_ms`
+- `speaker`
+- `source_text`
+- `target_text`
+- `annotations`
+
 ### `TranscriptCandidate`
 
-Fields should include:
+Normalized STT output:
 
 - `candidate_id`
 - `job_id`
@@ -69,11 +137,12 @@ Fields should include:
 
 ### `TranslationCandidate`
 
-Fields should include:
+Normalized translation output:
 
 - `candidate_id`
 - `job_id`
-- `source_transcript_candidate_id` or final transcript ref
+- `source_transcript_candidate_id`
+- `final_transcript_ref`
 - `model_id`
 - `prompt_variant_id`
 - `prompt_version`
@@ -84,26 +153,23 @@ Fields should include:
 - `normalization_version`
 - `metadata`
 
-### `Segment`
+## Review And Adjudication Models
 
-Fields should include:
+### `ReviewContext`
 
-- `segment_id`
-- `start_ms`
-- `end_ms`
-- `speaker`
-- `source_text`
-- `target_text`
-- `annotations`
+Inputs passed into the review layer:
 
-Notes:
-
-- transcript candidates will populate `source_text`
-- translation candidates may reuse segment timing and fill `target_text`
+- run ID
+- stage
+- reviewer role
+- job context
+- candidate IDs
+- stage-scoped memory bundle
+- optional policy ref
 
 ### `ReviewBundle`
 
-Fields should include:
+Parsed reviewer output:
 
 - `review_id`
 - `job_id`
@@ -118,141 +184,264 @@ Fields should include:
 - `escalation_signal`
 - `parser_version`
 
+### `AdjudicationContext`
+
+Context for deterministic adjudication:
+
+- run ID
+- stage
+- job
+- candidate IDs
+- review IDs
+- narrowed memory bundle
+- optional investigation ref
+- content-risk class
+
+### `AdjudicationScorecard`
+
+Structured scoring inputs used to explain a decision:
+
+- `candidate_count`
+- `preferred_candidate_id`
+- `average_confidence`
+- `confidence_spread`
+- `contradictory_evidence_count`
+- `highest_issue_severity`
+- `winner_mismatch`
+- `escalation_signal_count`
+- `total_score`
+- `content_risk_class`
+
 ### `FinalTranscriptDecision`
 
-Fields should include:
+Transcript decision payload:
 
-- `job_id`
 - `winner_candidate_id`
 - `decision_mode`
 - `decision_confidence`
 - `rationale_summary`
 - `review_refs`
 - `investigation_ref`
+- `disagreement_bucket`
+- `adjudication_scorecard`
 - `escalated`
 - `human_review_required`
 
 ### `FinalTranslationDecision`
 
-Fields should include the same decision pattern as transcript adjudication, plus:
+Translation decision payload extends the transcript pattern with:
 
+- `winner_model_id`
 - `prompt_variant_winner`
 - `prompt_version_winner`
 
+These fields are important because they feed prompt-evolution proposals and make translation decisions replayable.
+
+## Memory Models
+
+### `MemoryQuery`
+
+Recall request with built-in scope:
+
+- `job`
+- `stage`
+- `query_text`
+- `candidate_ids`
+- `max_items`
+
 ### `MemoryBundle`
 
-Fields should include:
+Read-only recall output:
 
-- semantic memory slice
-- episodic memory slice
-- glossary slice
-- rules slice
-- provider caveats
+- `semantic_memory`
+- `episodic_memory`
+- `glossary`
+- `rules`
+- `provider_caveats`
 
 ### `MemoryWriteBatch`
 
-Fields should include:
+Staged memory writes emitted at adjudication boundaries:
 
 - `batch_id`
 - `job_id`
 - `source_stage`
-- proposed semantic writes
-- proposed episodic writes
-- proposed procedural writes
+- decision and winner metadata
+- semantic, episodic, and procedural write lists
 - dedupe keys
 - consolidation status
+- scope metadata
+
+### `MemoryConsolidation`
+
+Result of background consolidation:
+
+- `consolidation_id`
+- `batch_id`
+- `job_id`
+- source decision metadata
+- inserted semantic and episodic memory IDs
+- skipped dedupe keys
+- procedural write count
+
+### `PromptEvolutionProposal`
+
+Translation-only prompt-improvement proposal derived from consolidated outcomes:
+
+- `proposal_id`
+- `job_id`
+- `source_consolidation_id`
+- `prompt_family`
+- `target_model_id`
+- `target_prompt_version`
+- `target_prompt_variant_id`
+- `status`
+- `activation_mode`
+- `auto_activate`
+- `rationale`
+- `suggested_changes`
+- `evidence_refs`
+- `metadata`
+
+## Publishing Models
+
+### `PublishContext`
+
+Context for finalization and downstream publishing:
+
+- run ID
+- job
+- transcript decision ref
+- translation decision ref
+- trace refs
+- export targets
+- downstream targets
 
 ### `PublishedArtifacts`
 
-Fields should include:
+Stable references emitted by publishing:
 
-- final transcript ref
-- final translation ref
-- scorecard refs
-- trace refs
-- export refs
-- downstream delivery refs
+- `final_transcript_ref`
+- `final_translation_ref`
+- `recoverable_translation_failure_ref`
+- `scorecard_refs`
+- `trace_refs`
+- `export_refs`
+- `downstream_delivery_refs`
+- `memory_batch_refs`
+- `memory_consolidation_refs`
+- `prompt_evolution_refs`
 
-## Provider Adapter Contracts
-
-Keep adapters narrow.
-
-### Transcription Adapter
-
-Must support:
-
-- request transcription
-- return provider IDs and raw payload ref
-- normalize provider-specific metadata into canonical candidate shape
-- classify retryable vs terminal errors
-
-Providers in v1:
-
-- `AssemblyAI` as primary
-- `Speechmatics` as comparison or backup
-- `Deepgram` as comparison or backup
-
-### Translation Adapter
-
-Must support:
-
-- model invocation for prompt variant A
-- model invocation for prompt variant B
-- prompt version tracking
-- raw response capture
-- retryable error classification
-
-V1 model:
-
-- `gpt-5.4-mini`
-
-## Adjudication Inputs
-
-The deterministic adjudication node should compare at least:
-
-- winner mismatch
-- confidence spread
-- contradictory evidence count
-- severity of issues
-- content risk class
-
-This should produce one of:
-
-- finalize automatically
-- investigate conflict
-- escalate to stronger adjudicator
-- require human review
-
-## Storage Shape
+## Storage Contracts
 
 ### Blob Store
 
-Should hold:
+The blob store contract supports:
 
-- videos
-- extracted audio
-- raw provider payloads
-- exported outputs
+- `put_bytes`
+- `read_bytes`
+- `exists`
+- `delete`
+- `list_keys`
+- `iter_entries`
 
-### Operational DB
+The default implementation is `LocalBlobStore`.
 
-Should hold tables or equivalent records for:
+### Run Store
 
-- runs
-- node executions
+The run store contract supports:
+
+- creating and updating runs
+- creating and updating node executions
+- listing historical runs and node executions
+
+Current implementations:
+
+- `SQLiteOperationalStore`
+- `PostgresOperationalStore`
+
+### Decision Store
+
+The decision store persists:
+
 - transcript candidates
-- transcript decisions
 - translation candidates
+- transcript decisions
 - translation decisions
-- escalation events
-- memory write batches
+- investigations
 
-### Observability
+### Memory Batch Store
 
-V1 requires:
+The memory batch store persists:
 
-- structured run records
-- structured evaluation records
-- trace events through an abstract tracing interface
+- staged `MemoryWriteBatch` models
 
-V1 does not require LangSmith, but should not block adding it later.
+## Artifact Key Conventions
+
+`storage/paths.py` defines the current job scope:
+
+```text
+tenants/<tenant>/projects/<project>/languages/<source>-to-<target>/jobs/<job_id>/
+```
+
+Everything published for a job hangs beneath that prefix. Any new feature that persists job-scoped artifacts should use the same convention instead of inventing a new storage layout.
+
+## Output Payloads
+
+### `validate-config --json`
+
+The CLI contract includes:
+
+- `ok`
+- `checked_paths`
+- `state_backend`
+- `state_db_ok`
+- `state_db_target`
+- `adapter_mode`
+- `runtime_compatibility_ok`
+- `runtime_compatibility_error`
+- `provider_config_ok`
+- `provider_config_error`
+- `state_db_error`
+
+### `run-job --json`
+
+The API and CLI result contract includes:
+
+- `run_id`
+- `job_id`
+- `status`
+- `source`
+- `blob_root`
+- `trace_path`
+- `state_backend`
+- `state_db_target`
+
+### Published Scorecard
+
+The scorecard is the main audit payload and includes:
+
+- job and run identity
+- final status flags
+- transcript and translation refs
+- trace refs
+- export refs
+- downstream refs
+- memory refs
+- routing facts
+- transcript decision payload
+- translation decision payload
+
+## Replay Contract
+
+`ReplayAdjudicationRequest` reconstructs a deterministic decision from:
+
+- `run_id`
+- `job`
+- `stage`
+- `candidate_refs`
+- `review_refs`
+- `memory_ref`
+- `content_risk_class`
+
+This contract is what makes the adjudication path inspectable and regression-testable after the original run completes.

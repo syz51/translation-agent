@@ -1,244 +1,277 @@
-# Implementation Plan
+# Implementation Map
 
-## Goal
+This document is no longer a future-state plan. It is a guide to the current package layout and the safest ways to extend it without drifting from the implementation.
 
-Turn the current empty scaffold into a runnable v1 system without reopening core architecture choices during implementation.
-
-## Recommended Package Layout
-
-Use `src/` layout when the real code lands.
+## Package Map
 
 ```text
 src/
   translation_agent/
-    __init__.py
     api.py
     cli.py
     config.py
-    graph/
-      __init__.py
-      builder.py
-      state.py
-      routing.py
-    nodes/
-      __init__.py
-      ingest.py
-      extract_audio.py
-      transcription.py
-      normalize.py
-      review.py
-      adjudicate.py
-      translate.py
-      finalize.py
-      memory_pipeline.py
+    normalization.py
+    replay.py
     adapters/
-      __init__.py
-      ffmpeg.py
-      openai_translation.py
-      assemblyai.py
-      speechmatics.py
-      deepgram.py
-    models/
-      __init__.py
-      jobs.py
-      artifacts.py
-      transcript.py
-      translation.py
-      review.py
-      memory.py
-    review/
-      __init__.py
-      prompts.py
-      parser.py
-      policy.py
+    graph/
     memory/
-      __init__.py
-      recall.py
-      staging.py
-      consolidation.py
-      prompt_evolution.py
-    storage/
-      __init__.py
-      blobs.py
-      runs.py
-      decisions.py
-      memory_batches.py
-    publish/
-      __init__.py
-      outputs.py
+    models/
+    nodes/
     observability/
-      __init__.py
-      tracing.py
-      events.py
+    publish/
+    review/
+    storage/
 tests/
-  adapters/
-  graph/
-  nodes/
-  memory/
-  integration/
+  contract/
+  regression/
+  test_api_cli_config.py
+  test_phase_two_workflow.py
+  test_phase_three_adapters.py
+  test_phase_four_review.py
+  test_phase_five_memory_publish.py
+  test_phase_six_hardening.py
+alembic/
+compose.yaml
 ```
 
-## Delivery Order
+## Module Responsibilities
 
-### Phase 1: Foundation
+### `api.py`
 
-Implement first:
+Owns the public Python API and run bootstrap:
 
-- package layout
-- config loading
-- canonical models
-- provider interface abstractions
-- lightweight persistence interfaces
-- tracing and event interface
+- configuration validation
+- blob-store initialization
+- run-record creation
+- trace setup
+- runtime construction
+- final status derivation
 
-Exit criteria:
+### `cli.py`
 
-- codebase imports cleanly
-- model and adapter contracts are stable
+Owns the public CLI contract:
 
-### Phase 2: Deterministic Workflow Skeleton
+- `validate-config`
+- `run-job`
 
-Implement next:
+Changes here should be mirrored in contract tests and, when necessary, in the golden files under `tests/contract/golden/`.
 
-- graph state model
-- node signatures
-- routing logic
-- stub node implementations
-- CLI entrypoint for running a job
-- keep node inputs/outputs on the Phase 1 typed contracts and keep graph state ref-only
+### `config.py`
 
-Exit criteria:
+Owns:
 
-- a dry-run graph can execute end to end with fake adapters
+- settings loading
+- runtime path resolution
+- backend selection
+- provider credential validation
+- LangGraph compatibility gating
+- DSN sanitization for user-facing output
 
-### Phase 3: Adapter Integration
+### `graph/`
 
-Implement:
+Owns:
 
-- `ffmpeg` extraction adapter
-- AssemblyAI adapter
-- Speechmatics adapter
-- Deepgram adapter
-- OpenAI translation adapter
-- make concrete adapters satisfy the Phase 1 protocol surface in `translation_agent.adapters`
+- runtime construction
+- fake versus real adapter selection
+- graph wiring
+- graph execution helpers
+- post-run trace synchronization
 
-Exit criteria:
+If you change graph structure, also update the workflow docs and the phase workflow tests.
 
-- raw adapter contract tests pass
-- normalization entrypoints have realistic inputs
+### `nodes/`
 
-### Phase 4: Review And Adjudication
+Owns the concrete workflow stages:
 
-Implement:
+- ingest
+- audio extraction
+- transcription fanout
+- normalization
+- review
+- adjudication
+- translation generation
+- memory staging
+- final publishing
 
-- reviewer prompt templates
-- reviewer output parser
-- disagreement scoring
-- conflict investigation routing
-- stronger escalation hook
+Node functions should stay deterministic and operate on typed models plus refs.
 
-Exit criteria:
+### `adapters/`
 
-- adjudication path is deterministic for fixed inputs
-- parser extracts required fields from reviewer prose
+Owns external integration boundaries:
 
-### Phase 5: Memory And Publishing
+- `ffmpeg`
+- AssemblyAI
+- Speechmatics
+- Deepgram
+- OpenAI translation
+- retry, timeout, polling, and HTTP helpers
 
-Implement:
+If a change affects real-provider payload shape or retry behavior, extend `tests/test_phase_three_adapters.py`.
 
-- memory recall
-- memory write staging
-- async consolidation pipeline
-- translation prompt evolution logic
-- artifact publishing
-- keep long-term memory inputs scoped to Phase 1 memory queries and write batches instead of loose dict payloads
+### `models/`
 
-Exit criteria:
+Owns canonical contracts:
 
-- adjudication emits memory batches
-- finalized runs persist outputs and trace refs
+- job and request models
+- artifacts
+- transcript and translation candidates
+- review and adjudication models
+- memory models
 
-### Phase 6: Hardening
+Changes here usually require corresponding updates in:
 
-Implement:
+- workflow nodes
+- persistence code
+- tests
+- docs
 
-- failure injection tests
-- replay tests
-- isolation tests for tenant and project memory
-- observability validation
+### `review/`
 
-Exit criteria:
+Owns:
 
-- test matrix from this document is covered
+- reviewer role definitions
+- fixed review prompt contracts
+- deterministic dry-run review rendering
+- prose parsing
+- disagreement scoring and escalation policy
 
-## Test Plan To Preserve
+If you change required review sections or adjudication thresholds, update both tests and docs because these are part of the repo’s conceptual model.
 
-### Adapter Contract Tests
+### `memory/`
 
-Each transcription adapter needs tests for:
+Owns:
 
-- success
-- timeout
-- malformed output
-- partial metadata
-- retryable failure
+- long-term recall
+- staging of candidate writes
+- consolidation and dedupe
+- prompt-evolution proposal generation
 
-### Translation Adapter Tests
+This package deliberately keeps raw full transcript and translation bodies out of long-term memory.
 
-Need tests for:
+### `storage/`
 
-- both prompt variants
-- prompt-version tracking
-- output normalization
+Owns:
 
-### Graph And Routing Tests
+- blob storage
+- operational store interfaces
+- SQLite and Postgres implementations
+- Alembic migration helper
+- job-scoped path conventions
 
-Need tests for:
+If you change storage shape, keep SQLite, Postgres, Alembic, and tests aligned.
 
-- replay of normalized inputs and memory refs
-- one STT provider down
-- two reviewers disagree
-- conflict investigator timeout
-- one translation variant failure
-- missing blob fetch
+### `publish/`
 
-### Memory Verification
+Owns final artifact generation:
 
-Need tests for:
+- transcript and translation publication
+- translation-failure manifest
+- scorecard
+- text and JSON exports
+- downstream payload
+- published artifact manifest
 
-- project and language isolation
-- duplicate consolidation
-- no raw full transcripts in long-term memory
-- no raw full translations in long-term memory
+### `observability/`
 
-### Prompt Evolution Verification
+Owns:
 
-Need tests for:
+- structured logging helpers
+- trace event model
+- JSONL trace sink
 
-- translation prompt variants update only from consolidated outcomes
-- reviewer and adjudicator prompts never auto-activate
+### `replay.py`
 
-### Observability Verification
+Owns deterministic adjudication replay from persisted refs. Changes here should be validated against the regression suite because replay is one of the repo’s strongest inspectability guarantees.
 
-Need tests for:
+## How To Change The Repo Safely
 
-- every run emits trace events
-- every run emits structured summary records
+### If You Change CLI Or API Output
 
-## Recommended Near-Term Repo Changes
+Update:
 
-These are the next practical coding steps after this docs pass:
+- unit tests in `tests/test_api_cli_config.py`
+- contract tests in `tests/contract/test_cli_contract.py`
+- any affected golden files in `tests/contract/golden/`
+- README command examples if the public UX changes
 
-1. Convert the project to `src/` layout.
-2. Add real dependencies to `pyproject.toml` using `uv`.
-3. Replace `main.py` with package-based CLI entrypoints.
-4. Implement the canonical models before touching provider integrations.
-5. Add fake adapters so the graph can run before external services are wired.
+### If You Change Workflow Routing Or Status Behavior
 
-## Non-Goals During Initial Buildout
+Update:
 
-- perfect prompt tuning
-- UI work
-- operator dashboard
-- LangSmith-first observability
-- adding more providers before the base path works
+- `tests/test_phase_two_workflow.py`
+- `tests/test_phase_four_review.py`
+- `tests/regression/test_runtime_regression.py`
+- `docs/workflow.md`
+- `README.md` status documentation when public status values change
+
+### If You Change Adapters Or Normalization
+
+Update:
+
+- `tests/test_phase_three_adapters.py`
+- docs that describe runtime modes, providers, or normalization expectations
+
+### If You Change Memory Behavior
+
+Update:
+
+- `tests/test_phase_five_memory_publish.py`
+- `tests/test_phase_six_hardening.py`
+- `docs/architecture.md`
+- `docs/interfaces-and-data-models.md`
+
+### If You Change Storage Or Migrations
+
+Update:
+
+- storage tests
+- Alembic migrations
+- any docs that describe operational state or local setup
+
+### If You Change Replay Behavior
+
+Update:
+
+- regression tests in `tests/regression/test_runtime_regression.py`
+- architecture and workflow docs when replay semantics or investigation behavior change
+
+## Verification Guide
+
+The repo conventions in `AGENTS.md` are the current baseline:
+
+```bash
+uv run ruff check .
+uv run pre-commit run --all-files
+uv run pyright
+uv run pytest -m "unit or slice"
+uv run pytest -m contract
+uv run pytest -m "integration or migration" -n 2 --dist=loadfile
+uv run pytest -m "regression and not staging_only"
+```
+
+Recommended narrowing:
+
+- docs-only or metadata-only changes: `uv run ruff check .`
+- CLI/API changes: `uv run pytest tests/test_api_cli_config.py tests/contract/test_cli_contract.py`
+- workflow changes: relevant phase tests plus regression tests
+- storage or Alembic changes: storage tests plus migration or integration coverage
+
+## Design Rules Worth Preserving
+
+Keep these constraints unless the architecture is intentionally changing:
+
+- graph state should stay ref-only and lightweight
+- deterministic code should own orchestration, routing, retries, normalization, and persistence
+- review output should remain parseable into typed bundles
+- prompt evolution should remain derived from consolidated translation outcomes, not raw reviewer prose
+- tenant, project, and language scoping should continue to protect artifact and memory isolation
+- replay should remain possible from persisted refs alone
+
+## Near-Term Engineering Opportunities
+
+These are logical next changes if the repo keeps expanding:
+
+- add a dedicated docs page for real-provider setup and failure modes
+- separate fake-runtime scenario docs from production runtime docs once real mode becomes more common
+- add explicit golden coverage for published scorecards and exports
+- wire currently unused settings such as console-log toggles or remove them from the config surface
