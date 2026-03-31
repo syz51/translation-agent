@@ -17,6 +17,7 @@ from translation_agent.nodes.common import (
     TRANSCRIPT_REVIEW_STAGE,
     TRANSLATION_REVIEW_STAGE,
     build_memory_query,
+    review_memory_bundle_key,
     select_transcript_candidates,
     select_translation_candidates,
     transcript_candidate_key,
@@ -53,6 +54,11 @@ def review_transcripts(state: GraphState, runtime: WorkflowRuntime) -> dict[str,
     if not candidates:
         raise RuntimeError("review_transcripts requires at least one normalized candidate")
 
+    memory_ref = write_model_artifact(
+        runtime,
+        review_memory_bundle_key(state.job, TRANSCRIPT_REVIEW_STAGE),
+        memory_bundle,
+    )
     review_ids = tuple(
         _review_stage(
             state=state,
@@ -76,6 +82,12 @@ def review_transcripts(state: GraphState, runtime: WorkflowRuntime) -> dict[str,
                 fact_type="review_count",
                 value=str(len(review_ids)),
                 source_ref=first_review_ref,
+            ),
+            RoutingFact(
+                stage="review_transcripts",
+                fact_type="review_memory_bundle",
+                value=memory_ref,
+                source_ref=memory_ref,
             ),
         ),
     }
@@ -111,6 +123,11 @@ def review_translations(state: GraphState, runtime: WorkflowRuntime) -> dict[str
             ),
         }
 
+    memory_ref = write_model_artifact(
+        runtime,
+        review_memory_bundle_key(state.job, TRANSLATION_REVIEW_STAGE),
+        memory_bundle,
+    )
     final_transcript = _load_final_transcript_candidate(state, runtime)
     review_ids = tuple(
         _review_stage(
@@ -135,6 +152,12 @@ def review_translations(state: GraphState, runtime: WorkflowRuntime) -> dict[str
                 fact_type="review_count",
                 value=str(len(review_ids)),
                 source_ref=first_review_ref,
+            ),
+            RoutingFact(
+                stage="review_translations",
+                fact_type="review_memory_bundle",
+                value=memory_ref,
+                source_ref=memory_ref,
             ),
         ),
     }

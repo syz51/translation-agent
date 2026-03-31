@@ -12,10 +12,11 @@ from translation_agent.models import (
     FinalTranscriptDecision,
     FinalTranslationDecision,
 )
-from translation_agent.models.review import DecisionMode, DisagreementBucket
+from translation_agent.models.review import DecisionMode, DisagreementBucket, ReviewStage
 from translation_agent.nodes.common import (
     TRANSCRIPT_REVIEW_STAGE,
     TRANSLATION_REVIEW_STAGE,
+    adjudication_memory_bundle_key,
     build_memory_query,
     load_reviews,
     select_transcript_candidates,
@@ -66,6 +67,11 @@ def adjudicate_transcript(state: GraphState, runtime: WorkflowRuntime) -> dict[s
         ),
         content_risk_class=content_risk_class_for_scenario(runtime.scenario),
     )
+    memory_ref = write_model_artifact(
+        runtime,
+        adjudication_memory_bundle_key(state.job, TRANSCRIPT_REVIEW_STAGE),
+        context.memory_bundle,
+    )
     outcome = adjudicate_reviews(candidates=candidates, reviews=reviews, context=context)
     investigation_ref = _persist_investigation(
         runtime,
@@ -104,6 +110,14 @@ def adjudicate_transcript(state: GraphState, runtime: WorkflowRuntime) -> dict[s
         "escalation_pending": decision.escalated,
         "human_review_required": decision.human_review_required,
         "routing_facts": state.routing_facts
+        + (
+            RoutingFact(
+                stage="adjudicate_transcript",
+                fact_type="adjudication_memory_bundle",
+                value=memory_ref,
+                source_ref=memory_ref,
+            ),
+        )
         + _routing_facts(
             stage="adjudicate_transcript",
             decision_mode=decision.decision_mode,
@@ -200,6 +214,11 @@ def adjudicate_translation(state: GraphState, runtime: WorkflowRuntime) -> dict[
         ),
         content_risk_class=content_risk_class_for_scenario(runtime.scenario),
     )
+    memory_ref = write_model_artifact(
+        runtime,
+        adjudication_memory_bundle_key(state.job, TRANSLATION_REVIEW_STAGE),
+        context.memory_bundle,
+    )
     outcome = adjudicate_reviews(candidates=candidates, reviews=reviews, context=context)
     timeout_fallback = _translation_timeout_fallback(runtime=runtime, outcome=outcome)
     winner_candidate_id = (
@@ -286,6 +305,14 @@ def adjudicate_translation(state: GraphState, runtime: WorkflowRuntime) -> dict[
         "human_review_required": decision.human_review_required,
         "translation_failed": False,
         "routing_facts": state.routing_facts
+        + (
+            RoutingFact(
+                stage="adjudicate_translation",
+                fact_type="adjudication_memory_bundle",
+                value=memory_ref,
+                source_ref=memory_ref,
+            ),
+        )
         + timeout_fact
         + _routing_facts(
             stage="adjudicate_translation",
@@ -300,12 +327,13 @@ def adjudicate_translation(state: GraphState, runtime: WorkflowRuntime) -> dict[
 def _persist_investigation(
     runtime: WorkflowRuntime,
     *,
-    stage: str,
+    stage: ReviewStage,
     job,
     payload: dict[str, object] | None,
 ) -> str | None:
     if payload is None:
         return None
+    runtime.decision_store.save_investigation(job_id=job.job_id, stage=stage, payload=payload)
     key = (
         transcript_investigation_key(job)
         if stage == TRANSCRIPT_REVIEW_STAGE

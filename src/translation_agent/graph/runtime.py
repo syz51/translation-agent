@@ -92,6 +92,7 @@ class InMemoryDecisionStore:
         self._translation_candidates: dict[str, TranslationCandidate] = {}
         self._transcript_decisions: dict[str, FinalTranscriptDecision] = {}
         self._translation_decisions: dict[str, FinalTranslationDecision] = {}
+        self._investigations: dict[tuple[str, str], dict[str, object]] = {}
 
     def save_transcript_candidate(self, candidate: TranscriptCandidate) -> None:
         self._transcript_candidates[candidate.candidate_id] = candidate
@@ -126,6 +127,23 @@ class InMemoryDecisionStore:
 
     def get_translation_decision(self, job_id: str) -> FinalTranslationDecision | None:
         return self._translation_decisions.get(job_id)
+
+    def save_investigation(
+        self,
+        *,
+        job_id: str,
+        stage: str,
+        payload: dict[str, object],
+    ) -> None:
+        self._investigations[(job_id, stage)] = payload
+
+    def get_investigation(
+        self,
+        *,
+        job_id: str,
+        stage: str,
+    ) -> dict[str, object] | None:
+        return self._investigations.get((job_id, stage))
 
 
 class InMemoryMemoryBatchStore:
@@ -286,6 +304,8 @@ def build_phase_two_runtime(
     *,
     blob_store: BlobStore,
     run_store: RunStore,
+    decision_store: DecisionStore | None = None,
+    memory_batch_store: MemoryBatchStore | None = None,
     trace_sink: TraceSink,
     source_artifact_ref: str,
     scenario: str = DEFAULT_SCENARIO,
@@ -293,12 +313,14 @@ def build_phase_two_runtime(
     """Construct the default dry-run runtime used by the public entrypoints."""
 
     memory_store = InMemoryLongTermMemoryStore()
+    resolved_decision_store = decision_store or _decision_store_for_run_store(run_store)
+    resolved_memory_batch_store = memory_batch_store or _memory_batch_store_for_run_store(run_store)
     return WorkflowRuntime(
         blob_store=blob_store,
         run_store=run_store,
         trace_sink=trace_sink,
-        decision_store=InMemoryDecisionStore(),
-        memory_batch_store=InMemoryMemoryBatchStore(),
+        decision_store=resolved_decision_store,
+        memory_batch_store=resolved_memory_batch_store,
         audio_extractor=FakeAudioExtractionAdapter(),
         transcription_adapters=(
             FakeTranscriptionAdapter("assemblyai", blob_store=blob_store),
@@ -322,6 +344,8 @@ def build_runtime(
     settings: Settings,
     blob_store: BlobStore,
     run_store: RunStore,
+    decision_store: DecisionStore | None = None,
+    memory_batch_store: MemoryBatchStore | None = None,
     trace_sink: TraceSink,
     source_artifact_ref: str,
     scenario: str = DEFAULT_SCENARIO,
@@ -333,6 +357,8 @@ def build_runtime(
         return build_phase_two_runtime(
             blob_store=blob_store,
             run_store=run_store,
+            decision_store=decision_store,
+            memory_batch_store=memory_batch_store,
             trace_sink=trace_sink,
             source_artifact_ref=source_artifact_ref,
             scenario=scenario,
@@ -342,6 +368,8 @@ def build_runtime(
         settings=settings,
         blob_store=blob_store,
         run_store=run_store,
+        decision_store=decision_store,
+        memory_batch_store=memory_batch_store,
         trace_sink=trace_sink,
         source_artifact_ref=source_artifact_ref,
         scenario=scenario,
@@ -354,6 +382,8 @@ def build_phase_three_runtime(
     settings: Settings,
     blob_store: BlobStore,
     run_store: RunStore,
+    decision_store: DecisionStore | None = None,
+    memory_batch_store: MemoryBatchStore | None = None,
     trace_sink: TraceSink,
     source_artifact_ref: str,
     scenario: str = DEFAULT_SCENARIO,
@@ -420,12 +450,14 @@ def build_phase_three_runtime(
     )
 
     memory_store = InMemoryLongTermMemoryStore()
+    resolved_decision_store = decision_store or _decision_store_for_run_store(run_store)
+    resolved_memory_batch_store = memory_batch_store or _memory_batch_store_for_run_store(run_store)
     return WorkflowRuntime(
         blob_store=blob_store,
         run_store=run_store,
         trace_sink=trace_sink,
-        decision_store=InMemoryDecisionStore(),
-        memory_batch_store=InMemoryMemoryBatchStore(),
+        decision_store=resolved_decision_store,
+        memory_batch_store=resolved_memory_batch_store,
         audio_extractor=audio_extractor,
         transcription_adapters=transcription_adapters,
         translation_adapter=translation_adapter,
@@ -463,6 +495,18 @@ def _blob_root(blob_store: BlobStore) -> str | None:
     if root is None:
         return None
     return str(root)
+
+
+def _decision_store_for_run_store(run_store: RunStore) -> DecisionStore:
+    if isinstance(run_store, DecisionStore):
+        return run_store
+    return InMemoryDecisionStore()
+
+
+def _memory_batch_store_for_run_store(run_store: RunStore) -> MemoryBatchStore:
+    if isinstance(run_store, MemoryBatchStore):
+        return run_store
+    return InMemoryMemoryBatchStore()
 
 
 def _provider_rank(provider_id: str) -> int:

@@ -61,10 +61,19 @@ def test_upgrade_database_bootstraps_schema_on_empty_database(postgres_dsn: str)
         run = store.create_run(input_data={"source": "legacy.mp4"})
         node = store.create_node_execution(run_id=run.run_id, node_name="ingest")
 
-    assert {"runs", "node_executions"} <= tables
+    assert {
+        "runs",
+        "node_executions",
+        "transcript_candidates",
+        "translation_candidates",
+        "transcript_decisions",
+        "translation_decisions",
+        "investigations",
+        "memory_batches",
+    } <= tables
     assert "idx_node_executions_run_id_created_at" in indexes
     assert revision is not None
-    assert revision["version_num"] == "0001_runtime_bootstrap"
+    assert revision["version_num"] == "0002_operational_entities"
     assert node.run_id == run.run_id
 
 
@@ -131,6 +140,12 @@ def test_upgrade_database_preserves_existing_legacy_data(postgres_dsn: str) -> N
     assert "idx_node_executions_run_id_created_at" in indexes
     assert executions[0].execution_id == "legacy-exec"
     assert executions[0].output_data == {"ok": True}
+
+    with psycopg.connect(postgres_dsn) as conn:
+        revision = conn.execute("SELECT version_num FROM alembic_version").fetchone()
+
+    assert revision is not None
+    assert revision[0] == "0002_operational_entities"
 
 
 def _create_legacy_schema(dsn: str) -> None:

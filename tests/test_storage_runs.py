@@ -23,7 +23,16 @@ def test_store_uses_explicit_migrated_schema(migrated_postgres_dsn: str) -> None
             ).fetchall()
         }
 
-    assert {"runs", "node_executions"} <= tables
+    assert {
+        "runs",
+        "node_executions",
+        "transcript_candidates",
+        "translation_candidates",
+        "transcript_decisions",
+        "translation_decisions",
+        "investigations",
+        "memory_batches",
+    } <= tables
     assert "idx_node_executions_run_id_created_at" in indexes
 
 

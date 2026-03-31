@@ -13,6 +13,8 @@ from psycopg.conninfo import conninfo_to_dict
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from translation_agent.storage import SQLiteOperationalStore
+
 
 class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
@@ -27,6 +29,9 @@ class Settings(BaseSettings):
     data_dir: Path = Field(default_factory=lambda: Path.cwd() / ".translation-agent")
     blob_dir: Path = Field(default_factory=lambda: Path.cwd() / ".translation-agent" / "blobs")
     state_db_dsn: str | None = None
+    state_db_path: Path = Field(
+        default_factory=lambda: Path.cwd() / ".translation-agent" / "state.sqlite3"
+    )
     trace_dir: Path = Field(default_factory=lambda: Path.cwd() / ".translation-agent" / "traces")
     log_level: str = "INFO"
     emit_console_logs: bool = True
@@ -53,12 +58,17 @@ class Settings(BaseSettings):
     def model_post_init(self, __context: object) -> None:
         blob_dir_overridden = "blob_dir" in self.model_fields_set
         trace_dir_overridden = "trace_dir" in self.model_fields_set
+        state_db_path_overridden = "state_db_path" in self.model_fields_set
         self.workspace_dir = self.workspace_dir.expanduser().resolve()
         self.data_dir = self.data_dir.expanduser().resolve()
         if blob_dir_overridden:
             self.blob_dir = self.blob_dir.expanduser().resolve()
         else:
             self.blob_dir = self.data_dir / "blobs"
+        if state_db_path_overridden:
+            self.state_db_path = self.state_db_path.expanduser().resolve()
+        else:
+            self.state_db_path = self.data_dir / "state.sqlite3"
         if trace_dir_overridden:
             self.trace_dir = self.trace_dir.expanduser().resolve()
         else:
@@ -87,25 +97,33 @@ def load_settings() -> Settings:
 
 
 def validate_environment(settings: Settings, *, create_dirs: bool = True) -> ValidationResult:
-    """Validate the configured local runtime paths and Postgres connectivity."""
+    """Validate the configured local runtime paths and operational store connectivity."""
 
     paths = _runtime_paths(settings)
     if create_dirs:
         for path in paths:
             path.mkdir(parents=True, exist_ok=True)
 
-    state_db_target = sanitize_db_target(settings.state_db_dsn)
+    state_backend = _state_backend(settings)
+    state_db_target = sanitize_db_target(
+        settings.state_db_dsn if state_backend == "postgres" else settings.state_db_path
+    )
     state_db_ok = False
     state_db_error: str | None = None
 
-    if not settings.state_db_dsn:
-        state_db_error = "TA_STATE_DB_DSN is required"
-    else:
+    if state_backend == "postgres" and settings.state_db_dsn is not None:
         try:
             with psycopg.connect(settings.state_db_dsn) as conn:
                 with conn.cursor() as cur:
                     cur.execute("SELECT 1")
                     cur.fetchone()
+            state_db_ok = True
+        except Exception as exc:
+            state_db_error = str(exc)
+    else:
+        try:
+            with SQLiteOperationalStore(settings.state_db_path):
+                pass
             state_db_ok = True
         except Exception as exc:
             state_db_error = str(exc)
@@ -126,7 +144,7 @@ def validate_environment(settings: Settings, *, create_dirs: bool = True) -> Val
             and runtime_compatibility_error is None
         ),
         checked_paths=paths,
-        state_backend="postgres",
+        state_backend=state_backend,
         state_db_ok=state_db_ok,
         state_db_target=state_db_target,
         adapter_mode=settings.adapter_mode,
@@ -138,9 +156,15 @@ def validate_environment(settings: Settings, *, create_dirs: bool = True) -> Val
     )
 
 
-def sanitize_db_target(state_db_dsn: str | None) -> str:
-    """Return a credential-free database target string for logs and CLI output."""
+def sanitize_db_target(state_db_target: str | Path | None) -> str:
+    """Return a display-safe database target string for logs and CLI output."""
 
+    if state_db_target is None:
+        return "<missing>"
+    if isinstance(state_db_target, Path):
+        return str(state_db_target.expanduser().resolve())
+
+    state_db_dsn = state_db_target
     if not state_db_dsn:
         return "<missing>"
 
@@ -173,6 +197,10 @@ def sanitize_db_target(state_db_dsn: str | None) -> str:
 
 def _runtime_paths(settings: Settings) -> tuple[Path, Path, Path]:
     return (settings.data_dir, settings.blob_dir, settings.trace_dir)
+
+
+def _state_backend(settings: Settings) -> str:
+    return "postgres" if settings.state_db_dsn else "sqlite"
 
 
 def validate_provider_configuration(settings: Settings) -> str | None:

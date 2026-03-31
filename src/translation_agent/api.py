@@ -17,8 +17,8 @@ from translation_agent.observability.events import (
     log_structured_event,
 )
 from translation_agent.observability.tracing import JsonlTraceSink, TraceEvent
+from translation_agent.storage import PostgresOperationalStore, SQLiteOperationalStore
 from translation_agent.storage.blobs import LocalBlobStore
-from translation_agent.storage.runs import PostgresRunStore
 
 
 @dataclass(slots=True)
@@ -42,7 +42,7 @@ class RunJobResult:
     source: str
     blob_root: Path
     trace_path: Path
-    state_backend: str = "postgres"
+    state_backend: str = "sqlite"
     state_db_target: str = ""
 
 
@@ -54,9 +54,6 @@ def run_job(request: RunJobRequest, settings: Settings | None = None) -> RunJobR
     if not validation.ok:
         message = validation.state_db_error or "invalid runtime configuration"
         raise RuntimeError(message)
-    state_db_dsn = settings.state_db_dsn
-    if state_db_dsn is None:
-        raise RuntimeError("TA_STATE_DB_DSN is required")
     blob_dir = settings.blob_dir
     trace_dir = settings.trace_dir
 
@@ -83,7 +80,7 @@ def run_job(request: RunJobRequest, settings: Settings | None = None) -> RunJobR
         f"jobs/{run_id}-request.json",
         _serialize_request(request, now).encode("utf-8"),
     )
-    with PostgresRunStore(state_db_dsn) as run_store:
+    with _open_operational_store(settings) as run_store:
         run_store.create_run(
             run_id=run_id,
             tenant_id=job.tenant_id,
@@ -98,13 +95,15 @@ def run_job(request: RunJobRequest, settings: Settings | None = None) -> RunJobR
         )
     trace_path = trace_dir / f"{run_id}.jsonl"
     with JsonlTraceSink(trace_path) as trace_sink:
-        runtime_run_store = PostgresRunStore(state_db_dsn)
+        runtime_run_store = _open_operational_store(settings)
         runtime = None
         try:
             runtime = build_runtime(
                 settings=settings,
                 blob_store=blob_store,
                 run_store=runtime_run_store,
+                decision_store=runtime_run_store,
+                memory_batch_store=runtime_run_store,
                 trace_sink=trace_sink,
                 source_artifact_ref=manifest_entry.key,
                 scenario=request.metadata.get("scenario", "happy"),
@@ -207,9 +206,18 @@ def run_job(request: RunJobRequest, settings: Settings | None = None) -> RunJobR
         status=final_status,
         source=request.source,
         blob_root=blob_dir,
+        state_backend=validation.state_backend,
         state_db_target=validation.state_db_target,
         trace_path=trace_path,
     )
+
+
+def _open_operational_store(
+    settings: Settings,
+) -> PostgresOperationalStore | SQLiteOperationalStore:
+    if settings.state_db_dsn:
+        return PostgresOperationalStore(settings.state_db_dsn)
+    return SQLiteOperationalStore(settings.state_db_path)
 
 
 def _serialize_request(request: RunJobRequest, created_at: datetime) -> str:

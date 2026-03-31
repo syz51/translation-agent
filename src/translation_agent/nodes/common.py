@@ -171,6 +171,14 @@ def prompt_evolution_key(job: JobContext, proposal_id: str) -> str:
     return job_path(job, "memory", "prompt-evolution", f"{proposal_id}.json")
 
 
+def review_memory_bundle_key(job: JobContext, stage: str) -> str:
+    return job_path(job, "memory", "recall", f"{stage}-review.json")
+
+
+def adjudication_memory_bundle_key(job: JobContext, stage: str) -> str:
+    return job_path(job, "memory", "recall", f"{stage}-adjudication.json")
+
+
 def audio_artifact_key(job: JobContext) -> str:
     return job_path(job, "artifacts", "audio.json")
 

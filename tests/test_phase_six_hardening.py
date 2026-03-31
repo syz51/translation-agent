@@ -8,9 +8,17 @@ from pathlib import Path
 import pytest
 
 from translation_agent.graph import GraphState, build_phase_two_runtime, run_workflow
+from translation_agent.memory import (
+    DeterministicMemoryConsolidationBackend,
+    InMemoryLongTermMemoryStore,
+    LongTermMemoryRecallBackend,
+)
 from translation_agent.models import (
     FinalTranslationDecision,
     JobContext,
+    MemoryQuery,
+    MemoryWrite,
+    MemoryWriteBatch,
 )
 from translation_agent.observability import JsonlTraceSink
 from translation_agent.storage import LocalBlobStore, NodeExecutionRecord, RunRecord, job_path
@@ -239,6 +247,104 @@ def test_phase_six_scoped_publish_paths_isolate_same_job_id_across_tenants(tmp_p
     assert transcript_a != transcript_b
     assert blob_store_a.exists(transcript_a)
     assert blob_store_b.exists(transcript_b)
+
+
+def test_phase_six_scoped_publish_paths_isolate_same_job_id_across_language_pairs(
+    tmp_path: Path,
+) -> None:
+    shared_root = tmp_path / "shared-language"
+    english_to_french = _job_context(job_id="job-shared-language", target_language="fr")
+    english_to_german = _job_context(job_id="job-shared-language", target_language="de")
+
+    _, blob_store_fr, _ = _run_workflow(
+        shared_root,
+        run_id="run-fr",
+        scenario="happy",
+        job=english_to_french,
+        blob_root=shared_root / "blobs",
+    )
+    _, blob_store_de, _ = _run_workflow(
+        shared_root,
+        run_id="run-de",
+        scenario="happy",
+        job=english_to_german,
+        blob_root=shared_root / "blobs",
+    )
+
+    transcript_fr = job_path(english_to_french, "published", "transcript.json")
+    transcript_de = job_path(english_to_german, "published", "transcript.json")
+
+    assert transcript_fr != transcript_de
+    assert blob_store_fr.exists(transcript_fr)
+    assert blob_store_de.exists(transcript_de)
+
+
+def test_phase_six_memory_recall_isolates_by_language_pair() -> None:
+    store = InMemoryLongTermMemoryStore()
+    consolidation_backend = DeterministicMemoryConsolidationBackend(store)
+    recall_backend = LongTermMemoryRecallBackend(store)
+
+    consolidation_backend.consolidate_batch(
+        MemoryWriteBatch(
+            batch_id="batch-fr",
+            job_id="job-fr",
+            source_stage="translation_adjudication",
+            semantic_writes=(
+                MemoryWrite(
+                    kind="semantic",
+                    content="Prefer workflow for English to French localization.",
+                    metadata={"dedupe_key": "semantic:en-fr"},
+                ),
+            ),
+            metadata={
+                "tenant_id": "tenant-1",
+                "project_id": "project-1",
+                "source_language": "en",
+                "target_language": "fr",
+            },
+        )
+    )
+    consolidation_backend.consolidate_batch(
+        MemoryWriteBatch(
+            batch_id="batch-de",
+            job_id="job-de",
+            source_stage="translation_adjudication",
+            semantic_writes=(
+                MemoryWrite(
+                    kind="semantic",
+                    content="Do not leak into English to German recall.",
+                    metadata={"dedupe_key": "semantic:en-de"},
+                ),
+            ),
+            metadata={
+                "tenant_id": "tenant-1",
+                "project_id": "project-1",
+                "source_language": "en",
+                "target_language": "de",
+            },
+        )
+    )
+
+    recalled = recall_backend.recall_memory(
+        MemoryQuery(
+            job=_job_context(
+                job_id="job-recall-language",
+                source_language="en",
+                target_language="fr",
+            ),
+            stage="review_translations",
+            query_text="workflow terminology",
+        )
+    )
+
+    assert any(
+        entry.content == "Prefer workflow for English to French localization."
+        for entry in recalled.semantic_memory
+    )
+    assert all(
+        entry.content != "Do not leak into English to German recall."
+        for entry in recalled.semantic_memory
+    )
 
 
 def test_phase_six_translation_conflict_timeout_escalates_to_human_review(

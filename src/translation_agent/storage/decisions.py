@@ -10,6 +10,7 @@ from translation_agent.models import (
     TranscriptCandidate,
     TranslationCandidate,
 )
+from translation_agent.models.review import ReviewStage
 
 
 @runtime_checkable
@@ -31,3 +32,18 @@ class DecisionStore(Protocol):
     def save_translation_decision(self, decision: FinalTranslationDecision) -> None: ...
 
     def get_translation_decision(self, job_id: str) -> FinalTranslationDecision | None: ...
+
+    def save_investigation(
+        self,
+        *,
+        job_id: str,
+        stage: ReviewStage,
+        payload: dict[str, object],
+    ) -> None: ...
+
+    def get_investigation(
+        self,
+        *,
+        job_id: str,
+        stage: ReviewStage,
+    ) -> dict[str, object] | None: ...

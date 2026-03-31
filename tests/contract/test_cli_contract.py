@@ -24,7 +24,7 @@ def test_validate_config_json_missing_dsn_contract(
     exit_code = main(["validate-config", "--json"])
 
     payload = json.loads(capsys.readouterr().out)
-    assert exit_code == 1
+    assert exit_code == 0
     assert _normalize_validate_config_payload(payload) == _load_golden(
         "validate_config_missing_dsn.json"
     )
@@ -66,6 +66,7 @@ def _load_golden(name: str) -> object:
 def _normalize_validate_config_payload(payload: dict[str, object]) -> dict[str, object]:
     normalized = dict(payload)
     normalized["checked_paths"] = ["<data_dir>", "<blob_dir>", "<trace_dir>"]
+    normalized["state_db_target"] = "<state_db_target>"
     return normalized
 
 

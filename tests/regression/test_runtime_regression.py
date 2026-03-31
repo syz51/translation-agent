@@ -11,6 +11,8 @@ from translation_agent.config import sanitize_db_target
 from translation_agent.graph import GraphState, build_phase_two_runtime, run_workflow
 from translation_agent.models import JobContext
 from translation_agent.observability import NoOpTraceSink
+from translation_agent.replay import ReplayAdjudicationRequest, replay_adjudication
+from translation_agent.review import content_risk_class_for_scenario
 from translation_agent.storage import LocalBlobStore, NodeExecutionRecord, RunRecord, job_path
 
 pytestmark = pytest.mark.regression
@@ -306,3 +308,54 @@ def test_replay_translation_failure_manifest_is_stable_regression(tmp_path: Path
     assert _normalize_failure_manifest(_load_json(first_blob_store, failure_path)) == (
         _normalize_failure_manifest(_load_json(second_blob_store, failure_path))
     )
+
+
+def test_replay_adjudication_uses_persisted_candidates_reviews_and_memory_refs(
+    tmp_path: Path,
+) -> None:
+    job = _job_context(job_id="job-replay-adjudication")
+    final_state, blob_store = _run_workflow(
+        tmp_path,
+        run_id="run-replay-adjudication",
+        scenario="translation_conflict",
+        job=job,
+    )
+    runtime = build_phase_two_runtime(
+        blob_store=blob_store,
+        run_store=InMemoryRunStore(),
+        trace_sink=NoOpTraceSink(),
+        source_artifact_ref=f"jobs/{final_state.run_id}-request.json",
+        scenario="translation_conflict",
+    )
+    replayed = replay_adjudication(
+        runtime,
+        ReplayAdjudicationRequest(
+            run_id=final_state.run_id,
+            job=job,
+            stage="translation",
+            candidate_refs=tuple(
+                job_path(job, "candidates", "translations", f"{candidate_id}.json")
+                for candidate_id in final_state.translation_candidate_ids
+            ),
+            review_refs=tuple(
+                job_path(job, "reviews", "translation", f"{review_id}.json")
+                for review_id in final_state.translation_review_ids
+            ),
+            memory_ref=next(
+                fact.source_ref
+                for fact in final_state.routing_facts
+                if fact.fact_type == "adjudication_memory_bundle"
+                and fact.stage == "adjudicate_translation"
+                and fact.source_ref is not None
+            ),
+            content_risk_class=content_risk_class_for_scenario("translation_conflict"),
+        ),
+    )
+
+    stored_decision = _load_json(blob_store, job_path(job, "decisions", "translation.json"))
+    replayed_decision = replayed.decision.model_dump(mode="json")
+
+    assert replayed.decision.decision_mode == stored_decision["decision_mode"]
+    assert replayed.decision.winner_candidate_id == stored_decision["winner_candidate_id"]
+    assert replayed.decision.disagreement_bucket == stored_decision["disagreement_bucket"]
+    assert replayed_decision["adjudication_scorecard"] == stored_decision["adjudication_scorecard"]

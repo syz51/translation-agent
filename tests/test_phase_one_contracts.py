@@ -483,6 +483,7 @@ def test_phase_one_protocols_accept_fake_implementations(tmp_path: Path) -> None
             self.translation_candidates: list[TranslationCandidate] = []
             self.transcript_decision: FinalTranscriptDecision | None = None
             self.translation_decision: FinalTranslationDecision | None = None
+            self.investigations: dict[tuple[str, str], dict[str, object]] = {}
 
         def save_transcript_candidate(self, candidate: TranscriptCandidate) -> None:
             self.transcript_candidates.append(candidate)
@@ -519,6 +520,23 @@ def test_phase_one_protocols_accept_fake_implementations(tmp_path: Path) -> None
                 if self.translation_decision and self.translation_decision.job_id == job_id
                 else None
             )
+
+        def save_investigation(
+            self,
+            *,
+            job_id: str,
+            stage: str,
+            payload: dict[str, object],
+        ) -> None:
+            self.investigations[(job_id, stage)] = payload
+
+        def get_investigation(
+            self,
+            *,
+            job_id: str,
+            stage: str,
+        ) -> dict[str, object] | None:
+            return self.investigations.get((job_id, stage))
 
     class FakeMemoryBatchStore:
         def __init__(self) -> None:

@@ -5,13 +5,13 @@
     "<blob_dir>",
     "<trace_dir>"
   ],
-  "ok": false,
+  "ok": true,
   "provider_config_error": null,
   "provider_config_ok": true,
   "runtime_compatibility_error": null,
   "runtime_compatibility_ok": true,
-  "state_backend": "postgres",
-  "state_db_error": "TA_STATE_DB_DSN is required",
-  "state_db_ok": false,
-  "state_db_target": "<missing>"
+  "state_backend": "sqlite",
+  "state_db_error": null,
+  "state_db_ok": true,
+  "state_db_target": "<state_db_target>"
 }

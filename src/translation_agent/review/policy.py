@@ -56,6 +56,18 @@ class AdjudicationOutcome:
     assessment: DisagreementAssessment
 
 
+@dataclass(frozen=True, slots=True)
+class InvestigationResult:
+    """Executed escalation artifact used before final re-adjudication."""
+
+    status: str
+    strategy: str
+    recommended_candidate_id: str | None
+    confidence_adjustment: float
+    rationale: str
+    payload: dict[str, object]
+
+
 def assess_review_disagreement(
     parsed_reviews: tuple[ParsedReview, ...],
     *,
@@ -129,9 +141,10 @@ def adjudicate_reviews(
     reviews: tuple[ReviewBundle, ...],
     context: AdjudicationContext,
 ) -> AdjudicationOutcome:
-    """Apply deterministic review scoring outside the graph runtime."""
+    """Apply deterministic review scoring with explicit escalation execution."""
 
-    fallback_candidate_id = candidates[0].candidate_id if candidates else None
+    candidate_list = tuple(candidates)
+    fallback_candidate_id = candidate_list[0].candidate_id if candidate_list else None
     parsed_reviews = tuple(parse_reviewer_output(review.raw_review_text) for review in reviews)
     assessment = assess_review_disagreement(
         parsed_reviews,
@@ -139,43 +152,55 @@ def adjudicate_reviews(
         fallback_candidate_id=fallback_candidate_id,
         content_risk_class=context.content_risk_class,
     )
-    candidate_count = len(tuple(candidates))
+    candidate_count = len(candidate_list)
     single_candidate_escalation = candidate_count == 1 and context.stage == "transcript"
-    investigation_payload = None
-    if assessment.decision_mode != "automatic_finalize" or single_candidate_escalation:
-        investigation_payload = {
-            "stage": context.stage,
-            "candidate_ids": list(context.candidate_ids),
-            "review_ids": list(context.review_ids),
-            "preferred_candidate_id": assessment.preferred_candidate_id,
-            "winner_mismatch": assessment.winner_mismatch,
-            "confidence_spread": assessment.confidence_spread,
-            "contradictory_evidence_count": assessment.contradictory_evidence_count,
-            "highest_issue_severity": assessment.highest_issue_severity,
-            "total_score": assessment.total_score,
-            "content_risk_class": context.content_risk_class,
-        }
+    investigation_result = _execute_escalation(
+        parsed_reviews=parsed_reviews,
+        assessment=assessment,
+        context=context,
+        single_candidate_escalation=single_candidate_escalation,
+    )
+    resolved_decision_mode = assessment.decision_mode
+    winner_candidate_id = assessment.preferred_candidate_id
+    human_review_required = assessment.human_review_required
+
+    if investigation_result is not None:
+        if investigation_result.status in {"timed_out", "unresolved"}:
+            resolved_decision_mode = "human_review"
+            winner_candidate_id = None
+            human_review_required = True
+        elif investigation_result.recommended_candidate_id is not None:
+            winner_candidate_id = investigation_result.recommended_candidate_id
+
     decision_confidence = _decision_confidence(
         assessment=assessment,
         candidate_count=candidate_count,
+        confidence_adjustment=(
+            investigation_result.confidence_adjustment if investigation_result is not None else 0.0
+        ),
+        final_decision_mode=resolved_decision_mode,
     )
     rationale_summary = _rationale_summary(
         stage=context.stage,
-        decision_mode=assessment.decision_mode,
+        decision_mode=resolved_decision_mode,
         candidate_count=candidate_count,
         assessment=assessment,
+        investigation_result=investigation_result,
     )
     return AdjudicationOutcome(
-        decision_mode=assessment.decision_mode,
-        winner_candidate_id=(
-            None if assessment.human_review_required else assessment.preferred_candidate_id
-        ),
+        decision_mode=resolved_decision_mode,
+        winner_candidate_id=None if human_review_required else winner_candidate_id,
         decision_confidence=decision_confidence,
         rationale_summary=rationale_summary,
-        human_review_required=assessment.human_review_required,
+        human_review_required=human_review_required,
         escalated=assessment.escalated or single_candidate_escalation,
-        investigation_payload=investigation_payload,
-        disagreement_bucket=_bucket_for_score(assessment),
+        investigation_payload=(
+            investigation_result.payload if investigation_result is not None else None
+        ),
+        disagreement_bucket=_bucket_for_score(
+            assessment,
+            final_decision_mode=resolved_decision_mode,
+        ),
         assessment=assessment,
     )
 
@@ -230,12 +255,17 @@ def _highest_issue_severity(parsed_reviews: tuple[ParsedReview, ...]) -> IssueSe
     return highest
 
 
-def _bucket_for_score(assessment: DisagreementAssessment) -> DisagreementBucket:
-    if assessment.decision_mode == "human_review":
+def _bucket_for_score(
+    assessment: DisagreementAssessment,
+    *,
+    final_decision_mode: DecisionMode | None = None,
+) -> DisagreementBucket:
+    mode = final_decision_mode or assessment.decision_mode
+    if mode == "human_review":
         return "unresolved"
-    if assessment.decision_mode == "stronger_adjudicator":
+    if mode == "stronger_adjudicator":
         return "high"
-    if assessment.decision_mode == "conflict_investigation":
+    if mode == "conflict_investigation":
         return "medium"
     return "low"
 
@@ -244,21 +274,24 @@ def _decision_confidence(
     *,
     assessment: DisagreementAssessment,
     candidate_count: int,
+    confidence_adjustment: float = 0.0,
+    final_decision_mode: DecisionMode | None = None,
 ) -> float:
     penalty = (
         assessment.confidence_spread * 0.35
         + assessment.contradictory_evidence_count * 0.08
         + {"minor": 0.05, "major": 0.18, "critical": 0.32}[assessment.highest_issue_severity]
     )
-    if assessment.decision_mode == "conflict_investigation":
+    mode = final_decision_mode or assessment.decision_mode
+    if mode == "conflict_investigation":
         penalty += 0.12
-    elif assessment.decision_mode == "stronger_adjudicator":
+    elif mode == "stronger_adjudicator":
         penalty += 0.2
-    elif assessment.decision_mode == "human_review":
+    elif mode == "human_review":
         penalty += 0.42
     if candidate_count == 1:
         penalty += 0.1
-    confidence = assessment.average_confidence - penalty
+    confidence = assessment.average_confidence - penalty + confidence_adjustment
     return round(max(0.0, min(confidence, 0.99)), 4)
 
 
@@ -268,6 +301,7 @@ def _rationale_summary(
     decision_mode: DecisionMode,
     candidate_count: int,
     assessment: DisagreementAssessment,
+    investigation_result: InvestigationResult | None = None,
 ) -> str:
     stage_label = "Transcript" if stage == "transcript" else "Translation"
     if decision_mode == "automatic_finalize":
@@ -281,16 +315,252 @@ def _rationale_summary(
             f"automatically after scoring {assessment.total_score:.2f} points."
         )
     if decision_mode == "conflict_investigation":
+        if investigation_result is not None:
+            return (
+                f"{stage_label} disagreement landed in the medium band; "
+                f"{investigation_result.strategy} ran before re-adjudication and "
+                f"{investigation_result.rationale}"
+            )
         return (
             f"{stage_label} disagreement landed in the medium band, so conflict investigation "
             "resolved the winner without reopening the graph."
         )
     if decision_mode == "stronger_adjudicator":
+        if investigation_result is not None:
+            return (
+                f"{stage_label} disagreement was high enough to invoke "
+                f"{investigation_result.strategy}, "
+                f"which {investigation_result.rationale}"
+            )
         return (
             f"{stage_label} disagreement was high enough to invoke the stronger adjudicator hook "
             "before finalization."
+        )
+    if investigation_result is not None and investigation_result.status in {
+        "timed_out",
+        "unresolved",
+    }:
+        return (
+            f"{stage_label} escalation remained unresolved after {investigation_result.strategy} "
+            "and now requires human review."
         )
     return (
         f"{stage_label} disagreement remained unresolved after deterministic scoring and now "
         "requires human review."
     )
+
+
+def _execute_escalation(
+    *,
+    parsed_reviews: tuple[ParsedReview, ...],
+    assessment: DisagreementAssessment,
+    context: AdjudicationContext,
+    single_candidate_escalation: bool,
+) -> InvestigationResult | None:
+    if assessment.decision_mode == "automatic_finalize" and not single_candidate_escalation:
+        return None
+    if assessment.decision_mode == "conflict_investigation":
+        return _run_conflict_investigator(
+            parsed_reviews=parsed_reviews,
+            assessment=assessment,
+            context=context,
+        )
+    if assessment.decision_mode == "stronger_adjudicator":
+        return _run_stronger_adjudicator(
+            parsed_reviews=parsed_reviews,
+            assessment=assessment,
+            context=context,
+        )
+    if assessment.decision_mode == "human_review":
+        return _build_unresolved_investigation(
+            assessment=assessment,
+            context=context,
+            reason="kept the disagreement unresolved after deterministic scoring",
+        )
+    if single_candidate_escalation:
+        return InvestigationResult(
+            status="reviewed",
+            strategy="single-candidate escalation check",
+            recommended_candidate_id=assessment.preferred_candidate_id,
+            confidence_adjustment=-0.04,
+            rationale="confirmed the only surviving transcript without broadening the route.",
+            payload=_base_investigation_payload(
+                assessment=assessment,
+                context=context,
+                strategy="single-candidate escalation check",
+                status="reviewed",
+                recommended_candidate_id=assessment.preferred_candidate_id,
+                notes=["Only one transcript candidate survived; the path stayed deterministic."],
+            ),
+        )
+    return None
+
+
+def _run_conflict_investigator(
+    *,
+    parsed_reviews: tuple[ParsedReview, ...],
+    assessment: DisagreementAssessment,
+    context: AdjudicationContext,
+) -> InvestigationResult:
+    candidate_scores = _candidate_scores(parsed_reviews, candidate_ids=context.candidate_ids)
+    ranked = sorted(candidate_scores.items(), key=lambda item: (-item[1], item[0]))
+    recommended_candidate_id = ranked[0][0] if ranked else assessment.preferred_candidate_id
+    margin = 0.0
+    if len(ranked) > 1:
+        margin = round(ranked[0][1] - ranked[1][1], 4)
+    notes = [
+        (
+            "Conflict investigator synthesized winner counts, confidence, evidence overlap, "
+            "and issue severity."
+        ),
+        f"Top recommendation margin: {margin:.4f}",
+    ]
+    if recommended_candidate_id is None:
+        return _build_unresolved_investigation(
+            assessment=assessment,
+            context=context,
+            reason="could not recommend a candidate after conflict investigation",
+        )
+    return InvestigationResult(
+        status="resolved",
+        strategy="conflict investigator then re-adjudication",
+        recommended_candidate_id=recommended_candidate_id,
+        confidence_adjustment=0.04 if margin >= 0.2 else 0.02,
+        rationale=f"resolved the winner as {recommended_candidate_id} before re-adjudication.",
+        payload=_base_investigation_payload(
+            assessment=assessment,
+            context=context,
+            strategy="conflict investigator",
+            status="resolved",
+            recommended_candidate_id=recommended_candidate_id,
+            notes=notes,
+            stage_payload={
+                "re_adjudication": {
+                    "decision_mode": "conflict_investigation",
+                    "recommended_candidate_id": recommended_candidate_id,
+                    "margin": margin,
+                }
+            },
+        ),
+    )
+
+
+def _run_stronger_adjudicator(
+    *,
+    parsed_reviews: tuple[ParsedReview, ...],
+    assessment: DisagreementAssessment,
+    context: AdjudicationContext,
+) -> InvestigationResult:
+    candidate_scores = _candidate_scores(parsed_reviews, candidate_ids=context.candidate_ids)
+    ranked = sorted(candidate_scores.items(), key=lambda item: (-item[1], item[0]))
+    recommended_candidate_id = ranked[0][0] if ranked else assessment.preferred_candidate_id
+    margin = 0.0
+    if len(ranked) > 1:
+        margin = round(ranked[0][1] - ranked[1][1], 4)
+    if recommended_candidate_id is None or (
+        assessment.highest_issue_severity == "critical" and margin < 0.15
+    ):
+        return _build_unresolved_investigation(
+            assessment=assessment,
+            context=context,
+            reason="stronger adjudicator stayed unconvinced by the remaining evidence",
+        )
+    notes = [
+        "Stronger adjudicator applied stricter evidence weighting and higher severity penalties.",
+        f"Top recommendation margin: {margin:.4f}",
+    ]
+    return InvestigationResult(
+        status="resolved",
+        strategy="stronger adjudicator",
+        recommended_candidate_id=recommended_candidate_id,
+        confidence_adjustment=0.03 if margin >= 0.25 else 0.01,
+        rationale=f"selected {recommended_candidate_id} after stronger adjudication.",
+        payload=_base_investigation_payload(
+            assessment=assessment,
+            context=context,
+            strategy="stronger adjudicator",
+            status="resolved",
+            recommended_candidate_id=recommended_candidate_id,
+            notes=notes,
+            stage_payload={"margin": margin},
+        ),
+    )
+
+
+def _build_unresolved_investigation(
+    *,
+    assessment: DisagreementAssessment,
+    context: AdjudicationContext,
+    reason: str,
+) -> InvestigationResult:
+    return InvestigationResult(
+        status="unresolved",
+        strategy="escalation review",
+        recommended_candidate_id=None,
+        confidence_adjustment=0.0,
+        rationale=f"{reason} and escalated to human review.",
+        payload=_base_investigation_payload(
+            assessment=assessment,
+            context=context,
+            strategy="escalation review",
+            status="unresolved",
+            recommended_candidate_id=None,
+            notes=[reason],
+        ),
+    )
+
+
+def _base_investigation_payload(
+    *,
+    assessment: DisagreementAssessment,
+    context: AdjudicationContext,
+    strategy: str,
+    status: str,
+    recommended_candidate_id: str | None,
+    notes: list[str],
+    stage_payload: dict[str, object] | None = None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "stage": context.stage,
+        "candidate_ids": list(context.candidate_ids),
+        "review_ids": list(context.review_ids),
+        "preferred_candidate_id": assessment.preferred_candidate_id,
+        "recommended_candidate_id": recommended_candidate_id,
+        "winner_mismatch": assessment.winner_mismatch,
+        "confidence_spread": assessment.confidence_spread,
+        "contradictory_evidence_count": assessment.contradictory_evidence_count,
+        "highest_issue_severity": assessment.highest_issue_severity,
+        "total_score": assessment.total_score,
+        "content_risk_class": context.content_risk_class,
+        "strategy": strategy,
+        "status": status,
+        "notes": notes,
+    }
+    if stage_payload:
+        payload.update(stage_payload)
+    return payload
+
+
+def _candidate_scores(
+    parsed_reviews: tuple[ParsedReview, ...],
+    *,
+    candidate_ids: tuple[str, ...],
+) -> dict[str, float]:
+    scores = {candidate_id: 0.0 for candidate_id in candidate_ids}
+    for review in parsed_reviews:
+        if review.winner_candidate_id is not None:
+            scores.setdefault(review.winner_candidate_id, 0.0)
+            scores[review.winner_candidate_id] += 1.0 + review.confidence
+        for evidence in review.quoted_evidence:
+            if evidence.candidate_id is None:
+                continue
+            scores.setdefault(evidence.candidate_id, 0.0)
+            scores[evidence.candidate_id] += 0.15
+        for issue in review.issues:
+            if issue.candidate_id is None:
+                continue
+            scores.setdefault(issue.candidate_id, 0.0)
+            scores[issue.candidate_id] -= {"minor": 0.12, "major": 0.35, "critical": 0.7}[
+                issue.severity
+            ]
+    return scores

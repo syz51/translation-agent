@@ -55,7 +55,7 @@ def test_load_settings_reads_environment(monkeypatch, tmp_path: Path) -> None:
 
 
 @pytest.mark.unit
-def test_validate_environment_fails_cleanly_without_state_db_dsn(
+def test_validate_environment_defaults_to_local_sqlite_without_state_db_dsn(
     monkeypatch, tmp_path: Path
 ) -> None:
     monkeypatch.setenv("TA_DATA_DIR", str(tmp_path / "runtime"))
@@ -63,16 +63,17 @@ def test_validate_environment_fails_cleanly_without_state_db_dsn(
 
     result = validate_environment(load_settings())
 
-    assert result.ok is False
-    assert result.state_backend == "postgres"
+    assert result.ok is True
+    assert result.state_backend == "sqlite"
     assert result.adapter_mode == "fake"
-    assert result.state_db_ok is False
-    assert result.state_db_target == "<missing>"
-    assert result.state_db_error == "TA_STATE_DB_DSN is required"
+    assert result.state_db_ok is True
+    assert result.state_db_target == str((tmp_path / "runtime" / "state.sqlite3").resolve())
+    assert result.state_db_error is None
     assert result.runtime_compatibility_ok is True
     assert result.provider_config_ok is True
     for path in result.checked_paths:
         assert path.exists()
+    assert (tmp_path / "runtime" / "state.sqlite3").exists()
 
 
 @pytest.mark.unit
@@ -147,13 +148,14 @@ def test_cli_validate_config_json_missing_dsn(monkeypatch, tmp_path: Path, capsy
     exit_code = main(["validate-config", "--json"])
 
     payload = json.loads(capsys.readouterr().out)
-    assert exit_code == 1
-    assert payload["ok"] is False
+    assert exit_code == 0
+    assert payload["ok"] is True
     assert payload["adapter_mode"] == "fake"
     assert payload["runtime_compatibility_ok"] is True
     assert payload["provider_config_ok"] is True
-    assert payload["state_db_ok"] is False
-    assert payload["state_db_target"] == "<missing>"
+    assert payload["state_backend"] == "sqlite"
+    assert payload["state_db_ok"] is True
+    assert payload["state_db_target"] == str((tmp_path / "runtime" / "state.sqlite3").resolve())
 
 
 @pytest.mark.unit
@@ -231,6 +233,25 @@ def test_run_job_bootstraps_local_artifacts_and_postgres_record(
     assert record.output_data is not None
     assert record.output_data["final_stage"] == "finalize_outputs"
     assert len(node_executions) == 13
+
+
+@pytest.mark.unit
+def test_run_job_defaults_to_local_sqlite_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("TA_DATA_DIR", str(tmp_path / "runtime"))
+    monkeypatch.delenv("TA_STATE_DB_DSN", raising=False)
+
+    result = run_job(RunJobRequest(source="input.mp4", job_id="job-local"))
+
+    assert result.status == "completed"
+    assert result.state_backend == "sqlite"
+    assert result.state_db_target == str((tmp_path / "runtime" / "state.sqlite3").resolve())
+    assert (tmp_path / "runtime" / "state.sqlite3").exists()
+    local_job = _job_context(job_id="job-local")
+    assert (result.blob_root / Path(job_path(local_job, "published", "transcript.json"))).exists()
+    assert (result.blob_root / Path(job_path(local_job, "published", "translation.json"))).exists()
 
 
 @pytest.mark.integration
