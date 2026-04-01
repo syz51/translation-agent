@@ -36,12 +36,14 @@ The repo supports two execution modes.
 | Mode | How it is selected | What it uses | Best for |
 | --- | --- | --- | --- |
 | `fake` | default | deterministic fake adapters and scenario-driven outputs | local development, docs examples, fast tests |
-| `real` | `TA_ADAPTER_MODE=real` | `ffmpeg`, AssemblyAI, Speechmatics, Deepgram, and OpenAI Responses API | real provider integration |
+| `real` | `TA_ADAPTER_MODE=real` | `ffmpeg`, a selectable subset of AssemblyAI, Speechmatics, and Deepgram, plus the OpenAI Responses API | real provider integration |
 
 Notes:
 
 - fake mode requires no provider credentials
-- real mode requires all four provider API keys
+- real mode defaults to all three transcription providers when `TA_TRANSCRIPTION_PROVIDERS` is unset
+- real mode optionally supports a comma-separated transcription-provider subset via `TA_TRANSCRIPTION_PROVIDERS`
+- real mode credential requirements depend on the selected transcription providers and still always require `TA_OPENAI_API_KEY`
 - real mode is currently gated behind the LangGraph Python 3.14 compatibility check unless `TA_ALLOW_LANGGRAPH_PY314_WARNING=1` is set
 - fake mode still writes the full run record, trace, blob artifacts, scorecards, memory batches, consolidations, and prompt-evolution proposals
 
@@ -99,6 +101,32 @@ uv run translation-agent validate-config --json
 
 If the LangGraph compatibility warning disappears in a future dependency update, the explicit opt-in should no longer be necessary.
 
+`TA_TRANSCRIPTION_PROVIDERS` is optional in real mode. If it is unset, the runtime behaves exactly as before and uses `assemblyai,speechmatics,deepgram`. If it is set, real mode uses exactly the selected non-empty subset in the configured order.
+
+AssemblyAI-only:
+
+```bash
+export TA_ADAPTER_MODE=real
+export TA_TRANSCRIPTION_PROVIDERS=assemblyai
+export TA_ASSEMBLYAI_API_KEY=...
+export TA_OPENAI_API_KEY=...
+export TA_ALLOW_LANGGRAPH_PY314_WARNING=1
+uv run translation-agent validate-config --json
+uv run translation-agent run-job /absolute/path/to/input.mp4 --job-id demo-real
+```
+
+AssemblyAI + Deepgram:
+
+```bash
+export TA_ADAPTER_MODE=real
+export TA_TRANSCRIPTION_PROVIDERS=assemblyai,deepgram
+export TA_ASSEMBLYAI_API_KEY=...
+export TA_DEEPGRAM_API_KEY=...
+export TA_OPENAI_API_KEY=...
+export TA_ALLOW_LANGGRAPH_PY314_WARNING=1
+uv run translation-agent validate-config --json
+```
+
 ## CLI
 
 The CLI entrypoint is `translation-agent`.
@@ -115,7 +143,7 @@ It verifies:
 - runtime directories exist or can be created
 - SQLite or Postgres connectivity works
 - secrets are not leaked in DSN output
-- provider credentials are present when `TA_ADAPTER_MODE=real`
+- provider credentials are present for the selected real-mode providers when `TA_ADAPTER_MODE=real`
 - real mode is allowed by the current LangGraph compatibility gate
 
 ### `run-job`
@@ -218,6 +246,7 @@ The settings model accepts more fields than most users need. These are the ones 
 | `TA_STATE_DB_PATH` | override SQLite database path |
 | `TA_STATE_DB_DSN` | switch operational state to Postgres |
 | `TA_ADAPTER_MODE` | choose `fake` or `real` runtime |
+| `TA_TRANSCRIPTION_PROVIDERS` | comma-separated subset of real-mode transcription providers: `assemblyai`, `speechmatics`, `deepgram` |
 | `TA_ALLOW_LANGGRAPH_PY314_WARNING` | opt into real mode despite the current warning gate |
 | `TA_FFMPEG_BINARY` | override the `ffmpeg` executable path |
 | `TA_PROVIDER_TIMEOUT_SECONDS` | provider HTTP timeout |

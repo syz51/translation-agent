@@ -270,12 +270,13 @@ def _adjudication_context(
     *,
     stage: ReviewStage,
     content_risk_class: str = "standard",
+    candidate_ids: tuple[str, ...] = ("candidate-a", "candidate-b"),
 ) -> AdjudicationContext:
     return AdjudicationContext(
         run_id="run-phase-four",
         stage=stage,
         job=_job_context(),
-        candidate_ids=("candidate-a", "candidate-b"),
+        candidate_ids=candidate_ids,
         review_ids=("rev-1", "rev-2"),
         memory_bundle=MemoryBundle(),
         content_risk_class=content_risk_class,
@@ -498,6 +499,46 @@ Escalate?: yes
     assert outcome.human_review_required is True
     assert outcome.winner_candidate_id is None
     assert outcome.investigation_payload is not None
+
+
+def test_adjudicate_reviews_keeps_single_transcript_candidate_on_reduced_confidence_path() -> None:
+    candidate = _transcript_candidate("candidate-a", "Hello world from the workflow skeleton.")
+    reviews = (
+        _review_bundle(
+            "rev-1",
+            "transcript",
+            "accuracy_reviewer",
+            """Winner: candidate-a
+Confidence: 0.92
+Why:
+- Candidate A matches the only available transcript evidence.
+Key Errors By Candidate:
+- candidate-a | accuracy | minor | No material errors found in the surviving transcript.
+Quoted Evidence:
+- candidate-a | candidate-a-seg-1 | Hello world from the workflow skeleton.
+Suggested Fixes:
+- accuracy | candidate-a | Preserve the surviving candidate as-is.
+Escalate?: no
+""",
+        ),
+    )
+
+    outcome = adjudicate_reviews(
+        candidates=(candidate,),
+        reviews=reviews,
+        context=_adjudication_context(
+            stage="transcript",
+            candidate_ids=("candidate-a",),
+        ),
+    )
+
+    assert outcome.decision_mode == "automatic_finalize"
+    assert outcome.winner_candidate_id == "candidate-a"
+    assert outcome.human_review_required is False
+    assert outcome.escalated is True
+    assert outcome.investigation_payload is not None
+    assert outcome.investigation_payload["strategy"] == "single-candidate escalation check"
+    assert outcome.decision_confidence == pytest.approx(0.73)
 
 
 def test_phase_four_workflow_routes_translation_escalation_to_stronger_adjudicator(

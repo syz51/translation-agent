@@ -18,6 +18,18 @@ from translation_agent.storage import SQLiteOperationalStore
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_ENV_FILE = PROJECT_ROOT / ".env"
 _USE_DEFAULT_ENV_FILE = object()
+type TranscriptionProviderId = Literal["assemblyai", "speechmatics", "deepgram"]
+DEFAULT_TRANSCRIPTION_PROVIDERS: tuple[TranscriptionProviderId, ...] = (
+    "assemblyai",
+    "speechmatics",
+    "deepgram",
+)
+_SUPPORTED_TRANSCRIPTION_PROVIDER_IDS = frozenset(DEFAULT_TRANSCRIPTION_PROVIDERS)
+_TRANSCRIPTION_PROVIDER_ENV_VARS: dict[TranscriptionProviderId, str] = {
+    "assemblyai": "TA_ASSEMBLYAI_API_KEY",
+    "speechmatics": "TA_SPEECHMATICS_API_KEY",
+    "deepgram": "TA_DEEPGRAM_API_KEY",
+}
 
 
 class Settings(BaseSettings):
@@ -49,6 +61,7 @@ class Settings(BaseSettings):
     adapter_max_backoff_seconds: float = Field(default=2.0, gt=0, le=30)
     adapter_poll_interval_seconds: float = Field(default=1.0, gt=0, le=30)
     adapter_poll_attempts: int = Field(default=120, ge=1, le=10_000)
+    transcription_providers: str | tuple[str, ...] | None = None
     assemblyai_api_key: str | None = None
     assemblyai_base_url: str = "https://api.assemblyai.com"
     speechmatics_api_key: str | None = None
@@ -215,22 +228,74 @@ def _state_backend(settings: Settings) -> str:
     return "postgres" if settings.state_db_dsn else "sqlite"
 
 
+def resolve_transcription_providers(settings: Settings) -> tuple[TranscriptionProviderId, ...]:
+    """Return the effective real-mode transcription provider tuple."""
+
+    configured = settings.transcription_providers
+    if configured is None:
+        return DEFAULT_TRANSCRIPTION_PROVIDERS
+
+    normalized_tokens = tuple(_normalized_transcription_provider_tokens(configured))
+    if not normalized_tokens:
+        raise ValueError("TA_TRANSCRIPTION_PROVIDERS must select at least one provider when set")
+
+    unsupported: list[str] = []
+    unsupported_seen: set[str] = set()
+    duplicates: list[str] = []
+    duplicate_seen: set[str] = set()
+    resolved: list[TranscriptionProviderId] = []
+    seen: set[str] = set()
+
+    for provider_id in normalized_tokens:
+        if provider_id in seen:
+            if provider_id not in duplicate_seen:
+                duplicates.append(provider_id)
+                duplicate_seen.add(provider_id)
+            continue
+        seen.add(provider_id)
+        if provider_id not in _SUPPORTED_TRANSCRIPTION_PROVIDER_IDS:
+            if provider_id not in unsupported_seen:
+                unsupported.append(provider_id)
+                unsupported_seen.add(provider_id)
+            continue
+        resolved.append(cast("TranscriptionProviderId", provider_id))
+
+    if unsupported:
+        unsupported_values = ", ".join(unsupported)
+        raise ValueError(
+            f"TA_TRANSCRIPTION_PROVIDERS contains unsupported providers: {unsupported_values}"
+        )
+    if duplicates:
+        duplicate_values = ", ".join(duplicates)
+        raise ValueError(
+            f"TA_TRANSCRIPTION_PROVIDERS contains duplicate providers: {duplicate_values}"
+        )
+    return tuple(resolved)
+
+
 def validate_provider_configuration(settings: Settings) -> str | None:
     """Validate provider credentials required for the selected adapter mode."""
 
     if settings.adapter_mode != "real":
         return None
 
+    try:
+        transcription_providers = resolve_transcription_providers(settings)
+    except ValueError as exc:
+        return str(exc)
+
+    provider_api_keys: dict[TranscriptionProviderId, str | None] = {
+        "assemblyai": settings.assemblyai_api_key,
+        "speechmatics": settings.speechmatics_api_key,
+        "deepgram": settings.deepgram_api_key,
+    }
     missing = [
-        name
-        for name, value in (
-            ("TA_ASSEMBLYAI_API_KEY", settings.assemblyai_api_key),
-            ("TA_SPEECHMATICS_API_KEY", settings.speechmatics_api_key),
-            ("TA_DEEPGRAM_API_KEY", settings.deepgram_api_key),
-            ("TA_OPENAI_API_KEY", settings.openai_api_key),
-        )
-        if not value
+        _TRANSCRIPTION_PROVIDER_ENV_VARS[provider_id]
+        for provider_id in transcription_providers
+        if not provider_api_keys[provider_id]
     ]
+    if not settings.openai_api_key:
+        missing.append("TA_OPENAI_API_KEY")
     if missing:
         return f"real adapter mode requires {', '.join(missing)}"
     return None
@@ -278,3 +343,13 @@ def _langgraph_py314_warning() -> str | None:
         if "Core Pydantic V1 functionality isn't compatible with Python 3.14" in message:
             return message
     return None
+
+
+def _normalized_transcription_provider_tokens(
+    configured: str | tuple[str, ...],
+) -> tuple[str, ...]:
+    if isinstance(configured, str):
+        raw_tokens = configured.split(",")
+    else:
+        raw_tokens = configured
+    return tuple(token.strip().lower() for token in raw_tokens if token.strip())

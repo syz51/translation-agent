@@ -5,7 +5,7 @@ import wave
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
@@ -17,6 +17,7 @@ from translation_agent.adapters import (
     OpenAITranslationAdapter,
     RetryPolicy,
     SpeechmaticsTranscriptionAdapter,
+    TranscriptionAdapter,
 )
 from translation_agent.adapters import (
     assemblyai as assemblyai_module,
@@ -41,6 +42,7 @@ from translation_agent.graph import (
 )
 from translation_agent.models import (
     AudioArtifact,
+    FinalTranscriptDecision,
     JobContext,
     RequestContext,
     Segment,
@@ -280,6 +282,20 @@ def _retry_policy() -> RetryPolicy:
         poll_interval_seconds=0.0,
         max_polls=4,
     )
+
+
+def _real_settings(**overrides: Any) -> Settings:
+    defaults: dict[str, Any] = {
+        "adapter_mode": "real",
+        "allow_langgraph_py314_warning": True,
+        "state_db_dsn": "postgresql://db.example.com:5432/app",
+        "assemblyai_api_key": "test-assemblyai-key",  # pragma: allowlist secret
+        "speechmatics_api_key": "test-speechmatics-key",  # pragma: allowlist secret
+        "deepgram_api_key": "test-deepgram-key",  # pragma: allowlist secret
+        "openai_api_key": "test-openai-key",  # pragma: allowlist secret
+    }
+    defaults.update(overrides)
+    return Settings(**defaults)
 
 
 @pytest.mark.contract
@@ -1424,6 +1440,86 @@ def test_phase_three_runtime_uses_configured_ffmpeg_retry_budget(
     assert runtime.audio_extractor._retry_policy.max_backoff_seconds == 1.5
 
 
+def test_phase_three_runtime_builds_selected_single_transcription_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        "translation_agent.graph.runtime.ensure_langgraph_runtime_supported",
+        lambda: None,
+    )
+    settings = _real_settings(
+        transcription_providers="assemblyai",
+        speechmatics_api_key=None,
+        deepgram_api_key=None,
+    )
+
+    runtime = build_phase_three_runtime(
+        settings=settings,
+        blob_store=LocalBlobStore(tmp_path / "blobs"),
+        run_store=InMemoryRunStore(),
+        trace_sink=NoOpTraceSink(),
+        source_artifact_ref="jobs/request.json",
+    )
+
+    assert [adapter.provider_id for adapter in runtime.transcription_adapters] == ["assemblyai"]
+
+
+def test_phase_three_runtime_builds_selected_transcription_provider_subset_in_order(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        "translation_agent.graph.runtime.ensure_langgraph_runtime_supported",
+        lambda: None,
+    )
+    settings = _real_settings(
+        transcription_providers="assemblyai,deepgram",
+        speechmatics_api_key=None,
+    )
+
+    runtime = build_phase_three_runtime(
+        settings=settings,
+        blob_store=LocalBlobStore(tmp_path / "blobs"),
+        run_store=InMemoryRunStore(),
+        trace_sink=NoOpTraceSink(),
+        source_artifact_ref="jobs/request.json",
+    )
+
+    assert [adapter.provider_id for adapter in runtime.transcription_adapters] == [
+        "assemblyai",
+        "deepgram",
+    ]
+
+
+def test_phase_three_runtime_unset_selector_builds_all_transcription_providers_and_openai(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        "translation_agent.graph.runtime.ensure_langgraph_runtime_supported",
+        lambda: None,
+    )
+    settings = _real_settings()
+
+    runtime = build_phase_three_runtime(
+        settings=settings,
+        blob_store=LocalBlobStore(tmp_path / "blobs"),
+        run_store=InMemoryRunStore(),
+        trace_sink=NoOpTraceSink(),
+        source_artifact_ref="jobs/request.json",
+    )
+
+    assert isinstance(runtime.audio_extractor, FFmpegAudioExtractionAdapter)
+    assert [adapter.provider_id for adapter in runtime.transcription_adapters] == [
+        "assemblyai",
+        "speechmatics",
+        "deepgram",
+    ]
+    assert isinstance(runtime.translation_adapter, OpenAITranslationAdapter)
+    assert runtime.translation_adapter.model_id == settings.translation_model_id
+
+
 @pytest.mark.contract
 def test_validate_runtime_compatibility_gates_python314_warning(
     monkeypatch: pytest.MonkeyPatch,
@@ -1650,3 +1746,210 @@ def test_phase_three_runtime_completes_workflow_with_real_adapters(tmp_path: Pat
             final_state.final_translation_candidate_id + ".json",
         )
     )
+
+
+@pytest.mark.contract
+def test_phase_three_runtime_completes_workflow_with_assemblyai_only_real_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        "translation_agent.graph.runtime.ensure_langgraph_runtime_supported",
+        lambda: None,
+    )
+    blob_store = LocalBlobStore(tmp_path / "blobs")
+    run_store = InMemoryRunStore()
+    run_store.create_run(run_id="run-assembly-only", status="running")
+    source_ref = "jobs/run-assembly-only-request.json"
+    source_path = tmp_path / "input.mp4"
+    source_path.write_bytes(b"video")
+    blob_store.put_bytes(source_ref, b"{}\n")
+
+    def fake_runner(command: Sequence[str], timeout_seconds: float) -> FfmpegCompletedProcess:
+        with wave.open(str(Path(command[-1])), "wb") as handle:
+            handle.setnchannels(1)
+            handle.setsampwidth(2)
+            handle.setframerate(16_000)
+            handle.writeframes(b"\x00\x00" * 16_000)
+        assert timeout_seconds == 120.0
+        return FfmpegCompletedProcess(returncode=0, stderr=b"ok")
+
+    assembly_transport = SequencedTransport(
+        [
+            _json_response({"upload_url": "https://upload.example/audio.wav"}),
+            _json_response({"id": "aai-job"}),
+            _json_response(
+                {
+                    "id": "aai-job",
+                    "status": "completed",
+                    "text": " Hello world ",
+                    "utterances": [
+                        {
+                            "start": 0,
+                            "end": 1000,
+                            "speaker": "A",
+                            "text": " Hello world ",
+                            "confidence": 0.98,
+                        }
+                    ],
+                }
+            ),
+        ]
+    )
+    openai_transport = SequencedTransport(
+        [
+            _json_response(
+                {
+                    "output_text": json.dumps(
+                        {
+                            "full_text": "Bonjour le monde",
+                            "segments": [
+                                {
+                                    "segment_id": "seg-assemblyai-1",
+                                    "target_text": "Bonjour le monde",
+                                }
+                            ],
+                        }
+                    )
+                }
+            ),
+            _json_response(
+                {
+                    "output_text": json.dumps(
+                        {
+                            "full_text": "Salut le monde",
+                            "segments": [
+                                {"segment_id": "seg-assemblyai-1", "target_text": "Salut le monde"}
+                            ],
+                        }
+                    )
+                }
+            ),
+        ]
+    )
+    settings = _real_settings(
+        transcription_providers="assemblyai",
+        speechmatics_api_key=None,
+        deepgram_api_key=None,
+    )
+    runtime = build_phase_three_runtime(
+        settings=settings,
+        blob_store=blob_store,
+        run_store=run_store,
+        trace_sink=NoOpTraceSink(),
+        source_artifact_ref=source_ref,
+        overrides=RealRuntimeOverrides(
+            audio_extractor=FFmpegAudioExtractionAdapter(
+                blob_store=blob_store,
+                command_runner=fake_runner,
+            ),
+            transcription_adapters=(
+                AssemblyAITranscriptionAdapter(
+                    api_key="assembly",
+                    blob_store=blob_store,
+                    transport=assembly_transport,
+                    retry_policy=_retry_policy(),
+                    sleep=lambda _: None,
+                ),
+            ),
+            translation_adapter=OpenAITranslationAdapter(
+                api_key="openai",
+                blob_store=blob_store,
+                transport=openai_transport,
+                retry_policy=_retry_policy(),
+                sleep=lambda _: None,
+            ),
+        ),
+    )
+    initial_state = GraphState(
+        run_id="run-assembly-only",
+        job=_job_context(),
+        current_stage="ingest",
+        source_video_ref=str(source_path),
+        source_artifact_ref=source_ref,
+    )
+
+    final_state = run_workflow(initial_state, runtime)
+    decision = FinalTranscriptDecision.model_validate_json(
+        blob_store.read_bytes(_artifact_path("decisions", "transcript.json"))
+    )
+
+    assert final_state.current_stage == "finalize_outputs"
+    assert final_state.translation_failed is False
+    assert final_state.human_review_required is False
+    assert len(final_state.transcript_candidate_ids) == 1
+    assert final_state.final_transcript_candidate_id == final_state.transcript_candidate_ids[0]
+    assert decision.winner_candidate_id == final_state.final_transcript_candidate_id
+    assert decision.decision_mode == "automatic_finalize"
+    assert decision.escalated is True
+    assert decision.human_review_required is False
+    assert decision.investigation_ref == _artifact_path("investigations", "transcript.json")
+    assert blob_store.exists(_artifact_path("published", "transcript.json"))
+    assert blob_store.exists(_artifact_path("published", "translation.json"))
+
+
+def test_phase_three_runtime_raises_when_selected_single_provider_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        "translation_agent.graph.runtime.ensure_langgraph_runtime_supported",
+        lambda: None,
+    )
+    blob_store = LocalBlobStore(tmp_path / "blobs")
+    run_store = InMemoryRunStore()
+    run_store.create_run(run_id="run-assembly-failure", status="running")
+    source_ref = "jobs/run-assembly-failure-request.json"
+    source_path = tmp_path / "input.mp4"
+    source_path.write_bytes(b"video")
+    blob_store.put_bytes(source_ref, b"{}\n")
+
+    def fake_runner(command: Sequence[str], timeout_seconds: float) -> FfmpegCompletedProcess:
+        with wave.open(str(Path(command[-1])), "wb") as handle:
+            handle.setnchannels(1)
+            handle.setsampwidth(2)
+            handle.setframerate(16_000)
+            handle.writeframes(b"\x00\x00" * 16_000)
+        assert timeout_seconds == 120.0
+        return FfmpegCompletedProcess(returncode=0, stderr=b"ok")
+
+    class FailingAssemblyAIAdapter:
+        provider_id = "assemblyai"
+
+        def transcribe(
+            self,
+            audio_artifact: AudioArtifact,
+            request_context: RequestContext,
+        ) -> TranscriptCandidate:
+            del audio_artifact, request_context
+            raise RuntimeError("simulated AssemblyAI failure")
+
+    settings = _real_settings(
+        transcription_providers="assemblyai",
+        speechmatics_api_key=None,
+        deepgram_api_key=None,
+    )
+    runtime = build_phase_three_runtime(
+        settings=settings,
+        blob_store=blob_store,
+        run_store=run_store,
+        trace_sink=NoOpTraceSink(),
+        source_artifact_ref=source_ref,
+        overrides=RealRuntimeOverrides(
+            audio_extractor=FFmpegAudioExtractionAdapter(
+                blob_store=blob_store,
+                command_runner=fake_runner,
+            ),
+            transcription_adapters=(cast("TranscriptionAdapter", FailingAssemblyAIAdapter()),),
+        ),
+    )
+    initial_state = GraphState(
+        run_id="run-assembly-failure",
+        job=_job_context(),
+        current_stage="ingest",
+        source_video_ref=str(source_path),
+        source_artifact_ref=source_ref,
+    )
+
+    with pytest.raises(RuntimeError, match="all transcription providers failed"):
+        run_workflow(initial_state, runtime)

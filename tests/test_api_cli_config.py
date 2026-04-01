@@ -12,6 +12,7 @@ from translation_agent.cli import main
 from translation_agent.config import (
     ValidationResult,
     load_settings,
+    resolve_transcription_providers,
     sanitize_db_target,
     validate_environment,
     validate_runtime_compatibility,
@@ -38,6 +39,26 @@ def _job_context(job_id: str = "job-123") -> JobContext:
 
 def _artifact_path(*parts: str) -> Path:
     return Path(job_path(_job_context(), *parts))
+
+
+def _configure_real_mode_env(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    transcription_providers: str | None = None,
+) -> None:
+    monkeypatch.setenv("TA_DATA_DIR", str(tmp_path / "runtime"))
+    monkeypatch.setenv("TA_ADAPTER_MODE", "real")
+    monkeypatch.setenv("TA_ALLOW_LANGGRAPH_PY314_WARNING", "1")
+    monkeypatch.delenv("TA_STATE_DB_DSN", raising=False)
+    monkeypatch.delenv("TA_ASSEMBLYAI_API_KEY", raising=False)
+    monkeypatch.delenv("TA_SPEECHMATICS_API_KEY", raising=False)
+    monkeypatch.delenv("TA_DEEPGRAM_API_KEY", raising=False)
+    monkeypatch.delenv("TA_OPENAI_API_KEY", raising=False)
+    if transcription_providers is None:
+        monkeypatch.delenv("TA_TRANSCRIPTION_PROVIDERS", raising=False)
+    else:
+        monkeypatch.setenv("TA_TRANSCRIPTION_PROVIDERS", transcription_providers)
 
 
 @pytest.mark.unit
@@ -166,6 +187,113 @@ def test_validate_environment_real_mode_requires_provider_keys(monkeypatch, tmp_
     assert result.ok is False
     assert result.provider_config_error is not None
     assert "TA_ASSEMBLYAI_API_KEY" in result.provider_config_error
+
+
+@pytest.mark.unit
+def test_validate_environment_real_mode_unset_selector_requires_all_stt_keys(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _configure_real_mode_env(monkeypatch, tmp_path)
+
+    result = validate_environment(load_settings())
+
+    assert result.ok is False
+    assert result.provider_config_error == (
+        "real adapter mode requires TA_ASSEMBLYAI_API_KEY, "
+        "TA_SPEECHMATICS_API_KEY, TA_DEEPGRAM_API_KEY, TA_OPENAI_API_KEY"
+    )
+
+
+@pytest.mark.unit
+def test_validate_environment_real_mode_assemblyai_selector_requires_only_selected_keys(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _configure_real_mode_env(monkeypatch, tmp_path, transcription_providers="assemblyai")
+
+    result = validate_environment(load_settings())
+
+    assert result.ok is False
+    assert result.provider_config_error == (
+        "real adapter mode requires TA_ASSEMBLYAI_API_KEY, TA_OPENAI_API_KEY"
+    )
+
+
+@pytest.mark.unit
+def test_validate_environment_real_mode_subset_selector_requires_only_subset_keys(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _configure_real_mode_env(monkeypatch, tmp_path, transcription_providers="assemblyai,deepgram")
+
+    result = validate_environment(load_settings())
+
+    assert result.ok is False
+    assert result.provider_config_error == (
+        "real adapter mode requires TA_ASSEMBLYAI_API_KEY, TA_DEEPGRAM_API_KEY, TA_OPENAI_API_KEY"
+    )
+
+
+@pytest.mark.unit
+def test_validate_environment_real_mode_rejects_unknown_transcription_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _configure_real_mode_env(monkeypatch, tmp_path, transcription_providers="assemblyai,foo")
+
+    result = validate_environment(load_settings())
+
+    assert result.ok is False
+    assert result.provider_config_error == (
+        "TA_TRANSCRIPTION_PROVIDERS contains unsupported providers: foo"
+    )
+
+
+@pytest.mark.unit
+def test_validate_environment_real_mode_rejects_empty_transcription_provider_selector(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _configure_real_mode_env(monkeypatch, tmp_path, transcription_providers=" , , ")
+
+    result = validate_environment(load_settings())
+
+    assert result.ok is False
+    assert result.provider_config_error == (
+        "TA_TRANSCRIPTION_PROVIDERS must select at least one provider when set"
+    )
+
+
+@pytest.mark.unit
+def test_validate_environment_real_mode_rejects_duplicate_transcription_providers(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _configure_real_mode_env(
+        monkeypatch,
+        tmp_path,
+        transcription_providers="assemblyai, deepgram, AssemblyAI",
+    )
+
+    result = validate_environment(load_settings())
+
+    assert result.ok is False
+    assert result.provider_config_error == (
+        "TA_TRANSCRIPTION_PROVIDERS contains duplicate providers: assemblyai"
+    )
+
+
+@pytest.mark.unit
+def test_resolve_transcription_providers_normalizes_case_and_whitespace(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _configure_real_mode_env(monkeypatch, tmp_path, transcription_providers="ASSEMBLYAI, deepgram")
+
+    settings = load_settings()
+
+    assert resolve_transcription_providers(settings) == ("assemblyai", "deepgram")
 
 
 @pytest.mark.unit

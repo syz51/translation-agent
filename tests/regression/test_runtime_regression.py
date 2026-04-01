@@ -4,12 +4,33 @@ import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 
-from translation_agent.config import sanitize_db_target
-from translation_agent.graph import GraphState, build_phase_two_runtime, run_workflow
-from translation_agent.models import JobContext
+from translation_agent.config import (
+    Settings,
+    load_settings,
+    resolve_transcription_providers,
+    sanitize_db_target,
+    validate_environment,
+)
+from translation_agent.graph import (
+    GraphState,
+    RealRuntimeOverrides,
+    build_phase_three_runtime,
+    build_phase_two_runtime,
+    run_workflow,
+)
+from translation_agent.models import (
+    AudioArtifact,
+    FinalTranscriptDecision,
+    JobContext,
+    RequestContext,
+    Segment,
+    TranscriptCandidate,
+    TranslationCandidate,
+)
 from translation_agent.observability import NoOpTraceSink
 from translation_agent.replay import ReplayAdjudicationRequest, replay_adjudication
 from translation_agent.review import content_risk_class_for_scenario
@@ -252,6 +273,473 @@ def _normalize_failure_manifest(payload: dict[str, object]) -> dict[str, object]
     normalized = json.loads(json.dumps(payload))
     normalized["run_id"] = "<normalized>"
     return normalized
+
+
+def _real_settings(**overrides: Any) -> Settings:
+    defaults: dict[str, Any] = {
+        "adapter_mode": "real",
+        "allow_langgraph_py314_warning": True,
+        "state_db_dsn": "postgresql://db.example.com:5432/app",
+        "assemblyai_api_key": "test-assemblyai-key",  # pragma: allowlist secret
+        "speechmatics_api_key": "test-speechmatics-key",  # pragma: allowlist secret
+        "deepgram_api_key": "test-deepgram-key",  # pragma: allowlist secret
+        "openai_api_key": "test-openai-key",  # pragma: allowlist secret
+    }
+    defaults.update(overrides)
+    return Settings(**defaults)
+
+
+def _configure_real_mode_env(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    transcription_providers: str | None = None,
+    assemblyai_api_key: str | None = None,
+    speechmatics_api_key: str | None = None,
+    deepgram_api_key: str | None = None,
+    openai_api_key: str | None = None,
+) -> None:
+    monkeypatch.setenv("TA_DATA_DIR", str(tmp_path / "runtime"))
+    monkeypatch.setenv("TA_ADAPTER_MODE", "real")
+    monkeypatch.setenv("TA_ALLOW_LANGGRAPH_PY314_WARNING", "1")
+    monkeypatch.delenv("TA_STATE_DB_DSN", raising=False)
+    if transcription_providers is None:
+        monkeypatch.delenv("TA_TRANSCRIPTION_PROVIDERS", raising=False)
+    else:
+        monkeypatch.setenv("TA_TRANSCRIPTION_PROVIDERS", transcription_providers)
+
+    for env_var, value in (
+        ("TA_ASSEMBLYAI_API_KEY", assemblyai_api_key),
+        ("TA_SPEECHMATICS_API_KEY", speechmatics_api_key),
+        ("TA_DEEPGRAM_API_KEY", deepgram_api_key),
+        ("TA_OPENAI_API_KEY", openai_api_key),
+    ):
+        if value is None:
+            monkeypatch.delenv(env_var, raising=False)
+        else:
+            monkeypatch.setenv(env_var, value)
+
+
+class StaticAudioExtractionAdapter:
+    adapter_id = "ffmpeg"
+
+    def __init__(self, *, blob_store: LocalBlobStore) -> None:
+        self._blob_store = blob_store
+
+    def extract_audio(self, video_ref: str, job_context: RequestContext) -> AudioArtifact:
+        artifact_ref = job_path(job_context.job, "artifacts", "audio.wav")
+        self._blob_store.put_bytes(artifact_ref, b"RIFF")
+        scope_token = job_scope_token(job_context.job)
+        return AudioArtifact(
+            artifact_id=f"audio-{job_context.job.job_id}-{scope_token}",
+            job_id=job_context.job.job_id,
+            blob_ref=artifact_ref,
+            duration_ms=1_000,
+            sample_rate_hz=16_000,
+            channels=1,
+            codec="pcm_s16le",
+            extraction_metadata={
+                "adapter_id": self.adapter_id,
+                "source_video_ref": video_ref,
+            },
+        )
+
+
+class StaticTranscriptionAdapter:
+    def __init__(self, provider_id: str, *, blob_store: LocalBlobStore) -> None:
+        self.provider_id = provider_id
+        self._blob_store = blob_store
+
+    def transcribe(
+        self,
+        audio_artifact: AudioArtifact,
+        request_context: RequestContext,
+    ) -> TranscriptCandidate:
+        del audio_artifact
+        text = f"Hello world from {self.provider_id}."
+        raw_payload_ref = job_path(
+            request_context.job,
+            "raw",
+            "provider-payloads",
+            f"{self.provider_id}.json",
+        )
+        self._blob_store.put_bytes(
+            raw_payload_ref,
+            (
+                json.dumps(
+                    {"provider": self.provider_id, "text": text},
+                    sort_keys=True,
+                )
+                + "\n"
+            ).encode("utf-8"),
+        )
+        scope_token = job_scope_token(request_context.job)
+        return TranscriptCandidate(
+            candidate_id=f"tr-{self.provider_id}-{request_context.job.job_id}-{scope_token}",
+            job_id=request_context.job.job_id,
+            provider_id=self.provider_id,
+            provider_request_id=f"req-{self.provider_id}-{request_context.run_id}",
+            language=request_context.job.source_language,
+            segments=(
+                Segment(
+                    segment_id=f"seg-{self.provider_id}-1",
+                    start_ms=0,
+                    end_ms=1_000,
+                    speaker="speaker-1",
+                    source_text=text,
+                ),
+            ),
+            full_text=text,
+            speaker_map={"speaker-1": "Host"},
+            timing_resolution="segment",
+            raw_payload_ref=raw_payload_ref,
+            normalization_version="raw",
+            metadata={
+                "provider_rank": {
+                    "assemblyai": 0,
+                    "speechmatics": 1,
+                    "deepgram": 2,
+                }[self.provider_id]
+            },
+        )
+
+
+class FailingTranscriptionAdapter:
+    def __init__(self, provider_id: str) -> None:
+        self.provider_id = provider_id
+
+    def transcribe(
+        self,
+        audio_artifact: AudioArtifact,
+        request_context: RequestContext,
+    ) -> TranscriptCandidate:
+        del audio_artifact, request_context
+        raise RuntimeError(f"simulated failure for {self.provider_id}")
+
+
+class StaticTranslationAdapter:
+    model_id = "gpt-5.4-mini"
+
+    def __init__(self, *, blob_store: LocalBlobStore) -> None:
+        self._blob_store = blob_store
+
+    def generate_translation(
+        self,
+        final_transcript: TranscriptCandidate,
+        prompt_variant_id: str,
+        request_context: RequestContext,
+    ) -> TranslationCandidate:
+        text = {
+            "variant-a": "Bonjour le monde",
+            "variant-b": "Salut le monde",
+        }[prompt_variant_id]
+        raw_response_ref = job_path(
+            request_context.job,
+            "raw",
+            "provider-payloads",
+            f"openai-{prompt_variant_id}.json",
+        )
+        self._blob_store.put_bytes(
+            raw_response_ref,
+            (
+                json.dumps(
+                    {"variant": prompt_variant_id, "translation": text},
+                    sort_keys=True,
+                )
+                + "\n"
+            ).encode("utf-8"),
+        )
+        scope_token = job_scope_token(request_context.job)
+        return TranslationCandidate(
+            candidate_id=f"tl-{prompt_variant_id}-{request_context.job.job_id}-{scope_token}",
+            job_id=request_context.job.job_id,
+            source_transcript_candidate_id=final_transcript.candidate_id,
+            model_id=self.model_id,
+            prompt_variant_id=prompt_variant_id,
+            prompt_version="phase-3-v1",
+            language=request_context.job.target_language,
+            segments=(
+                Segment(
+                    segment_id=final_transcript.segments[0].segment_id,
+                    start_ms=0,
+                    end_ms=1_000,
+                    speaker="speaker-1",
+                    source_text=final_transcript.full_text,
+                    target_text=text,
+                ),
+            ),
+            full_text=text,
+            raw_response_ref=raw_response_ref,
+            normalization_version="raw",
+            metadata={},
+        )
+
+
+def test_real_mode_unset_transcription_provider_selector_preserves_three_provider_order_regression(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        "translation_agent.graph.runtime.ensure_langgraph_runtime_supported",
+        lambda: None,
+    )
+    runtime = build_phase_three_runtime(
+        settings=_real_settings(),
+        blob_store=LocalBlobStore(tmp_path / "blobs"),
+        run_store=InMemoryRunStore(),
+        trace_sink=NoOpTraceSink(),
+        source_artifact_ref="jobs/request.json",
+    )
+
+    assert [adapter.provider_id for adapter in runtime.transcription_adapters] == [
+        "assemblyai",
+        "speechmatics",
+        "deepgram",
+    ]
+
+
+def test_real_mode_assemblyai_only_selector_validates_with_minimal_credentials_regression(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _configure_real_mode_env(
+        monkeypatch,
+        tmp_path,
+        transcription_providers="assemblyai",
+        assemblyai_api_key="assembly",  # pragma: allowlist secret
+        openai_api_key="openai",  # pragma: allowlist secret
+    )
+
+    result = validate_environment(load_settings(env_file=None))
+
+    assert result.ok is True
+    assert result.provider_config_ok is True
+    assert result.provider_config_error is None
+
+
+def test_real_mode_subset_selector_normalizes_case_and_preserves_order_regression(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _configure_real_mode_env(
+        monkeypatch,
+        tmp_path,
+        transcription_providers=" ASSEMBLYAI , deepgram ",
+        assemblyai_api_key="assembly",  # pragma: allowlist secret
+        deepgram_api_key="deepgram",  # pragma: allowlist secret
+        openai_api_key="openai",  # pragma: allowlist secret
+    )
+    settings = load_settings(env_file=None)
+    monkeypatch.setattr(
+        "translation_agent.graph.runtime.ensure_langgraph_runtime_supported",
+        lambda: None,
+    )
+
+    runtime = build_phase_three_runtime(
+        settings=settings,
+        blob_store=LocalBlobStore(tmp_path / "blobs"),
+        run_store=InMemoryRunStore(),
+        trace_sink=NoOpTraceSink(),
+        source_artifact_ref="jobs/request.json",
+    )
+
+    assert resolve_transcription_providers(settings) == ("assemblyai", "deepgram")
+    assert [adapter.provider_id for adapter in runtime.transcription_adapters] == [
+        "assemblyai",
+        "deepgram",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("configured_value", "expected_error"),
+    [
+        (
+            "assemblyai,foo",
+            "TA_TRANSCRIPTION_PROVIDERS contains unsupported providers: foo",
+        ),
+        (
+            " , , ",
+            "TA_TRANSCRIPTION_PROVIDERS must select at least one provider when set",
+        ),
+        (
+            "assemblyai, deepgram, AssemblyAI",
+            "TA_TRANSCRIPTION_PROVIDERS contains duplicate providers: assemblyai",
+        ),
+    ],
+)
+def test_real_mode_selector_rejects_invalid_provider_inputs_regression(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    configured_value: str,
+    expected_error: str,
+) -> None:
+    _configure_real_mode_env(
+        monkeypatch,
+        tmp_path,
+        transcription_providers=configured_value,
+        assemblyai_api_key="assembly",  # pragma: allowlist secret
+        deepgram_api_key="deepgram",  # pragma: allowlist secret
+        openai_api_key="openai",  # pragma: allowlist secret
+    )
+
+    result = validate_environment(load_settings(env_file=None))
+
+    assert result.ok is False
+    assert result.provider_config_error == expected_error
+
+
+def test_real_mode_assemblyai_only_workflow_stays_on_single_candidate_path_regression(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    job = _job_context(job_id="job-real-assembly-only")
+    run_id = "run-real-assembly-only"
+    run_store = InMemoryRunStore()
+    run_store.create_run(run_id=run_id, status="running")
+    blob_store = LocalBlobStore(tmp_path / run_id / "blobs")
+    source_ref = f"jobs/{run_id}-request.json"
+    blob_store.put_bytes(source_ref, b"{}\n")
+    monkeypatch.setattr(
+        "translation_agent.graph.runtime.ensure_langgraph_runtime_supported",
+        lambda: None,
+    )
+    runtime = build_phase_three_runtime(
+        settings=_real_settings(
+            transcription_providers="assemblyai",
+            speechmatics_api_key=None,
+            deepgram_api_key=None,
+        ),
+        blob_store=blob_store,
+        run_store=run_store,
+        trace_sink=NoOpTraceSink(),
+        source_artifact_ref=source_ref,
+        overrides=RealRuntimeOverrides(
+            audio_extractor=StaticAudioExtractionAdapter(blob_store=blob_store),
+            transcription_adapters=(
+                StaticTranscriptionAdapter("assemblyai", blob_store=blob_store),
+            ),
+            translation_adapter=StaticTranslationAdapter(blob_store=blob_store),
+        ),
+    )
+    final_state = run_workflow(
+        GraphState(
+            run_id=run_id,
+            job=job,
+            current_stage="ingest",
+            source_video_ref="input.mp4",
+            source_artifact_ref=source_ref,
+        ),
+        runtime,
+    )
+
+    decision = FinalTranscriptDecision.model_validate_json(
+        blob_store.read_bytes(job_path(job, "decisions", "transcript.json"))
+    )
+
+    assert len(final_state.transcript_candidate_ids) == 1
+    assert decision.decision_mode == "automatic_finalize"
+    assert decision.escalated is True
+    assert decision.human_review_required is False
+    assert decision.investigation_ref == job_path(job, "investigations", "transcript.json")
+    assert blob_store.exists(job_path(job, "published", "transcript.json"))
+    assert blob_store.exists(job_path(job, "published", "translation.json"))
+
+
+def test_real_mode_assemblyai_and_deepgram_subset_publishes_selected_provider_artifacts_regression(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    job = _job_context(job_id="job-real-subset")
+    run_id = "run-real-subset"
+    run_store = InMemoryRunStore()
+    run_store.create_run(run_id=run_id, status="running")
+    blob_store = LocalBlobStore(tmp_path / run_id / "blobs")
+    source_ref = f"jobs/{run_id}-request.json"
+    blob_store.put_bytes(source_ref, b"{}\n")
+    monkeypatch.setattr(
+        "translation_agent.graph.runtime.ensure_langgraph_runtime_supported",
+        lambda: None,
+    )
+    runtime = build_phase_three_runtime(
+        settings=_real_settings(
+            transcription_providers="assemblyai,deepgram",
+            speechmatics_api_key=None,
+        ),
+        blob_store=blob_store,
+        run_store=run_store,
+        trace_sink=NoOpTraceSink(),
+        source_artifact_ref=source_ref,
+        overrides=RealRuntimeOverrides(
+            audio_extractor=StaticAudioExtractionAdapter(blob_store=blob_store),
+            transcription_adapters=(
+                StaticTranscriptionAdapter("assemblyai", blob_store=blob_store),
+                StaticTranscriptionAdapter("deepgram", blob_store=blob_store),
+            ),
+            translation_adapter=StaticTranslationAdapter(blob_store=blob_store),
+        ),
+    )
+
+    final_state = run_workflow(
+        GraphState(
+            run_id=run_id,
+            job=job,
+            current_stage="ingest",
+            source_video_ref="input.mp4",
+            source_artifact_ref=source_ref,
+        ),
+        runtime,
+    )
+
+    assert len(final_state.transcript_candidate_ids) == 2
+    assert blob_store.exists(job_path(job, "raw", "provider-payloads", "assemblyai.json"))
+    assert blob_store.exists(job_path(job, "raw", "provider-payloads", "deepgram.json"))
+    assert not blob_store.exists(job_path(job, "raw", "provider-payloads", "speechmatics.json"))
+    assert blob_store.exists(job_path(job, "published", "translation.json"))
+
+
+def test_real_mode_single_selected_provider_failure_raises_expected_error_regression(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    job = _job_context(job_id="job-real-single-provider-failure")
+    run_id = "run-real-single-provider-failure"
+    run_store = InMemoryRunStore()
+    run_store.create_run(run_id=run_id, status="running")
+    blob_store = LocalBlobStore(tmp_path / run_id / "blobs")
+    source_ref = f"jobs/{run_id}-request.json"
+    blob_store.put_bytes(source_ref, b"{}\n")
+    monkeypatch.setattr(
+        "translation_agent.graph.runtime.ensure_langgraph_runtime_supported",
+        lambda: None,
+    )
+    runtime = build_phase_three_runtime(
+        settings=_real_settings(
+            transcription_providers="assemblyai",
+            speechmatics_api_key=None,
+            deepgram_api_key=None,
+        ),
+        blob_store=blob_store,
+        run_store=run_store,
+        trace_sink=NoOpTraceSink(),
+        source_artifact_ref=source_ref,
+        overrides=RealRuntimeOverrides(
+            audio_extractor=StaticAudioExtractionAdapter(blob_store=blob_store),
+            transcription_adapters=(FailingTranscriptionAdapter("assemblyai"),),
+            translation_adapter=StaticTranslationAdapter(blob_store=blob_store),
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="all transcription providers failed"):
+        run_workflow(
+            GraphState(
+                run_id=run_id,
+                job=job,
+                current_stage="ingest",
+                source_video_ref="input.mp4",
+                source_artifact_ref=source_ref,
+            ),
+            runtime,
+        )
 
 
 def test_replay_scorecards_memory_and_prompt_proposals_are_stable_regression(

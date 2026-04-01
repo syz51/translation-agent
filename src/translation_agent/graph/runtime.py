@@ -20,6 +20,7 @@ from translation_agent.adapters import (
 )
 from translation_agent.config import (
     Settings,
+    resolve_transcription_providers,
     validate_provider_configuration,
     validate_runtime_compatibility,
 )
@@ -495,28 +496,10 @@ def build_phase_three_runtime(
             max_backoff_seconds=settings.adapter_max_backoff_seconds,
         ),
     )
-    transcription_adapters = overrides.transcription_adapters or (
-        AssemblyAITranscriptionAdapter(
-            blob_store=blob_store,
-            api_key=_required_setting(settings.assemblyai_api_key, "TA_ASSEMBLYAI_API_KEY"),
-            base_url=settings.assemblyai_base_url,
-            timeout_seconds=settings.provider_timeout_seconds,
-            retry_policy=retry_policy,
-        ),
-        SpeechmaticsTranscriptionAdapter(
-            blob_store=blob_store,
-            api_key=_required_setting(settings.speechmatics_api_key, "TA_SPEECHMATICS_API_KEY"),
-            base_url=settings.speechmatics_base_url,
-            timeout_seconds=settings.provider_timeout_seconds,
-            retry_policy=retry_policy,
-        ),
-        DeepgramTranscriptionAdapter(
-            blob_store=blob_store,
-            api_key=_required_setting(settings.deepgram_api_key, "TA_DEEPGRAM_API_KEY"),
-            base_url=settings.deepgram_base_url,
-            timeout_seconds=settings.provider_timeout_seconds,
-            retry_policy=retry_policy,
-        ),
+    transcription_adapters = overrides.transcription_adapters or _build_real_transcription_adapters(
+        settings=settings,
+        blob_store=blob_store,
+        retry_policy=retry_policy,
     )
     translation_adapter = overrides.translation_adapter or OpenAITranslationAdapter(
         blob_store=blob_store,
@@ -567,6 +550,53 @@ def _required_setting(value: str | None, env_var: str) -> str:
     if value:
         return value
     raise RuntimeError(f"{env_var} is required when TA_ADAPTER_MODE=real")
+
+
+def _build_real_transcription_adapters(
+    *,
+    settings: Settings,
+    blob_store: BlobStore,
+    retry_policy: RetryPolicy,
+) -> tuple[TranscriptionAdapter, ...]:
+    adapters: list[TranscriptionAdapter] = []
+    for provider_id in resolve_transcription_providers(settings):
+        if provider_id == "assemblyai":
+            adapters.append(
+                AssemblyAITranscriptionAdapter(
+                    blob_store=blob_store,
+                    api_key=_required_setting(settings.assemblyai_api_key, "TA_ASSEMBLYAI_API_KEY"),
+                    base_url=settings.assemblyai_base_url,
+                    timeout_seconds=settings.provider_timeout_seconds,
+                    retry_policy=retry_policy,
+                )
+            )
+            continue
+        if provider_id == "speechmatics":
+            adapters.append(
+                SpeechmaticsTranscriptionAdapter(
+                    blob_store=blob_store,
+                    api_key=_required_setting(
+                        settings.speechmatics_api_key,
+                        "TA_SPEECHMATICS_API_KEY",
+                    ),
+                    base_url=settings.speechmatics_base_url,
+                    timeout_seconds=settings.provider_timeout_seconds,
+                    retry_policy=retry_policy,
+                )
+            )
+            continue
+        adapters.append(
+            DeepgramTranscriptionAdapter(
+                blob_store=blob_store,
+                api_key=_required_setting(settings.deepgram_api_key, "TA_DEEPGRAM_API_KEY"),
+                base_url=settings.deepgram_base_url,
+                timeout_seconds=settings.provider_timeout_seconds,
+                retry_policy=retry_policy,
+            )
+        )
+    if not adapters:
+        raise RuntimeError("TA_TRANSCRIPTION_PROVIDERS must select at least one provider when set")
+    return tuple(adapters)
 
 
 def _blob_root(blob_store: BlobStore) -> str | None:
