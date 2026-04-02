@@ -59,6 +59,57 @@ def test_cli_run_job_json_contract(
     assert record is not None
 
 
+def test_convert_json_to_srt_json_contract(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source_path = tmp_path / "published" / "translation.json"
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    source_path.write_text(
+        json.dumps(
+            {
+                "candidate_id": "translation-candidate-1",
+                "job_id": "job-contract",
+                "source_transcript_candidate_id": "transcript-candidate-1",
+                "final_transcript_ref": None,
+                "model_id": "gpt-5.4-mini",
+                "prompt_variant_id": "variant-a",
+                "prompt_version": "v1",
+                "language": "fr",
+                "segments": [
+                    {
+                        "segment_id": "seg-1",
+                        "start_ms": 0,
+                        "end_ms": 1200,
+                        "speaker": None,
+                        "source_text": "Hello world",
+                        "target_text": "Bonjour le monde",
+                        "annotations": {},
+                    }
+                ],
+                "full_text": "Bonjour le monde",
+                "raw_response_ref": "raw/translation-candidate-1.json",
+                "normalization_version": "2026-03-30",
+                "metadata": {},
+            },
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+
+    exit_code = main(["convert-json-to-srt", str(source_path), "--json"])
+
+    payload = json.loads(capsys.readouterr().out)
+    output_path = Path(payload["output_path"])
+
+    assert exit_code == 0
+    assert output_path.exists()
+    assert _normalize_convert_json_to_srt_payload(payload) == _load_golden(
+        "convert_json_to_srt.json"
+    )
+
+
 def _load_golden(name: str) -> object:
     return json.loads((GOLDEN_DIR / name).read_text(encoding="utf-8"))
 
@@ -77,4 +128,11 @@ def _normalize_run_job_payload(payload: dict[str, object]) -> dict[str, object]:
     normalized["trace_path"] = "<trace_path>"
     normalized["default_output_path"] = "<default_output_path>"
     normalized["state_db_target"] = "<state_db_target>"
+    return normalized
+
+
+def _normalize_convert_json_to_srt_payload(payload: dict[str, object]) -> dict[str, object]:
+    normalized = dict(payload)
+    normalized["source_path"] = "<source_path>"
+    normalized["output_path"] = "<output_path>"
     return normalized

@@ -25,7 +25,7 @@ from translation_agent.config import (
 )
 from translation_agent.graph import GraphState
 from translation_agent.graph.state import RoutingFact
-from translation_agent.models import JobContext
+from translation_agent.models import JobContext, Segment, TranslationCandidate
 from translation_agent.storage import (
     LocalBlobStore,
     PostgresRunStore,
@@ -52,6 +52,56 @@ def _job_context(job_id: str = "job-123") -> JobContext:
 
 def _artifact_path(*parts: str) -> Path:
     return Path(job_path(_job_context(), *parts))
+
+
+def _translation_candidate(job_id: str = "job-123") -> TranslationCandidate:
+    return TranslationCandidate(
+        candidate_id=f"candidate-{job_id}",
+        job_id=job_id,
+        source_transcript_candidate_id=f"transcript-{job_id}",
+        model_id="gpt-5.4",
+        prompt_variant_id="prompt-variant-a",
+        prompt_version="translation-v1",
+        language="fr",
+        segments=(
+            Segment(
+                segment_id="seg-1",
+                start_ms=0,
+                end_ms=1_200,
+                source_text="Hello.",
+                target_text="Bonjour.",
+            ),
+            Segment(
+                segment_id="seg-2",
+                start_ms=1_200,
+                end_ms=2_400,
+                source_text="Skip me.",
+                target_text="   ",
+            ),
+            Segment(
+                segment_id="seg-3",
+                start_ms=2_400,
+                end_ms=3_600,
+                source_text="Thank you.",
+                target_text="Merci.",
+            ),
+        ),
+        full_text="Bonjour. Merci.",
+        normalization_version="translation-candidate/v1",
+    )
+
+
+def _write_translation_candidate(
+    path: Path,
+    candidate: TranslationCandidate | None = None,
+) -> TranslationCandidate:
+    persisted_candidate = candidate or _translation_candidate()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(persisted_candidate.model_dump(mode="json"), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return persisted_candidate
 
 
 def _configure_real_mode_env(
@@ -454,6 +504,46 @@ def test_cli_migrate_db_runs_upgrade_with_loaded_settings(
 
 
 @pytest.mark.unit
+def test_cli_convert_json_to_srt_json_output_includes_conversion_metadata(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source_path = tmp_path / "candidates" / "translations" / "candidate-job-123.json"
+    candidate = _write_translation_candidate(source_path)
+
+    exit_code = main(["convert-json-to-srt", str(source_path), "--json"])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert payload == {
+        "source_path": str(source_path.resolve()),
+        "output_path": str(source_path.with_suffix(".srt").resolve()),
+        "job_id": candidate.job_id,
+        "candidate_id": candidate.candidate_id,
+        "language": candidate.language,
+        "subtitle_count": 2,
+    }
+
+
+@pytest.mark.unit
+def test_cli_convert_json_to_srt_plain_output_reports_output_path_and_count(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source_path = tmp_path / "published" / "translation.json"
+    _write_translation_candidate(source_path)
+
+    exit_code = main(["convert-json-to-srt", str(source_path)])
+
+    lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
+    assert exit_code == 0
+    assert lines == [
+        str(source_path.with_suffix(".srt").resolve()),
+        "subtitles: 2",
+    ]
+
+
+@pytest.mark.unit
 def test_cli_run_job_plain_output_reports_run_status_and_trace(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -617,6 +707,49 @@ def test_run_job_bootstraps_local_artifacts_and_postgres_record(
     assert record.output_data is not None
     assert record.output_data["final_stage"] == "finalize_outputs"
     assert len(node_executions) == 13
+
+
+@pytest.mark.integration
+def test_cli_convert_json_to_srt_matches_published_export_in_postgres_runtime(
+    migrated_postgres_dsn: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("TA_DATA_DIR", str(tmp_path / "runtime"))
+    monkeypatch.setenv("TA_STATE_DB_DSN", migrated_postgres_dsn)
+
+    result = run_job(RunJobRequest(source="input.mp4", job_id="job-convert"))
+    published_translation_path = result.blob_root / job_path(
+        _job_context("job-convert"),
+        "published",
+        "translation.json",
+    )
+    existing_export_path = result.blob_root / job_path(
+        _job_context("job-convert"),
+        "exports",
+        "translation.srt",
+    )
+    converted_output_path = tmp_path / "converted" / "translation-from-json.srt"
+
+    exit_code = main(
+        [
+            "convert-json-to-srt",
+            str(published_translation_path),
+            "--output",
+            str(converted_output_path),
+        ]
+    )
+
+    lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
+    assert exit_code == 0
+    assert lines == [
+        str(converted_output_path.resolve()),
+        "subtitles: 1",
+    ]
+    assert converted_output_path.read_text(encoding="utf-8") == existing_export_path.read_text(
+        encoding="utf-8"
+    )
 
 
 @pytest.mark.unit

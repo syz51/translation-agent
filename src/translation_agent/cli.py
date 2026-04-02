@@ -6,7 +6,11 @@ import argparse
 import json
 from dataclasses import asdict
 
-from translation_agent.api import RunJobRequest, run_job
+from translation_agent.api import (
+    RunJobRequest,
+    convert_translation_json_to_srt,
+    run_job,
+)
 from translation_agent.config import load_settings, sanitize_db_target, validate_environment
 from translation_agent.storage.migrations import upgrade_database
 
@@ -20,6 +24,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     migrate_parser = subparsers.add_parser("migrate-db", help="Apply Postgres migrations")
     migrate_parser.add_argument("--revision", default="head")
+
+    convert_parser = subparsers.add_parser(
+        "convert-json-to-srt",
+        help="Convert a persisted translation JSON artifact into SRT",
+    )
+    convert_parser.add_argument("source")
+    convert_parser.add_argument("--output")
+    convert_parser.add_argument("--json", action="store_true", dest="as_json")
 
     run_parser = subparsers.add_parser("run-job", help="Execute the local dry-run workflow")
     run_parser.add_argument("source")
@@ -89,6 +101,19 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         upgrade_database(settings.state_db_dsn, revision=args.revision)
         print(f"migrated {sanitize_db_target(settings.state_db_dsn)} to {args.revision}")
+        return 0
+
+    if args.command == "convert-json-to-srt":
+        result = convert_translation_json_to_srt(args.source, output_path=args.output)
+        payload = {
+            key: str(value) if hasattr(value, "__fspath__") else value
+            for key, value in asdict(result).items()
+        }
+        if args.as_json:
+            print(json.dumps(payload))
+        else:
+            print(result.output_path)
+            print(f"subtitles: {result.subtitle_count}")
         return 0
 
     if args.command == "run-job":

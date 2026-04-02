@@ -280,7 +280,7 @@ A successful translation run publishes:
 - `published/translation.json`
 - `published/scorecard.json`
 - `published/artifacts.json`
-- `exports/translation.txt`
+- `exports/translation.srt`
 - `exports/translation.json`
 - `deliveries/translation.json`
 - `traces/<run_id>.jsonl`

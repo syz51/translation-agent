@@ -1,6 +1,12 @@
 """Translation agent package bootstrap."""
 
-from translation_agent.api import RunJobRequest, RunJobResult, run_job
+from translation_agent.api import (
+    ConvertTranslationJsonToSrtResult,
+    RunJobRequest,
+    RunJobResult,
+    convert_translation_json_to_srt,
+    run_job,
+)
 from translation_agent.replay import (
     ReplayAdjudicationRequest,
     ReplayAdjudicationResult,
@@ -8,10 +14,12 @@ from translation_agent.replay import (
 )
 
 __all__ = [
+    "ConvertTranslationJsonToSrtResult",
     "ReplayAdjudicationRequest",
     "ReplayAdjudicationResult",
     "RunJobRequest",
     "RunJobResult",
+    "convert_translation_json_to_srt",
     "replay_adjudication",
     "run_job",
 ]

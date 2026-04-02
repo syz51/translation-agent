@@ -54,6 +54,7 @@ Notes:
 ```bash
 uv run translation-agent validate-config --json
 uv run translation-agent run-job input.wav --job-id demo --json
+uv run translation-agent convert-json-to-srt .translation-agent/blobs/.../published/translation.json
 ```
 
 Defaults:
@@ -174,6 +175,17 @@ Final statuses currently emitted by the API are:
 - `human_review_required`
 - `translation_failed`
 
+### `convert-json-to-srt`
+
+```bash
+uv run translation-agent convert-json-to-srt .translation-agent/blobs/.../published/translation.json
+uv run translation-agent convert-json-to-srt .translation-agent/blobs/.../published/translation.json --output ./translation-backfill.srt --json
+```
+
+This command converts a persisted `TranslationCandidate` artifact such as `published/translation.json`
+or `candidates/translations/*.json` into `.srt`. It does not accept the summary payload at
+`exports/translation.json` because that file does not include timed segments.
+
 ## Python API
 
 ```python
@@ -224,7 +236,7 @@ tenants/<tenant>/projects/<project>/languages/<src>-to-<dst>/jobs/<job_id>/
   published/scorecard.json
   published/transcript.json
   published/translation.json
-  exports/translation.txt
+  exports/translation.srt
   exports/translation.json
   deliveries/translation.json
   traces/<run_id>.jsonl
@@ -236,6 +248,12 @@ Important behavior:
 - the same job ID can exist safely across tenants or language pairs
 - translation failure publishes `translation-failed.json` instead of `published/translation.json`
 - the scorecard includes routing facts, decision payloads, trace refs, export refs, downstream refs, memory refs, and prompt-evolution refs
+
+To backfill subtitles from a persisted translation artifact:
+
+```bash
+uv run translation-agent convert-json-to-srt path/to/published/translation.json
+```
 
 ## Configuration
 

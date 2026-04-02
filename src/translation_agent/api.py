@@ -12,7 +12,7 @@ from uuid import uuid4
 from translation_agent.config import Settings, load_settings, validate_environment
 from translation_agent.graph import GraphState, build_runtime, run_workflow, sync_trace_artifact
 from translation_agent.media_identity import compute_media_fingerprint
-from translation_agent.models import HistoricalRunLink, JobContext
+from translation_agent.models import HistoricalRunLink, JobContext, TranslationCandidate
 from translation_agent.observability.events import (
     configure_structured_logging,
     get_structured_logger,
@@ -25,6 +25,7 @@ from translation_agent.storage import (
     job_path,
 )
 from translation_agent.storage.blobs import LocalBlobStore
+from translation_agent.subtitles import render_translation_srt, subtitle_count
 
 
 @dataclass(slots=True)
@@ -58,6 +59,16 @@ class RunJobResult:
     failure_ref: str | None = None
     failure_summary: str | None = None
     failure_reasons: tuple[str, ...] = ()
+
+
+@dataclass(slots=True)
+class ConvertTranslationJsonToSrtResult:
+    source_path: Path
+    output_path: Path
+    job_id: str
+    candidate_id: str
+    language: str
+    subtitle_count: int
 
 
 def run_job(request: RunJobRequest, settings: Settings | None = None) -> RunJobResult:
@@ -288,6 +299,27 @@ def run_job(request: RunJobRequest, settings: Settings | None = None) -> RunJobR
     )
 
 
+def convert_translation_json_to_srt(
+    source_path: str | Path,
+    output_path: str | Path | None = None,
+) -> ConvertTranslationJsonToSrtResult:
+    source = Path(source_path).expanduser().resolve()
+    destination = _resolved_srt_output_path(source, output_path)
+    if destination == source:
+        raise ValueError("output path must be different from source path")
+    translation = _load_translation_candidate(source)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(render_translation_srt(translation), encoding="utf-8")
+    return ConvertTranslationJsonToSrtResult(
+        source_path=source,
+        output_path=destination.resolve(),
+        job_id=translation.job_id,
+        candidate_id=translation.candidate_id,
+        language=translation.language,
+        subtitle_count=subtitle_count(translation),
+    )
+
+
 def _open_operational_store(
     settings: Settings,
 ) -> PostgresOperationalStore | SQLiteOperationalStore:
@@ -314,6 +346,18 @@ def _serialize_request(request: RunJobRequest, created_at: datetime) -> str:
         "reference_mode": request.reference_mode,
     }
     return json.dumps(payload, indent=2, sort_keys=True) + "\n"
+
+
+def _load_translation_candidate(source_path: Path) -> TranslationCandidate:
+    return TranslationCandidate.model_validate_json(source_path.read_bytes())
+
+
+def _resolved_srt_output_path(source_path: Path, output_path: str | Path | None) -> Path:
+    if output_path is not None:
+        return Path(output_path).expanduser().resolve()
+    if source_path.suffix:
+        return source_path.with_suffix(".srt")
+    return source_path.with_name(f"{source_path.name}.srt")
 
 
 def _resolved_reference_transcript_format(request: RunJobRequest) -> Literal["srt"] | None:

@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 
+from translation_agent.api import convert_translation_json_to_srt
 from translation_agent.config import (
     Settings,
     load_settings,
@@ -696,6 +697,32 @@ def test_real_mode_assemblyai_and_deepgram_subset_publishes_selected_provider_ar
     assert blob_store.exists(job_path(job, "raw", "provider-payloads", "deepgram.json"))
     assert not blob_store.exists(job_path(job, "raw", "provider-payloads", "speechmatics.json"))
     assert blob_store.exists(job_path(job, "published", "translation.json"))
+
+
+def test_convert_translation_json_to_srt_matches_published_export_regression(
+    tmp_path: Path,
+) -> None:
+    job = _job_context(job_id="job-convert-regression")
+    final_state, blob_store = _run_workflow(
+        tmp_path,
+        run_id="run-convert-regression",
+        scenario="happy",
+        job=job,
+    )
+
+    assert final_state.translation_failed is False
+    assert final_state.human_review_required is False
+
+    source_path = blob_store.root / job_path(job, "published", "translation.json")
+    rebuilt_output = tmp_path / "rebuilt" / "translation.srt"
+    result = convert_translation_json_to_srt(source_path, rebuilt_output)
+    published_output = blob_store.root / job_path(job, "exports", "translation.srt")
+
+    assert result.output_path == rebuilt_output.resolve()
+    assert result.subtitle_count > 0
+    assert rebuilt_output.read_text(encoding="utf-8") == published_output.read_text(
+        encoding="utf-8"
+    )
 
 
 def test_real_mode_single_selected_provider_failure_raises_expected_error_regression(

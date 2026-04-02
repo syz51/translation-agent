@@ -6,8 +6,6 @@ import json
 from pathlib import Path
 from typing import Any
 
-import pysubs2
-
 from translation_agent.graph.runtime import WorkflowRuntime
 from translation_agent.graph.state import GraphState
 from translation_agent.models import (
@@ -26,6 +24,7 @@ from translation_agent.nodes.common import (
     write_model_artifact,
 )
 from translation_agent.storage import job_path
+from translation_agent.subtitles import render_translation_srt
 
 
 def publish_outputs(state: GraphState, runtime: WorkflowRuntime) -> tuple[PublishedArtifacts, str]:
@@ -97,7 +96,7 @@ def publish_outputs(state: GraphState, runtime: WorkflowRuntime) -> tuple[Publis
 
     export_refs: tuple[str, ...]
     if translation is not None and not state.human_review_required:
-        _write_srt(runtime, export_srt_ref, _render_export_srt(translation))
+        _write_srt(runtime, export_srt_ref, render_translation_srt(translation))
         export_refs = (export_srt_ref, export_json_ref)
     else:
         runtime.blob_store.delete(export_srt_ref)
@@ -281,20 +280,6 @@ def _export_payload(
         "trace_refs": list(trace_refs),
         "status": _delivery_status(state),
     }
-
-
-def _render_export_srt(translation: TranslationCandidate) -> str:
-    subtitles = pysubs2.SSAFile()
-    subtitles.events = [
-        pysubs2.SSAEvent(
-            start=segment.start_ms,
-            end=segment.end_ms,
-            text=target_text,
-        )
-        for segment in translation.segments
-        if (target_text := (segment.target_text or "").strip())
-    ]
-    return subtitles.to_string("srt")
 
 
 def _decision[ModelT: FinalTranscriptDecision | FinalTranslationDecision](
