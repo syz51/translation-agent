@@ -7,8 +7,10 @@
   "job_id": "job-123",
   "run_id": "<run_id>",
   "source": "input.wav",
+  "source_language": "en",
   "state_backend": "postgres",
   "state_db_target": "<state_db_target>",
   "status": "completed",
+  "target_language": "zh",
   "trace_path": "<trace_path>"
 }

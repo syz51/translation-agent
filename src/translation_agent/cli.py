@@ -44,6 +44,8 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["none", "evaluate_and_regenerate"],
         default="none",
     )
+    run_parser.add_argument("--source-language")
+    run_parser.add_argument("--target-language")
     run_parser.add_argument("--json", action="store_true", dest="as_json")
     return parser
 
@@ -117,15 +119,19 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "run-job":
+        settings = load_settings()
         result = run_job(
             RunJobRequest(
                 source=args.source,
                 job_id=args.job_id,
                 asset_id=args.asset_id,
+                source_language=args.source_language,
+                target_language=args.target_language,
                 reference_transcript_source=args.reference_transcript_source,
                 reference_transcript_format=args.reference_transcript_format,
                 reference_mode=args.reference_mode,
-            )
+            ),
+            settings=settings,
         )
         payload = {
             key: str(value) if hasattr(value, "__fspath__") else value
@@ -136,6 +142,8 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print(result.run_id)
             print(result.status)
+            print(f"source_language: {result.source_language}")
+            print(f"target_language: {result.target_language}")
             print(f"{result.state_backend}: {result.state_db_target}")
             print(result.trace_path)
             if result.default_output_path is not None:

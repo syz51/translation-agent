@@ -7,7 +7,7 @@
 `translation_agent.cli` exposes:
 
 - `translation-agent validate-config [--json]`
-- `translation-agent run-job <source> [--job-id <id>] [--json]`
+- `translation-agent run-job <source> [--job-id <id>] [--source-language <code>] [--target-language <code>] [--json]`
 
 ### Python API
 
@@ -30,6 +30,7 @@ The most important current settings are:
 - fake versus real adapter mode
 - provider credentials
 - retry, timeout, and polling controls
+- default source and target languages
 - translation model ID and prompt version
 
 Configuration validation returns a `ValidationResult` with:
@@ -412,6 +413,8 @@ The API and CLI result contract includes:
 - `job_id`
 - `status`
 - `source`
+- `source_language`
+- `target_language`
 - `blob_root`
 - `trace_path`
 - `state_backend`

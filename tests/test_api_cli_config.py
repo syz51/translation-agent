@@ -41,7 +41,7 @@ def _job_context(job_id: str = "job-123") -> JobContext:
         tenant_id="tenant-local",
         project_id="project-local",
         source_video_ref="input.mp4",
-        target_language="fr",
+        target_language="zh",
         source_language="en",
         requested_by="system@local",
         created_at=datetime(2026, 3, 31, 0, 0, tzinfo=UTC),
@@ -127,6 +127,7 @@ def _configure_real_mode_env(
 @pytest.mark.unit
 def test_load_settings_reads_environment(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setenv("TA_DATA_DIR", str(tmp_path / "runtime"))
+    monkeypatch.setenv("TA_DEFAULT_TARGET_LANGUAGE", "ja")
     monkeypatch.setenv(
         "TA_STATE_DB_DSN",
         "postgresql://user:secret@db.example.com:5432/translation_agent?sslmode=require",
@@ -137,6 +138,7 @@ def test_load_settings_reads_environment(monkeypatch, tmp_path: Path) -> None:
     assert settings.data_dir == tmp_path / "runtime"
     assert settings.blob_dir == settings.data_dir / "blobs"
     assert settings.trace_dir == settings.data_dir / "traces"
+    assert settings.default_target_language == "ja"
     assert settings.state_db_dsn == (
         "postgresql://user:secret@db.example.com:5432/translation_agent?sslmode=require"
     )
@@ -562,11 +564,13 @@ def test_cli_run_job_plain_output_reports_run_status_and_trace(
         / job_path(_job_context("job-plain"), "exports", "translation.srt")
     ).resolve()
     assert exit_code == 0
-    assert len(lines) == 5
+    assert len(lines) == 7
     assert lines[1] == "completed"
-    assert lines[2] == f"sqlite: {(tmp_path / 'runtime' / 'state.sqlite3').resolve()}"
-    assert Path(lines[3]).exists()
-    assert lines[4] == f"default_output_path: {default_output_path}"
+    assert lines[2] == "source_language: en"
+    assert lines[3] == "target_language: zh"
+    assert lines[4] == f"sqlite: {(tmp_path / 'runtime' / 'state.sqlite3').resolve()}"
+    assert Path(lines[5]).exists()
+    assert lines[6] == f"default_output_path: {default_output_path}"
 
 
 @pytest.mark.unit
@@ -582,6 +586,8 @@ def test_cli_run_job_json_includes_default_output_path(
 
     payload = json.loads(capsys.readouterr().out)
     assert exit_code == 0
+    assert payload["source_language"] == "en"
+    assert payload["target_language"] == "zh"
     assert payload["default_output_path"] == str(
         (
             tmp_path
@@ -603,11 +609,13 @@ def test_cli_run_job_plain_output_reports_failure_details(
     trace_path.write_text("", encoding="utf-8")
     monkeypatch.setattr(
         "translation_agent.cli.run_job",
-        lambda request: RunJobResult(
+        lambda request, settings=None: RunJobResult(
             run_id="run-failed",
             job_id=request.job_id or "job-failed",
             status="translation_failed",
             source=request.source,
+            source_language=request.source_language or "en",
+            target_language=request.target_language or "zh",
             blob_root=tmp_path / "runtime" / "blobs",
             trace_path=trace_path,
             state_backend="sqlite",
@@ -628,6 +636,8 @@ def test_cli_run_job_plain_output_reports_failure_details(
     assert lines == [
         "run-failed",
         "translation_failed",
+        "source_language: en",
+        "target_language: zh",
         f"sqlite: {(tmp_path / 'runtime' / 'state.sqlite3').resolve()}",
         str(trace_path),
         "All translation variants failed; transcript preserved for recovery.",
@@ -672,6 +682,8 @@ def test_run_job_bootstraps_local_artifacts_and_postgres_record(
     result = run_job(RunJobRequest(source="input.mp4", job_id="job-123"))
 
     assert result.status == "completed"
+    assert result.source_language == "en"
+    assert result.target_language == "zh"
     assert result.blob_root.exists()
     assert result.trace_path.exists()
     assert (
@@ -707,6 +719,33 @@ def test_run_job_bootstraps_local_artifacts_and_postgres_record(
     assert record.output_data is not None
     assert record.output_data["final_stage"] == "finalize_outputs"
     assert len(node_executions) == 13
+
+
+@pytest.mark.unit
+def test_run_job_uses_configured_default_target_language(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("TA_DATA_DIR", str(tmp_path / "runtime"))
+    monkeypatch.setenv("TA_DEFAULT_TARGET_LANGUAGE", "zh")
+    monkeypatch.delenv("TA_STATE_DB_DSN", raising=False)
+
+    result = run_job(RunJobRequest(source="input.mp4", job_id="job-default-target"))
+    request_payload = json.loads(
+        (result.blob_root / "jobs" / f"{result.run_id}-request.json").read_text(encoding="utf-8")
+    )
+
+    assert request_payload["source_language"] == "en"
+    assert request_payload["target_language"] == "zh"
+    assert result.source_language == "en"
+    assert result.target_language == "zh"
+    assert (
+        result.default_output_path
+        == (
+            result.blob_root
+            / Path(job_path(_job_context("job-default-target"), "exports", "translation.srt"))
+        ).resolve()
+    )
 
 
 @pytest.mark.integration
@@ -763,6 +802,8 @@ def test_run_job_defaults_to_local_sqlite_runtime(
     result = run_job(RunJobRequest(source="input.mp4", job_id="job-local"))
 
     assert result.status == "completed"
+    assert result.source_language == "en"
+    assert result.target_language == "zh"
     assert result.state_backend == "sqlite"
     assert result.state_db_target == str((tmp_path / "runtime" / "state.sqlite3").resolve())
     assert result.failure_ref is None
@@ -888,6 +929,8 @@ def test_run_job_returns_translation_failure_details(
     )
 
     assert result.status == "translation_failed"
+    assert result.source_language == "en"
+    assert result.target_language == "zh"
     assert result.default_output_path is None
     assert result.failure_ref == str(
         job_path(_job_context("job-translation-failed"), "published", "translation-failed.json")
@@ -918,6 +961,8 @@ def test_run_job_human_review_required_leaves_default_output_path_unset(
     )
 
     assert result.status == "human_review_required"
+    assert result.source_language == "en"
+    assert result.target_language == "zh"
     assert result.default_output_path is None
 
 
@@ -1070,8 +1115,10 @@ def test_cli_run_job_json(migrated_postgres_dsn: str, monkeypatch, tmp_path: Pat
     assert exit_code == 0
     assert payload["job_id"] == "job-123"
     assert payload["status"] == "completed"
+    assert payload["source_language"] == "en"
     assert payload["state_backend"] == "postgres"
     assert payload["state_db_target"] == sanitize_db_target(migrated_postgres_dsn)
+    assert payload["target_language"] == "zh"
     assert payload["failure_ref"] is None
     assert payload["failure_summary"] is None
     assert payload["failure_reasons"] == []
@@ -1083,3 +1130,40 @@ def test_cli_run_job_json(migrated_postgres_dsn: str, monkeypatch, tmp_path: Pat
 
     assert record is not None
     assert len(node_executions) == 13
+
+
+@pytest.mark.unit
+def test_cli_run_job_language_flags_override_config_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("TA_DATA_DIR", str(tmp_path / "runtime"))
+    monkeypatch.setenv("TA_DEFAULT_SOURCE_LANGUAGE", "en")
+    monkeypatch.setenv("TA_DEFAULT_TARGET_LANGUAGE", "zh")
+    monkeypatch.delenv("TA_STATE_DB_DSN", raising=False)
+
+    exit_code = main(
+        [
+            "run-job",
+            "input.wav",
+            "--job-id",
+            "job-cli-ja",
+            "--target-language",
+            "ja",
+            "--json",
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    request_payload = json.loads(
+        (Path(payload["blob_root"]) / "jobs" / f"{payload['run_id']}-request.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert exit_code == 0
+    assert payload["source_language"] == "en"
+    assert payload["target_language"] == "ja"
+    assert request_payload["source_language"] == "en"
+    assert request_payload["target_language"] == "ja"

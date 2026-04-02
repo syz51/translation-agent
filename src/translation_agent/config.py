@@ -70,6 +70,8 @@ class Settings(BaseSettings):
     deepgram_base_url: str = "https://api.deepgram.com/v1/listen"
     openai_api_key: str | None = None
     openai_base_url: str = "https://api.openai.com/v1/responses"
+    default_source_language: str = "en"
+    default_target_language: str = "zh"
     translation_model_id: str = "gpt-5.4-mini"
     translation_prompt_version: str = "phase-3-v1"
 

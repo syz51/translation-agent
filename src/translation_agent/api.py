@@ -35,8 +35,8 @@ class RunJobRequest:
     metadata: dict[str, str] = field(default_factory=dict)
     tenant_id: str = "tenant-local"
     project_id: str = "project-local"
-    target_language: str = "fr"
-    source_language: str = "en"
+    target_language: str | None = None
+    source_language: str | None = None
     requested_by: str = "system@local"
     profile_ref: str | None = "profiles/default"
     asset_id: str | None = None
@@ -51,6 +51,8 @@ class RunJobResult:
     job_id: str
     status: str
     source: str
+    source_language: str
+    target_language: str
     blob_root: Path
     trace_path: Path
     default_output_path: Path | None = None
@@ -89,6 +91,7 @@ def run_job(request: RunJobRequest, settings: Settings | None = None) -> RunJobR
     run_id = uuid4().hex
     job_id = request.job_id or run_id
     now = datetime.now(UTC)
+    source_language, target_language = _resolved_job_languages(request, settings)
     reference_transcript_format = _resolved_reference_transcript_format(request)
     media_fingerprint = compute_media_fingerprint(request.source)
     normalized_asset_id = _normalized_optional_identifier(request.asset_id)
@@ -102,16 +105,16 @@ def run_job(request: RunJobRequest, settings: Settings | None = None) -> RunJobR
             asset_id=normalized_asset_id,
             media_fingerprint=media_fingerprint,
             first_seen_run_id=run_id,
-            source_language=request.source_language,
-            target_language=request.target_language,
+            source_language=source_language,
+            target_language=target_language,
         )
         job = JobContext(
             job_id=job_id,
             tenant_id=request.tenant_id,
             project_id=request.project_id,
             source_video_ref=request.source,
-            target_language=request.target_language,
-            source_language=request.source_language,
+            target_language=target_language,
+            source_language=source_language,
             requested_by=request.requested_by,
             created_at=now,
             profile_ref=request.profile_ref,
@@ -124,7 +127,12 @@ def run_job(request: RunJobRequest, settings: Settings | None = None) -> RunJobR
         )
         manifest_entry = blob_store.put_bytes(
             f"jobs/{run_id}-request.json",
-            _serialize_request(request, now).encode("utf-8"),
+            _serialize_request(
+                request,
+                now,
+                source_language=source_language,
+                target_language=target_language,
+            ).encode("utf-8"),
         )
         run_store.create_run(
             run_id=run_id,
@@ -288,6 +296,8 @@ def run_job(request: RunJobRequest, settings: Settings | None = None) -> RunJobR
         job_id=job_id,
         status=final_status,
         source=request.source,
+        source_language=final_state.job.source_language,
+        target_language=final_state.job.target_language,
         blob_root=blob_dir,
         state_backend=validation.state_backend,
         state_db_target=validation.state_db_target,
@@ -328,7 +338,13 @@ def _open_operational_store(
     return SQLiteOperationalStore(settings.state_db_path)
 
 
-def _serialize_request(request: RunJobRequest, created_at: datetime) -> str:
+def _serialize_request(
+    request: RunJobRequest,
+    created_at: datetime,
+    *,
+    source_language: str,
+    target_language: str,
+) -> str:
     payload = {
         "source": request.source,
         "job_id": request.job_id,
@@ -336,8 +352,8 @@ def _serialize_request(request: RunJobRequest, created_at: datetime) -> str:
         "metadata": request.metadata,
         "tenant_id": request.tenant_id,
         "project_id": request.project_id,
-        "target_language": request.target_language,
-        "source_language": request.source_language,
+        "target_language": target_language,
+        "source_language": source_language,
         "requested_by": request.requested_by,
         "profile_ref": request.profile_ref,
         "asset_id": request.asset_id,
@@ -370,6 +386,13 @@ def _resolved_reference_transcript_format(request: RunJobRequest) -> Literal["sr
     if request.reference_mode == "none":
         return request.reference_transcript_format or "srt"
     return request.reference_transcript_format or "srt"
+
+
+def _resolved_job_languages(request: RunJobRequest, settings: Settings) -> tuple[str, str]:
+    return (
+        request.source_language or settings.default_source_language,
+        request.target_language or settings.default_target_language,
+    )
 
 
 def _upsert_current_run_link(

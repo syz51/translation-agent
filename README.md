@@ -54,6 +54,7 @@ Notes:
 ```bash
 uv run translation-agent validate-config --json
 uv run translation-agent run-job input.wav --job-id demo --json
+uv run translation-agent run-job input.wav --job-id demo-zh --target-language zh --json
 uv run translation-agent convert-json-to-srt .translation-agent/blobs/.../published/translation.json
 ```
 
@@ -152,6 +153,7 @@ It verifies:
 ```bash
 uv run translation-agent run-job input.wav --job-id demo
 uv run translation-agent run-job input.wav --job-id demo --json
+uv run translation-agent run-job input.wav --job-id demo-ja --target-language ja --json
 ```
 
 The public result payload contains:
@@ -160,6 +162,8 @@ The public result payload contains:
 - `job_id`
 - `status`
 - `source`
+- `source_language`
+- `target_language`
 - `blob_root`
 - `trace_path`
 - `state_backend`
@@ -198,7 +202,7 @@ result = run_job(
         tenant_id="tenant-local",
         project_id="project-local",
         source_language="en",
-        target_language="fr",
+        target_language="zh",
     )
 )
 
@@ -280,6 +284,8 @@ The settings model accepts more fields than most users need. These are the ones 
 | `TA_SPEECHMATICS_API_KEY` | Speechmatics credential for real mode |
 | `TA_DEEPGRAM_API_KEY` | Deepgram credential for real mode |
 | `TA_OPENAI_API_KEY` | OpenAI credential for real mode |
+| `TA_DEFAULT_SOURCE_LANGUAGE` | default source language for API and CLI runs when omitted |
+| `TA_DEFAULT_TARGET_LANGUAGE` | default target language for API and CLI runs when omitted |
 | `TA_TRANSLATION_MODEL_ID` | translation model ID for real mode |
 | `TA_TRANSLATION_PROMPT_VERSION` | translation prompt version recorded in outputs |
 
