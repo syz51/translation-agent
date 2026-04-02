@@ -298,6 +298,12 @@ def test_phase_five_translation_failure_publishes_recoverable_manifest(tmp_path:
     scorecard = json.loads(
         blob_store.read_bytes(_artifact_path("published", "scorecard.json")).decode("utf-8")
     )
+    export_payload = json.loads(
+        blob_store.read_bytes(_artifact_path("exports", "translation.json")).decode("utf-8")
+    )
+    delivery_payload = json.loads(
+        blob_store.read_bytes(_artifact_path("deliveries", "translation.json")).decode("utf-8")
+    )
     assert failure_manifest["failure_summary"] == (
         "All translation variants failed; transcript preserved for recovery."
     )
@@ -306,6 +312,8 @@ def test_phase_five_translation_failure_publishes_recoverable_manifest(tmp_path:
         "variant-b: simulated translation failure for variant-b",
     ]
     assert scorecard["translation_failed"] is True
+    assert export_payload["status"] == "translation_failed"
+    assert delivery_payload["status"] == "translation_failed"
 
 
 def test_phase_five_translation_failure_manifest_dedupes_duplicate_reasons(tmp_path: Path) -> None:

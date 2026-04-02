@@ -1187,19 +1187,12 @@ def test_openai_translation_adapter_rejects_partial_segment_payloads(tmp_path: P
             Segment(
                 segment_id="seg-1",
                 start_ms=0,
-                end_ms=900,
+                end_ms=1800,
                 speaker="speaker-1",
                 source_text="Hello world",
             ),
-            Segment(
-                segment_id="seg-2",
-                start_ms=900,
-                end_ms=1800,
-                speaker="speaker-1",
-                source_text="Goodbye world",
-            ),
         ),
-        full_text="Hello world Goodbye world",
+        full_text="Hello world",
         speaker_map={"speaker-1": "speaker-1"},
         timing_resolution="segment",
         raw_payload_ref=_artifact_path("raw", "provider-payloads", "assemblyai.json"),
@@ -1212,13 +1205,8 @@ def test_openai_translation_adapter_rejects_partial_segment_payloads(tmp_path: P
                 {
                     "output_text": json.dumps(
                         {
-                            "full_text": "Bonjour le monde Au revoir le monde",
-                            "segments": [
-                                {
-                                    "segment_id": "seg-1",
-                                    "target_text": "Bonjour le monde",
-                                }
-                            ],
+                            "full_text": "Bonjour le monde",
+                            "segments": [],
                         }
                     )
                 }

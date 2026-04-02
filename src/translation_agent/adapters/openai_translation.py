@@ -276,6 +276,7 @@ class OpenAITranslationAdapter:
         prompt_variant_id: str,
         request_context: RequestContext,
     ) -> _ChunkExecutionResult:
+        raw_payload: dict[str, Any] | None = None
         try:
             raw_payload = perform_with_retries(
                 lambda: self._generate_once(chunk, prompt_variant_id, request_context),
@@ -283,6 +284,8 @@ class OpenAITranslationAdapter:
                 retry_policy=self._retry_policy,
                 sleep=self._sleep,
             )
+            translation_payload = _extract_translation_payload(raw_payload)
+            chunk_result = _chunk_translation_from_payload(translation_payload, chunk=chunk)
         except AdapterError as exc:
             if _should_split_chunk(chunk, exc):
                 left_chunk, right_chunk = _split_chunk(
@@ -301,7 +304,12 @@ class OpenAITranslationAdapter:
                 )
                 fallback_record = _chunk_attempt_record(
                     chunk,
-                    status="split_after_retryable_failure",
+                    status=(
+                        "split_after_retryable_failure"
+                        if exc.retryable
+                        else "split_after_validation_failure"
+                    ),
+                    response=raw_payload,
                     error=exc,
                     fallback_children=(left_chunk.chunk_key, right_chunk.chunk_key),
                 )
@@ -313,9 +321,6 @@ class OpenAITranslationAdapter:
                     response_ids=(*left_result.response_ids, *right_result.response_ids),
                 )
             raise
-
-        translation_payload = _extract_translation_payload(raw_payload)
-        chunk_result = _chunk_translation_from_payload(translation_payload, chunk=chunk)
         response_id = _provider_request_id(raw_payload)
         response_ids = (response_id,) if response_id is not None else ()
         return _ChunkExecutionResult(
@@ -505,7 +510,13 @@ def _chunk_transcript(
 
 
 def _should_split_chunk(chunk: _TranslationChunk, error: AdapterError) -> bool:
-    return error.retryable and len(chunk.segments) > 1
+    if len(chunk.segments) <= 1:
+        return False
+    if error.retryable:
+        return True
+    return error.category == "malformed_response" and str(error).startswith(
+        "translation payload was missing segment translations"
+    )
 
 
 def _split_chunk(

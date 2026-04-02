@@ -265,6 +265,89 @@ def test_openai_translation_adapter_splits_retryable_failed_chunks(
     assert stored_payload["chunks"][0]["fallback_children"] == ["chunk-0.a", "chunk-0.b"]
 
 
+def test_openai_translation_adapter_splits_partial_segment_coverage_chunks(
+    tmp_path: Path,
+) -> None:
+    blob_store = LocalBlobStore(tmp_path / "blobs")
+    transcript = _transcript_candidate()
+    transport = SequencedTransport(
+        [
+            _json_response(
+                {
+                    "id": "resp-parent",
+                    "output_text": json.dumps(
+                        {
+                            "full_text": "Bonjour alpha",
+                            "segments": [
+                                {"segment_id": "seg-1", "target_text": "Bonjour alpha"},
+                            ],
+                        }
+                    ),
+                }
+            ),
+            _json_response(
+                {
+                    "id": "resp-left",
+                    "output_text": json.dumps(
+                        {
+                            "full_text": "Bonjour alpha",
+                            "segments": [
+                                {"segment_id": "seg-1", "target_text": "Bonjour alpha"},
+                            ],
+                        }
+                    ),
+                }
+            ),
+            _json_response(
+                {
+                    "id": "resp-right",
+                    "output_text": json.dumps(
+                        {
+                            "full_text": "Bonjour beta Bonjour gamma",
+                            "segments": [
+                                {"segment_id": "seg-2", "target_text": "Bonjour beta"},
+                                {"segment_id": "seg-3", "target_text": "Bonjour gamma"},
+                            ],
+                        }
+                    ),
+                }
+            ),
+        ]
+    )
+    adapter = OpenAITranslationAdapter(
+        api_key="test-key",  # pragma: allowlist secret
+        blob_store=blob_store,
+        transport=transport,
+        retry_policy=RetryPolicy(max_attempts=1),
+        sleep=lambda _: None,
+        max_chunk_characters=200,
+        max_chunk_segments=10,
+        context_segment_window=1,
+    )
+
+    candidate = adapter.generate_translation(transcript, "variant-a", _request_context())
+
+    assert len(transport.requests) == 3
+    assert [segment.target_text for segment in candidate.segments] == [
+        "Bonjour alpha",
+        "Bonjour beta",
+        "Bonjour gamma",
+    ]
+    assert candidate.metadata["chunking"]["chunk_count"] == 2
+    assert candidate.metadata["chunking"]["response_count"] == 2
+    assert candidate.raw_response_ref is not None
+
+    stored_payload = json.loads(blob_store.read_bytes(candidate.raw_response_ref).decode("utf-8"))
+    assert stored_payload["chunking"]["planned_chunk_count"] == 1
+    assert stored_payload["chunking"]["executed_request_count"] == 2
+    assert stored_payload["chunks"][0]["status"] == "split_after_validation_failure"
+    assert stored_payload["chunks"][0]["fallback_children"] == ["chunk-0.a", "chunk-0.b"]
+    assert stored_payload["chunks"][0]["error"]["message"].startswith(
+        "translation payload was missing segment translations"
+    )
+    assert stored_payload["chunks"][0]["response"]["id"] == "resp-parent"
+
+
 def test_openai_translation_adapter_preserves_chunk_order_under_parallel_completion(
     tmp_path: Path,
 ) -> None:

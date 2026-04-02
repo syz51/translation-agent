@@ -360,10 +360,10 @@ def _translation_failure_reasons(state: GraphState) -> list[str]:
 def _delivery_status(state: GraphState) -> str:
     if state.approval_ref is not None:
         return "completed_after_human_review"
-    if state.human_review_required:
-        return "human_review_required"
     if state.translation_failed:
         return "translation_failed"
+    if state.human_review_required:
+        return "human_review_required"
     return "completed"
 
 
