@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from translation_agent.graph.runtime import WorkflowRuntime
 from translation_agent.graph.state import GraphState, RoutingFact
+from translation_agent.memory.recall import build_scope_key
 from translation_agent.models import MemoryWriteBatch
 from translation_agent.nodes.common import (
     memory_batch_key,
@@ -188,11 +189,45 @@ def _scoped_batch(
 ) -> MemoryWriteBatch:
     scope_key = operational_job_key(state.job)
     scope_token = job_scope_token(state.job)
+    memory_scope_kind = "pair"
+    memory_scope_key = build_scope_key(
+        scope_kind=memory_scope_kind,
+        tenant_id=state.job.tenant_id,
+        project_id=state.job.project_id,
+        source_language=state.job.source_language,
+        target_language=state.job.target_language,
+    )
     return batch.model_copy(
         update={
             "batch_id": f"{batch.batch_id}-{scope_token}",
             "decision_ref": decision_ref,
-            "dedupe_keys": tuple(f"{scope_key}::{key}" for key in batch.dedupe_keys),
+            "semantic_writes": tuple(
+                write.model_copy(
+                    update={
+                        "scope_kind": memory_scope_kind,
+                        "scope_key": memory_scope_key,
+                    }
+                )
+                for write in batch.semantic_writes
+            ),
+            "episodic_writes": tuple(
+                write.model_copy(
+                    update={
+                        "scope_kind": memory_scope_kind,
+                        "scope_key": memory_scope_key,
+                    }
+                )
+                for write in batch.episodic_writes
+            ),
+            "procedural_writes": tuple(
+                write.model_copy(
+                    update={
+                        "scope_kind": memory_scope_kind,
+                        "scope_key": memory_scope_key,
+                    }
+                )
+                for write in batch.procedural_writes
+            ),
             "metadata": {
                 **batch.metadata,
                 "tenant_id": state.job.tenant_id,
@@ -200,6 +235,8 @@ def _scoped_batch(
                 "source_language": state.job.source_language,
                 "target_language": state.job.target_language,
                 "job_scope_key": scope_key,
+                "scope_kind": memory_scope_kind,
+                "scope_key": memory_scope_key,
             },
         }
     )

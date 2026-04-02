@@ -18,7 +18,9 @@ from .prompts import (
     adjudication_memory_bundle,
     build_review_context,
     build_review_prompt,
+    build_structured_review,
     render_reviewer_output,
+    review_bundle_from_draft,
     reviewer_roles_for_stage,
     scoped_memory_bundle,
 )
@@ -37,11 +39,13 @@ __all__ = [
     "adjudicate_reviews",
     "adjudication_memory_bundle",
     "assess_review_disagreement",
+    "build_structured_review",
     "build_review_context",
     "build_review_prompt",
     "content_risk_class_for_scenario",
     "parse_reviewer_output",
     "render_reviewer_output",
+    "review_bundle_from_draft",
     "reviewer_roles_for_stage",
     "scoped_memory_bundle",
 ]

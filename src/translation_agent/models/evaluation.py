@@ -5,10 +5,11 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Annotated, Any
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from .base import ContractModel
 from .jobs import ReferenceTranscriptFormat
+from .memory import PromptCompatibilityTuple, ProposalAggregateMetrics
 
 NonEmptyStr = Annotated[str, Field(min_length=1)]
 
@@ -67,6 +68,14 @@ class HistoricalRunLink(ContractModel):
     translation_decision_ref: str | None = None
     evaluation_report_ref: str | None = None
     regenerated_draft_ref: str | None = None
+    translation_model_id: str | None = None
+    translation_prompt_variant_id: str | None = None
+    translation_base_prompt_version: str | None = None
+    translation_effective_prompt_version: str | None = None
+    prompt_scope_kind: str | None = None
+    prompt_scope_key: str | None = None
+    prompt_resolution_mode: str | None = None
+    prompt_proposal_id: str | None = None
 
 
 class TranscriptMismatchSpan(ContractModel):
@@ -98,18 +107,39 @@ class TranscriptAlignmentReport(ContractModel):
 
 
 class TranslationScore(ContractModel):
-    """Deterministic translation scoring driven by the trusted source transcript."""
+    """Multilingual-safe translation scoring driven by a trusted source transcript."""
 
     run_id: NonEmptyStr
     translation_ref: str | None = None
     trusted_transcript_ref: NonEmptyStr
-    faithfulness: float = Field(ge=0.0, le=1.0)
+    faithfulness_judge: float = Field(ge=0.0, le=1.0)
+    segment_coverage: float = Field(ge=0.0, le=1.0)
+    entity_consistency: float = Field(ge=0.0, le=1.0)
+    numeric_date_unit_consistency: float = Field(ge=0.0, le=1.0)
+    glossary_compliance: float = Field(ge=0.0, le=1.0)
     omission_risk: float = Field(ge=0.0, le=1.0)
     addition_risk: float = Field(ge=0.0, le=1.0)
-    terminology_consistency: float = Field(ge=0.0, le=1.0)
-    named_entity_preservation: float = Field(ge=0.0, le=1.0)
-    repeated_failure_terms: tuple[str, ...] = ()
+    fluency_judge: float | None = Field(default=None, ge=0.0, le=1.0)
+    primary_quality_score: float = Field(ge=0.0, le=1.0)
+    severe_failure_bucket: bool = False
     notes: tuple[str, ...] = ()
+    faithfulness: float | None = Field(default=None, ge=0.0, le=1.0)
+    terminology_consistency: float | None = Field(default=None, ge=0.0, le=1.0)
+    named_entity_preservation: float | None = Field(default=None, ge=0.0, le=1.0)
+    repeated_failure_terms: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def backfill_legacy_scores(self) -> TranslationScore:
+        updates: dict[str, object] = {}
+        if self.faithfulness is None:
+            updates["faithfulness"] = self.faithfulness_judge
+        if self.terminology_consistency is None:
+            updates["terminology_consistency"] = self.glossary_compliance
+        if self.named_entity_preservation is None:
+            updates["named_entity_preservation"] = self.entity_consistency
+        if updates:
+            return self.model_copy(update=updates)
+        return self
 
 
 class EvaluatedRunReport(ContractModel):
@@ -118,6 +148,12 @@ class EvaluatedRunReport(ContractModel):
     run: HistoricalRunLink
     transcript: TranscriptAlignmentReport | None = None
     translation: TranslationScore | None = None
+
+
+class EvaluationFailure(ContractModel):
+    stage: NonEmptyStr
+    message: NonEmptyStr
+    recoverable: bool = True
 
 
 class EvaluationReport(ContractModel):
@@ -132,6 +168,10 @@ class EvaluationReport(ContractModel):
     prior_official_translation_refs: tuple[str, ...] = ()
     proposal_refs: tuple[str, ...] = ()
     regenerated_draft_ref: str | None = None
+    failures: tuple[EvaluationFailure, ...] = ()
+    canary_metrics: ProposalAggregateMetrics | None = None
+    control_metrics: ProposalAggregateMetrics | None = None
+    proposal_compatibility: tuple[PromptCompatibilityTuple, ...] = ()
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 

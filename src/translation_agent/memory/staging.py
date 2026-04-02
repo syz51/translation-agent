@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Protocol, runtime_checkable
 
+from translation_agent.memory.recall import build_scope_key
 from translation_agent.models import (
     EvaluationReport,
     FinalTranscriptDecision,
@@ -42,8 +44,11 @@ class DeterministicMemoryStagingBackend:
         *,
         source_stage: str,
     ) -> MemoryWriteBatch:
+        now = datetime.now(UTC)
         dedupe_keys: list[str] = []
         semantic_writes: tuple[MemoryWrite, ...] = ()
+        scope_kind = "pair"
+        scope_key = _scope_key_from_metadata(decision, scope_kind=scope_kind)
         if decision.winner_candidate_id is not None:
             semantic_key = (
                 f"semantic:{source_stage}:{decision.job_id}:{decision.winner_candidate_id}"
@@ -53,6 +58,10 @@ class DeterministicMemoryStagingBackend:
                 MemoryWrite(
                     kind="semantic",
                     content=_semantic_summary(decision, source_stage=source_stage),
+                    scope_kind=scope_kind,
+                    scope_key=scope_key,
+                    updated_at=now,
+                    score=_score_for_decision(decision),
                     source_ref=decision.investigation_ref or decision.review_refs[0]
                     if decision.review_refs
                     else None,
@@ -81,6 +90,10 @@ class DeterministicMemoryStagingBackend:
                         "Strengthen terminology preservation and named-entity stability for "
                         "approved translation outcomes."
                     ),
+                    scope_kind=scope_kind,
+                    scope_key=scope_key,
+                    updated_at=now,
+                    score=_score_for_decision(decision),
                     source_ref=decision.investigation_ref or decision.review_refs[0]
                     if decision.review_refs
                     else None,
@@ -118,10 +131,14 @@ class DeterministicMemoryStagingBackend:
                 MemoryWrite(
                     kind="episodic",
                     content=decision.rationale_summary,
+                    scope_kind=scope_kind,
+                    scope_key=scope_key,
+                    updated_at=now,
+                    score=_score_for_decision(decision),
                     source_ref=decision.investigation_ref or decision.review_refs[0]
                     if decision.review_refs
                     else None,
-                    metadata={"dedupe_key": episodic_key},
+                    metadata={"dedupe_key": episodic_key, "event_id": batch_event_id(decision)},
                 ),
             ),
             procedural_writes=procedural_writes,
@@ -134,12 +151,29 @@ class DeterministicMemoryStagingBackend:
         *,
         proposals: tuple[PromptEvolutionProposal, ...],
     ) -> MemoryWriteBatch | None:
+        now = datetime.now(UTC)
         if not report.recurring_failure_patterns and not proposals:
             return None
+        source_language = _report_metadata_string(report.metadata, "source_language") or "unknown"
+        target_language = _report_metadata_string(report.metadata, "target_language") or "unknown"
+        tenant_id = _report_metadata_string(report.metadata, "tenant_id") or "unknown"
+        project_id = _report_metadata_string(report.metadata, "project_id") or "unknown"
+        scope_kind = "pair"
+        scope_key = build_scope_key(
+            scope_kind=scope_kind,
+            tenant_id=tenant_id,
+            project_id=project_id,
+            source_language=source_language,
+            target_language=target_language,
+        )
         semantic_writes = tuple(
             MemoryWrite(
                 kind="semantic",
                 content=f"Reference evaluation observed recurring issue: {pattern}.",
+                scope_kind=scope_kind,
+                scope_key=scope_key,
+                updated_at=now,
+                score=0.7,
                 source_ref=report.trusted_transcript_ref,
                 metadata={"dedupe_key": f"evaluation:{report.media_key}:{pattern}"},
             )
@@ -151,6 +185,10 @@ class DeterministicMemoryStagingBackend:
                 content=proposal.suggested_changes[0].instruction
                 if proposal.suggested_changes
                 else proposal.rationale,
+                scope_kind=scope_kind,
+                scope_key=scope_key,
+                updated_at=now,
+                score=max(proposal.canary_metrics.primary_quality_score, 0.5),
                 source_ref=proposal.evidence_refs[0] if proposal.evidence_refs else None,
                 metadata={
                     "dedupe_key": f"evaluation:{report.media_key}:{proposal.proposal_id}",
@@ -178,14 +216,25 @@ class DeterministicMemoryStagingBackend:
             episodic_writes=(
                 MemoryWrite(
                     kind="episodic",
-                    content="Reference evaluation produced approval-gated learning proposals.",
+                    content="Reference evaluation produced non-blocking learning artifacts.",
+                    scope_kind=scope_kind,
+                    scope_key=scope_key,
+                    updated_at=now,
+                    score=0.65,
                     source_ref=report.trusted_transcript_ref,
-                    metadata={"dedupe_key": episodic_key},
+                    metadata={"dedupe_key": episodic_key, "event_id": report.run_id},
                 ),
             ),
             procedural_writes=procedural_writes,
             dedupe_keys=dedupe_keys + (episodic_key,),
-            metadata={"media_key": report.media_key, "proposal_count": len(proposals)},
+            metadata={
+                "media_key": report.media_key,
+                "proposal_count": len(proposals),
+                "source_language": source_language,
+                "target_language": target_language,
+                "tenant_id": tenant_id,
+                "project_id": project_id,
+            },
         )
 
 
@@ -199,3 +248,30 @@ def _semantic_summary(
         f"{stage_label} trusted {decision.winner_candidate_id} after "
         f"{decision.decision_mode} with {decision.disagreement_bucket} disagreement."
     )
+
+
+def _score_for_decision(
+    decision: FinalTranscriptDecision | FinalTranslationDecision,
+) -> float:
+    return round(max(0.0, min(decision.decision_confidence or 0.5, 0.99)), 4)
+
+
+def batch_event_id(decision: FinalTranscriptDecision | FinalTranslationDecision) -> str:
+    return f"{decision.job_id}:{decision.decision_mode}"
+
+
+def _scope_key_from_metadata(
+    decision: FinalTranscriptDecision | FinalTranslationDecision,
+    *,
+    scope_kind: str,
+) -> str:
+    del decision, scope_kind
+    return "pending-source::pending-target"
+
+
+def _report_metadata_string(metadata: dict[str, object], key: str) -> str | None:
+    value = metadata.get(key)
+    if isinstance(value, str):
+        normalized = value.strip()
+        return normalized or None
+    return None

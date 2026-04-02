@@ -7,7 +7,6 @@ from hashlib import sha256
 from translation_agent.graph.runtime import WorkflowRuntime
 from translation_agent.graph.state import GraphState, RoutingFact
 from translation_agent.models import (
-    CandidatePreference,
     ReviewBundle,
     TranscriptCandidate,
     TranslationCandidate,
@@ -30,8 +29,9 @@ from translation_agent.review import (
     PARSER_VERSION,
     build_review_context,
     build_review_prompt,
-    parse_reviewer_output,
+    build_structured_review,
     render_reviewer_output,
+    review_bundle_from_draft,
     reviewer_roles_for_stage,
 )
 
@@ -204,8 +204,12 @@ def _review_stage(
         prompt_text=prompt_text,
         final_transcript=final_transcript,
     )
-    parsed = parse_reviewer_output(raw_review_text)
-    review = ReviewBundle(
+    draft = build_structured_review(
+        review_context,
+        candidates=candidates,
+        final_transcript=final_transcript,
+    )
+    review = review_bundle_from_draft(
         review_id=_review_id(
             job=state.job,
             stage=stage,
@@ -215,23 +219,9 @@ def _review_stage(
         job_id=state.job.job_id,
         stage=stage,
         reviewer_role=reviewer_role,
-        candidate_preferences=(
-            CandidatePreference(
-                candidate_id=parsed.winner_candidate_id,
-                rank=1,
-                rationale=parsed.why,
-            ),
-        )
-        if parsed.winner_candidate_id is not None
-        else (),
-        confidence=parsed.confidence,
         raw_review_text=raw_review_text,
-        quoted_evidence=parsed.quoted_evidence,
-        issue_categories=tuple(dict.fromkeys(issue.category for issue in parsed.issues)),
-        suggested_fixes=parsed.suggested_fixes,
-        escalation_signal=parsed.escalation_signal,
-        parser_version=PARSER_VERSION,
-    )
+        draft=draft,
+    ).model_copy(update={"parser_version": PARSER_VERSION})
     return _persist_review(runtime, state.job, review)
 
 

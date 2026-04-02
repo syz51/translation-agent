@@ -183,6 +183,8 @@ def _scorecard(
         average_confidence=assessment.average_confidence,
         confidence_spread=assessment.confidence_spread,
         contradictory_evidence_count=assessment.contradictory_evidence_count,
+        hard_contradiction_count=assessment.hard_contradiction_count,
+        blocking_hard_contradiction_count=assessment.blocking_hard_contradiction_count,
         highest_issue_severity=assessment.highest_issue_severity,
         winner_mismatch=assessment.winner_mismatch,
         escalation_signal_count=assessment.escalation_signal_count,

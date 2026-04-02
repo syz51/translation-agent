@@ -19,6 +19,17 @@ DecisionMode = Literal[
     "human_review",
 ]
 DisagreementBucket = Literal["low", "medium", "high", "unresolved"]
+ReviewDimension = Literal[
+    "meaning",
+    "entity",
+    "number_date_unit",
+    "terminology",
+    "coverage",
+    "formatting",
+    "style",
+]
+EvidencePolarity = Literal["supports", "refutes"]
+EvidenceSeverity = Literal["minor", "major", "critical"]
 
 
 class CandidatePreference(ContractModel):
@@ -28,9 +39,29 @@ class CandidatePreference(ContractModel):
 
 
 class QuotedEvidence(ContractModel):
+    """Legacy quote-only evidence retained for replay compatibility."""
+
     quote: NonEmptyStr
     candidate_id: str | None = None
     segment_id: str | None = None
+
+
+class StructuredEvidence(ContractModel):
+    source_span_id: str | None = None
+    candidate_id: NonEmptyStr
+    dimension: ReviewDimension
+    polarity: EvidencePolarity
+    normalized_value: str | None = None
+    severity: EvidenceSeverity
+    evidence_text: NonEmptyStr
+
+
+class ReviewIssue(ContractModel):
+    candidate_id: str | None = None
+    dimension: ReviewDimension
+    severity: EvidenceSeverity
+    description: NonEmptyStr
+    source_span_id: str | None = None
 
 
 class SuggestedFix(ContractModel):
@@ -65,7 +96,7 @@ class AdjudicationContext(ContractModel):
 
 
 class ReviewBundle(ContractModel):
-    """Parsed and normalized reviewer output for a single stage."""
+    """Structured reviewer output for a single stage."""
 
     review_id: NonEmptyStr
     job_id: NonEmptyStr
@@ -73,12 +104,15 @@ class ReviewBundle(ContractModel):
     reviewer_role: NonEmptyStr
     candidate_preferences: tuple[CandidatePreference, ...] = ()
     confidence: float = Field(ge=0.0, le=1.0)
-    raw_review_text: NonEmptyStr
+    raw_review_text: str = ""
+    structured_evidence: tuple[StructuredEvidence, ...] = ()
+    review_issues: tuple[ReviewIssue, ...] = ()
     quoted_evidence: tuple[QuotedEvidence, ...] = ()
     issue_categories: tuple[str, ...] = ()
     suggested_fixes: tuple[SuggestedFix, ...] = ()
     escalation_signal: bool = False
-    parser_version: NonEmptyStr
+    parser_version: str | None = None
+    output_version: NonEmptyStr = "structured-review-v1"
 
 
 class AdjudicationScorecard(ContractModel):
@@ -89,6 +123,8 @@ class AdjudicationScorecard(ContractModel):
     average_confidence: float = Field(ge=0.0, le=1.0)
     confidence_spread: float = Field(ge=0.0, le=1.0)
     contradictory_evidence_count: int = Field(ge=0)
+    hard_contradiction_count: int = Field(default=0, ge=0)
+    blocking_hard_contradiction_count: int = Field(default=0, ge=0)
     highest_issue_severity: Literal["minor", "major", "critical"]
     winner_mismatch: bool = False
     escalation_signal_count: int = Field(ge=0)

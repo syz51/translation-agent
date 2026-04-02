@@ -1,11 +1,15 @@
-"""Prompt resolution over approved proposal overlays."""
+"""Prompt resolution over exact-match active and canary proposal overlays."""
 
 from __future__ import annotations
 
 from hashlib import sha256
 from typing import Protocol, cast, runtime_checkable
 
-from translation_agent.models import PromptEvolutionProposal, ResolvedTranslationPrompt
+from translation_agent.models import (
+    PromptCompatibilityTuple,
+    PromptEvolutionProposal,
+    ResolvedTranslationPrompt,
+)
 from translation_agent.storage import asset_path
 
 
@@ -14,9 +18,14 @@ class _ProposalQueryStore(Protocol):
         self,
         *,
         status: str | None = None,
+        prompt_family: str | None = None,
         target_model_id: str | None = None,
         target_language: str | None = None,
         source_language: str | None = None,
+        prompt_variant_id: str | None = None,
+        base_prompt_version: str | None = None,
+        scope_kind: str | None = None,
+        scope_key: str | None = None,
         media_key: str | None = None,
     ) -> list[PromptEvolutionProposal]: ...
 
@@ -40,11 +49,14 @@ class PromptResolver(Protocol):
         source_language: str,
         target_language: str,
         media_key: str | None = None,
+        run_id: str | None = None,
+        scope_kind: str = "pair",
+        scope_key: str | None = None,
     ) -> ResolvedTranslationPrompt: ...
 
 
 class ProposalBackedPromptResolver:
-    """Apply approved translation proposals as prompt overlays."""
+    """Apply exact-match active proposals and deterministic canary overlays."""
 
     def __init__(self, proposal_store: object | None = None) -> None:
         self._proposal_store = proposal_store
@@ -58,30 +70,52 @@ class ProposalBackedPromptResolver:
         source_language: str,
         target_language: str,
         media_key: str | None = None,
+        run_id: str | None = None,
+        scope_kind: str = "pair",
+        scope_key: str | None = None,
     ) -> ResolvedTranslationPrompt:
-        proposals = tuple(
-            self._matching_proposals(
-                model_id=model_id,
-                source_language=source_language,
-                target_language=target_language,
-                prompt_variant_id=prompt_variant_id,
-                media_key=media_key,
-            )
+        compatibility = PromptCompatibilityTuple(
+            prompt_family="translation",
+            model_id=model_id,
+            prompt_variant_id=prompt_variant_id,
+            base_prompt_version=base_prompt_version,
+            source_language=source_language,
+            target_language=target_language,
+            scope_kind=scope_kind,  # type: ignore[arg-type]
+            scope_key=scope_key or f"{source_language}::{target_language}",
         )
+        active_proposals = self._matching_proposals(
+            compatibility=compatibility, status="active", media_key=media_key
+        )
+        canary_proposals = self._matching_proposals(
+            compatibility=compatibility, status="canary", media_key=media_key
+        )
+        selected: tuple[PromptEvolutionProposal, ...]
+        resolution_mode = "control"
+        if canary_proposals and run_id is not None and _is_canary_run(run_id):
+            selected = canary_proposals[:1]
+            resolution_mode = "canary"
+        else:
+            selected = active_proposals
+            if active_proposals:
+                resolution_mode = "active"
         instructions = tuple(
-            change.instruction for proposal in proposals for change in proposal.suggested_changes
+            change.instruction for proposal in selected for change in proposal.suggested_changes
         )
-        proposal_refs = tuple(ref for proposal in proposals for ref in _proposal_refs(proposal))
+        proposal_refs = tuple(ref for proposal in selected for ref in _proposal_refs(proposal))
         effective_prompt_version = base_prompt_version
-        if proposals:
+        selected_proposal_id = selected[0].proposal_id if selected else None
+        if selected:
             version_suffix = sha256(
-                "|".join(proposal.proposal_id for proposal in proposals).encode("utf-8")
+                "|".join(proposal.proposal_id for proposal in selected).encode("utf-8")
             ).hexdigest()[:8]
-            effective_prompt_version = f"{base_prompt_version}+approved-{version_suffix}"
+            effective_prompt_version = f"{base_prompt_version}+{resolution_mode}-{version_suffix}"
         return ResolvedTranslationPrompt(
             prompt_variant_id=prompt_variant_id,
             base_prompt_version=base_prompt_version,
             effective_prompt_version=effective_prompt_version,
+            resolution_mode=resolution_mode,  # type: ignore[arg-type]
+            selected_proposal_id=selected_proposal_id,
             instructions=instructions,
             applied_proposal_refs=proposal_refs,
         )
@@ -89,31 +123,31 @@ class ProposalBackedPromptResolver:
     def _matching_proposals(
         self,
         *,
-        model_id: str,
-        source_language: str,
-        target_language: str,
-        prompt_variant_id: str,
+        compatibility: PromptCompatibilityTuple,
+        status: str,
         media_key: str | None,
-    ) -> list[PromptEvolutionProposal]:
+    ) -> tuple[PromptEvolutionProposal, ...]:
         matched: list[PromptEvolutionProposal] = []
         if self._proposal_store is None:
-            return matched
+            return ()
 
         if hasattr(self._proposal_store, "list_prompt_evolution_proposals"):
             query_store = cast(_ProposalQueryStore, self._proposal_store)
-            proposals = query_store.list_prompt_evolution_proposals(
-                status="approved",
-                target_model_id=model_id,
-                target_language=target_language,
-                source_language=source_language,
-                media_key=media_key,
-            )
             matched.extend(
                 proposal
-                for proposal in proposals
-                if proposal.prompt_family == "translation"
-                and proposal.target_prompt_variant_id in {None, prompt_variant_id}
-                and proposal.metadata.get("media_key", media_key) == media_key
+                for proposal in query_store.list_prompt_evolution_proposals(
+                    status=status,
+                    prompt_family=compatibility.prompt_family,
+                    target_model_id=compatibility.model_id,
+                    target_language=compatibility.target_language,
+                    source_language=compatibility.source_language,
+                    prompt_variant_id=compatibility.prompt_variant_id,
+                    base_prompt_version=compatibility.base_prompt_version,
+                    scope_kind=compatibility.scope_kind,
+                    scope_key=compatibility.scope_key,
+                    media_key=media_key,
+                )
+                if _proposal_matches(proposal, compatibility)
             )
 
         if (
@@ -125,17 +159,7 @@ class ProposalBackedPromptResolver:
             keys = sorted(blob_store.list_keys(asset_path(media_key, "improvement-proposals")))
             for key in keys:
                 proposal = PromptEvolutionProposal.model_validate_json(blob_store.read_bytes(key))
-                if proposal.status != "approved":
-                    continue
-                if proposal.prompt_family != "translation":
-                    continue
-                if proposal.target_model_id != model_id:
-                    continue
-                if proposal.target_prompt_variant_id not in {None, prompt_variant_id}:
-                    continue
-                if proposal.metadata.get("source_language", source_language) != source_language:
-                    continue
-                if proposal.metadata.get("target_language", target_language) != target_language:
+                if proposal.status != status or not _proposal_matches(proposal, compatibility):
                     continue
                 if all(existing.proposal_id != proposal.proposal_id for existing in matched):
                     matched.append(
@@ -148,7 +172,14 @@ class ProposalBackedPromptResolver:
                             }
                         )
                     )
-        return sorted(matched, key=lambda proposal: proposal.proposal_id)
+        return tuple(sorted(matched, key=lambda proposal: proposal.proposal_id))
+
+
+def _proposal_matches(
+    proposal: PromptEvolutionProposal,
+    compatibility: PromptCompatibilityTuple,
+) -> bool:
+    return proposal.compatibility == compatibility
 
 
 def _proposal_refs(proposal: PromptEvolutionProposal) -> tuple[str, ...]:
@@ -168,3 +199,8 @@ def _proposal_refs(proposal: PromptEvolutionProposal) -> tuple[str, ...]:
     if isinstance(proposal_ref, str) and proposal_ref.strip():
         return (proposal_ref,)
     return ()
+
+
+def _is_canary_run(run_id: str) -> bool:
+    digest = sha256(run_id.encode("utf-8")).hexdigest()
+    return int(digest[:8], 16) % 10 == 0

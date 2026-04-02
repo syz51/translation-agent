@@ -155,7 +155,14 @@ def _memory_batch(job_id: str = "job-operational") -> MemoryWriteBatch:
         translation_model_winner="gpt-5.4-mini",
         prompt_variant_winner="variant-a",
         prompt_version_winner="phase-5-v1",
-        semantic_writes=(MemoryWrite(kind="semantic", content="Prefer workflow terminology."),),
+        semantic_writes=(
+            MemoryWrite(
+                kind="semantic",
+                content="Prefer workflow terminology.",
+                scope_kind="pair",
+                scope_key="en::fr",
+            ),
+        ),
         dedupe_keys=("semantic:workflow",),
     )
 
@@ -431,13 +438,14 @@ def test_sqlite_operational_store_resolves_assets_and_persists_prompt_proposals(
             target_model_id="gpt-5.4-mini",
             target_prompt_version="phase-5-v1",
             target_prompt_variant_id="variant-a",
-            status="approved",
-            activation_mode="approval_required",
-            auto_activate=False,
-            rationale="Approved reference-evaluation improvement.",
+            base_prompt_version="phase-5-v1",
+            status="active",
+            rationale="Automatic reference-evaluation improvement.",
             metadata={
                 "source_language": "en",
                 "target_language": "fr",
+                "scope_kind": "pair",
+                "scope_key": "en::fr",
                 "media_key": asset.media_key,
                 "proposal_ref": "assets/asset-id-asset-1/improvement-proposals/proposal-1.json",
             },
@@ -454,7 +462,7 @@ def test_sqlite_operational_store_resolves_assets_and_persists_prompt_proposals(
         )
         stored_asset = reopened.get_asset(asset.media_key)
         proposals = reopened.list_prompt_evolution_proposals(
-            status="approved",
+            status="active",
             target_model_id="gpt-5.4-mini",
             target_language="fr",
             source_language="en",
@@ -465,7 +473,9 @@ def test_sqlite_operational_store_resolves_assets_and_persists_prompt_proposals(
     assert stored_asset is not None
     assert stored_asset.asset_id == "asset-1"
     assert stored_asset.media_fingerprint == "sha256:abc123"
-    assert proposals == [proposal]
+    assert len(proposals) == 1
+    assert proposals[0].status == "active"
+    assert proposals[0].compatibility is not None
 
 
 @pytest.mark.unit

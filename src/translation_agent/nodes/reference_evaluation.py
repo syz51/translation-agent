@@ -8,6 +8,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from difflib import SequenceMatcher
 from pathlib import Path
+from statistics import mean
 from typing import cast
 
 import pysubs2
@@ -17,10 +18,13 @@ from translation_agent.graph.state import GraphState, RoutingFact
 from translation_agent.models import (
     AssetRecord,
     EvaluatedRunReport,
+    EvaluationFailure,
     EvaluationReport,
     HistoricalRunLink,
     PromptChange,
+    PromptCompatibilityTuple,
     PromptEvolutionProposal,
+    ProposalAggregateMetrics,
     PublishedArtifacts,
     ReferenceSegment,
     ReferenceTranscript,
@@ -37,6 +41,7 @@ from translation_agent.nodes.common import (
     memory_batch_key,
     memory_consolidation_key,
     read_model_artifact,
+    select_translation_candidates,
     write_model_artifact,
 )
 from translation_agent.storage import asset_path, operational_job_key
@@ -57,30 +62,68 @@ def run_reference_evaluation(state: GraphState, runtime: WorkflowRuntime) -> dic
     reference_refs = _persist_reference_transcript(state, runtime, reference, now=now)
     _update_asset_latest_reference(runtime, state.job.media_key, reference_refs[0])
 
-    evaluated_runs = _load_historical_runs(
-        state,
-        runtime,
-        reference=reference,
-        trusted_transcript_ref=reference_refs[0],
-    )
-    recurring_patterns = _recurring_failure_patterns(evaluated_runs)
-    proposal_refs = _persist_improvement_proposals(
-        state,
-        runtime,
-        recurring_patterns=recurring_patterns,
-        evaluation_refs=tuple(
-            report.translation.translation_ref
-            for report in evaluated_runs
-            if report.translation is not None and report.translation.translation_ref is not None
-        ),
-    )
-    regenerated_draft_ref = _generate_regenerated_draft(
-        state,
-        runtime,
-        reference=reference,
-        trusted_transcript_ref=reference_refs[0],
-    )
+    failures: list[EvaluationFailure] = []
+    evaluated_runs: list[EvaluatedRunReport] = []
+    proposal_refs: tuple[str, ...] = ()
+    regenerated_draft_ref: str | None = None
+    recurring_patterns: list[str] = []
 
+    try:
+        evaluated_runs = _load_historical_runs(
+            state,
+            runtime,
+            reference=reference,
+            trusted_transcript_ref=reference_refs[0],
+        )
+        recurring_patterns = _recurring_failure_patterns(evaluated_runs)
+    except Exception as exc:
+        failures.append(
+            EvaluationFailure(
+                stage="evaluation",
+                message=str(exc) or "historical evaluation failed",
+            )
+        )
+
+    try:
+        proposal_refs = _persist_improvement_proposals(
+            state,
+            runtime,
+            evaluated_runs=evaluated_runs,
+            recurring_patterns=recurring_patterns,
+            evaluation_refs=tuple(
+                report.translation.translation_ref
+                for report in evaluated_runs
+                if report.translation is not None and report.translation.translation_ref is not None
+            ),
+        )
+    except Exception as exc:
+        failures.append(
+            EvaluationFailure(
+                stage="proposal_generation",
+                message=str(exc) or "proposal generation failed",
+            )
+        )
+
+    try:
+        regenerated_draft_ref = _generate_regenerated_draft(
+            state,
+            runtime,
+            reference=reference,
+            trusted_transcript_ref=reference_refs[0],
+        )
+    except Exception as exc:
+        failures.append(
+            EvaluationFailure(
+                stage="regenerated_draft",
+                message=str(exc) or "draft regeneration failed",
+            )
+        )
+
+    current_compatibility = _current_run_compatibility(state, runtime)
+    canary_metrics, control_metrics = _aggregate_outcomes_for_compatibility(
+        evaluated_runs,
+        current_compatibility,
+    )
     report = EvaluationReport(
         evaluation_id=f"evaluation-{state.run_id}",
         run_id=state.run_id,
@@ -95,17 +138,23 @@ def run_reference_evaluation(state: GraphState, runtime: WorkflowRuntime) -> dic
         ),
         proposal_refs=proposal_refs,
         regenerated_draft_ref=regenerated_draft_ref,
+        failures=tuple(failures),
+        canary_metrics=canary_metrics,
+        control_metrics=control_metrics,
+        proposal_compatibility=(current_compatibility,)
+        if current_compatibility is not None
+        else (),
         metadata={
             "asset_id": state.job.asset_id,
             "media_fingerprint": state.job.media_fingerprint,
             "reference_history_ref": reference_refs[1],
+            "tenant_id": state.job.tenant_id,
+            "project_id": state.job.project_id,
+            "source_language": state.job.source_language,
+            "target_language": state.job.target_language,
         },
     )
-    evaluation_report_ref = write_model_artifact(
-        runtime,
-        asset_path(state.job.media_key, "evaluations", f"{state.run_id}.json"),
-        report,
-    )
+    evaluation_report_ref = asset_path(state.job.media_key, "evaluations", f"{state.run_id}.json")
     routing_facts = list(state.routing_facts)
     memory_batch_ids = state.memory_batch_ids
     for ref in reference_refs:
@@ -130,59 +179,74 @@ def run_reference_evaluation(state: GraphState, runtime: WorkflowRuntime) -> dic
         read_model_artifact(runtime, proposal_ref, PromptEvolutionProposal)
         for proposal_ref in proposal_refs
     )
-    batch = runtime.memory_staging_backend.stage_evaluation_candidates(
+    try:
+        batch = runtime.memory_staging_backend.stage_evaluation_candidates(
+            report,
+            proposals=proposal_models,
+        )
+        if batch is not None:
+            storage_job_id = operational_job_key(state.job)
+            scoped_batch = batch.model_copy(
+                update={
+                    "batch_id": f"{batch.batch_id}-{state.run_id}",
+                    "metadata": {
+                        **batch.metadata,
+                        "job_scope_key": storage_job_id,
+                    },
+                }
+            )
+            runtime.memory_batch_store.save_batch(scoped_batch, storage_job_id=storage_job_id)
+            batch_ref = write_model_artifact(
+                runtime,
+                memory_batch_key(state.job, scoped_batch.batch_id),
+                scoped_batch,
+            )
+            routing_facts.append(
+                RoutingFact(
+                    stage="reference_evaluation",
+                    fact_type="memory_batch_staged",
+                    value=scoped_batch.batch_id,
+                    source_ref=batch_ref,
+                )
+            )
+            memory_batch_ids = state.memory_batch_ids + (scoped_batch.batch_id,)
+            consolidation = runtime.memory_consolidation_backend.consolidate_batch(scoped_batch)
+            consolidated_batch = scoped_batch.model_copy(
+                update={"consolidation_status": "consolidated"}
+            )
+            runtime.memory_batch_store.save_batch(consolidated_batch, storage_job_id=storage_job_id)
+            write_model_artifact(
+                runtime,
+                memory_batch_key(state.job, consolidated_batch.batch_id),
+                consolidated_batch,
+            )
+            consolidation_ref = write_model_artifact(
+                runtime,
+                memory_consolidation_key(state.job, consolidation.consolidation_id),
+                consolidation,
+            )
+            routing_facts.append(
+                RoutingFact(
+                    stage="reference_evaluation",
+                    fact_type="memory_batch_consolidated",
+                    value=consolidation.consolidation_id,
+                    source_ref=consolidation_ref,
+                )
+            )
+    except Exception as exc:
+        failures.append(
+            EvaluationFailure(
+                stage="memory_consolidation",
+                message=str(exc) or "evaluation memory consolidation failed",
+            )
+        )
+    if tuple(failures) != report.failures:
+        report = report.model_copy(update={"failures": tuple(failures)})
+    write_model_artifact(
+        runtime,
+        evaluation_report_ref,
         report,
-        proposals=proposal_models,
     )
-    if batch is not None:
-        storage_job_id = operational_job_key(state.job)
-        scoped_batch = batch.model_copy(
-            update={
-                "batch_id": f"{batch.batch_id}-{state.run_id}",
-                "metadata": {
-                    **batch.metadata,
-                    "job_scope_key": storage_job_id,
-                },
-            }
-        )
-        runtime.memory_batch_store.save_batch(scoped_batch, storage_job_id=storage_job_id)
-        batch_ref = write_model_artifact(
-            runtime,
-            memory_batch_key(state.job, scoped_batch.batch_id),
-            scoped_batch,
-        )
-        routing_facts.append(
-            RoutingFact(
-                stage="reference_evaluation",
-                fact_type="memory_batch_staged",
-                value=scoped_batch.batch_id,
-                source_ref=batch_ref,
-            )
-        )
-        memory_batch_ids = state.memory_batch_ids + (scoped_batch.batch_id,)
-        consolidation = runtime.memory_consolidation_backend.consolidate_batch(scoped_batch)
-        consolidated_batch = scoped_batch.model_copy(
-            update={"consolidation_status": "consolidated"}
-        )
-        runtime.memory_batch_store.save_batch(consolidated_batch, storage_job_id=storage_job_id)
-        write_model_artifact(
-            runtime,
-            memory_batch_key(state.job, consolidated_batch.batch_id),
-            consolidated_batch,
-        )
-        consolidation_ref = write_model_artifact(
-            runtime,
-            memory_consolidation_key(state.job, consolidation.consolidation_id),
-            consolidation,
-        )
-        routing_facts.append(
-            RoutingFact(
-                stage="reference_evaluation",
-                fact_type="memory_batch_consolidated",
-                value=consolidation.consolidation_id,
-                source_ref=consolidation_ref,
-            )
-        )
     routing_facts.extend(
         (
             RoutingFact(
@@ -199,6 +263,15 @@ def run_reference_evaluation(state: GraphState, runtime: WorkflowRuntime) -> dic
             ),
         )
     )
+    for failure in failures:
+        routing_facts.append(
+            RoutingFact(
+                stage="reference_evaluation",
+                fact_type="best_effort_failure",
+                value=failure.stage,
+                source_ref=failure.message,
+            )
+        )
     return {
         "current_stage": "reference_evaluation",
         "reference_transcript_ref": reference_refs[0],
@@ -220,6 +293,7 @@ def update_historical_run_link(
     upsert_link = getattr(runtime.run_store, "upsert_historical_run_link", None)
     if not callable(upsert_link):
         return
+    prompt_updates = _translation_link_updates(state, runtime, artifacts.final_translation_ref)
     upsert_link(
         HistoricalRunLink(
             run_id=state.run_id,
@@ -236,8 +310,57 @@ def update_historical_run_link(
             translation_decision_ref=state.final_translation_decision_ref,
             evaluation_report_ref=state.evaluation_report_ref,
             regenerated_draft_ref=state.regenerated_translation_draft_ref,
+            translation_model_id=prompt_updates["translation_model_id"],
+            translation_prompt_variant_id=prompt_updates["translation_prompt_variant_id"],
+            translation_base_prompt_version=prompt_updates["translation_base_prompt_version"],
+            translation_effective_prompt_version=prompt_updates[
+                "translation_effective_prompt_version"
+            ],
+            prompt_scope_kind=prompt_updates["prompt_scope_kind"],
+            prompt_scope_key=prompt_updates["prompt_scope_key"],
+            prompt_resolution_mode=prompt_updates["prompt_resolution_mode"],
+            prompt_proposal_id=prompt_updates["prompt_proposal_id"],
         )
     )
+
+
+def _translation_link_updates(
+    state: GraphState,
+    runtime: WorkflowRuntime,
+    translation_ref: str | None,
+) -> dict[str, str | None]:
+    if translation_ref is None or not runtime.blob_store.exists(translation_ref):
+        return {
+            "translation_model_id": None,
+            "translation_prompt_variant_id": None,
+            "translation_base_prompt_version": None,
+            "translation_effective_prompt_version": None,
+            "prompt_scope_kind": "pair",
+            "prompt_scope_key": f"{state.job.source_language}::{state.job.target_language}",
+            "prompt_resolution_mode": None,
+            "prompt_proposal_id": None,
+        }
+    translation = read_model_artifact(runtime, translation_ref, TranslationCandidate)
+    resolver = translation.metadata.get("prompt_resolver")
+    if not isinstance(resolver, dict):
+        resolver = {}
+    selected_proposal_id = resolver.get("selected_proposal_id")
+    return {
+        "translation_model_id": translation.model_id,
+        "translation_prompt_variant_id": translation.prompt_variant_id,
+        "translation_base_prompt_version": str(
+            resolver.get("base_prompt_version") or translation.prompt_version
+        ),
+        "translation_effective_prompt_version": translation.prompt_version,
+        "prompt_scope_kind": "pair",
+        "prompt_scope_key": f"{state.job.source_language}::{state.job.target_language}",
+        "prompt_resolution_mode": str(resolver.get("resolution_mode"))
+        if resolver.get("resolution_mode")
+        else "control",
+        "prompt_proposal_id": str(selected_proposal_id)
+        if isinstance(selected_proposal_id, str)
+        else None,
+    }
 
 
 def _load_reference_transcript(
@@ -400,50 +523,86 @@ def _evaluate_translation(
     source_segments = tuple(segment.text for segment in reference.segments)
     target_segments = tuple(segment.target_text or "" for segment in translation.segments)
     populated_segments = sum(1 for text in target_segments if text.strip())
-    segment_coverage = populated_segments / max(len(source_segments), 1)
-    source_entities = _named_entities(" ".join(source_segments))
+    segment_coverage = round(populated_segments / max(len(source_segments), 1), 4)
     target_text = translation.full_text
-    preserved_entities = sum(1 for entity in source_entities if entity in target_text)
-    named_entity_preservation = preserved_entities / max(len(source_entities), 1)
-    repeated_terms = _repeated_terms(" ".join(source_segments))
-    repeated_term_hits = sum(1 for term in repeated_terms if term in target_text.lower())
-    terminology_consistency = repeated_term_hits / max(len(repeated_terms), 1)
+    source_text = " ".join(source_segments)
+    source_entities = _named_entities(source_text)
+    target_entities = _named_entities(target_text)
+    entity_consistency = round(
+        _preservation_ratio(source_entities, target_entities),
+        4,
+    )
+    source_numbers = _numeric_markers(source_text)
+    target_numbers = _numeric_markers(target_text)
+    numeric_consistency = round(
+        _preservation_ratio(source_numbers, target_numbers),
+        4,
+    )
+    glossary_compliance = 1.0
     target_token_count = len(_normalized_tokens(target_text))
-    source_token_count = len(_normalized_tokens(" ".join(source_segments)))
+    source_token_count = len(_normalized_tokens(source_text))
     length_ratio = target_token_count / max(source_token_count, 1)
     omission_risk = round(max(0.0, 1.0 - min(segment_coverage, 1.0)), 4)
-    addition_risk = round(max(0.0, min(length_ratio - 1.5, 1.0)), 4) if length_ratio > 1.5 else 0.0
-    faithfulness = round(
+    addition_risk = round(max(0.0, min(length_ratio - 1.4, 1.0)), 4) if length_ratio > 1.4 else 0.0
+    faithfulness_judge = round(
         max(
             0.0,
             min(
                 1.0,
-                (segment_coverage * 0.5)
-                + (named_entity_preservation * 0.3)
-                + (terminology_consistency * 0.2)
-                - (addition_risk * 0.2),
+                (segment_coverage * 0.55)
+                + (entity_consistency * 0.20)
+                + (numeric_consistency * 0.15)
+                + ((1.0 - addition_risk) * 0.10),
+            ),
+        ),
+        4,
+    )
+    fluency_judge = round(_fluency_score(target_segments or (target_text,)), 4)
+    primary_quality_score = round(
+        max(
+            0.0,
+            min(
+                1.0,
+                0.45 * faithfulness_judge
+                + 0.20 * segment_coverage
+                + 0.15 * entity_consistency
+                + 0.10 * numeric_consistency
+                + 0.10 * glossary_compliance,
             ),
         ),
         4,
     )
     notes: list[str] = []
-    if terminology_consistency < 0.6 and repeated_terms:
-        notes.append("repeated terminology drift")
-    if named_entity_preservation < 0.8 and source_entities:
+    if entity_consistency < 0.8 and source_entities:
         notes.append("named entity preservation dropped")
     if omission_risk > 0.25:
         notes.append("segment-level omissions detected")
+    if numeric_consistency < 1.0 and source_numbers:
+        notes.append("numeric/date/unit mismatch detected")
     return TranslationScore(
         run_id=link.run_id,
         translation_ref=link.translation_ref,
         trusted_transcript_ref=trusted_transcript_ref,
-        faithfulness=faithfulness,
+        faithfulness_judge=faithfulness_judge,
+        segment_coverage=segment_coverage,
+        entity_consistency=entity_consistency,
+        numeric_date_unit_consistency=numeric_consistency,
+        glossary_compliance=glossary_compliance,
         omission_risk=omission_risk,
         addition_risk=round(min(addition_risk, 1.0), 4),
-        terminology_consistency=round(min(terminology_consistency, 1.0), 4),
-        named_entity_preservation=round(min(named_entity_preservation, 1.0), 4),
-        repeated_failure_terms=tuple(repeated_terms if terminology_consistency < 0.6 else ()),
+        fluency_judge=fluency_judge,
+        primary_quality_score=primary_quality_score,
+        severe_failure_bucket=(
+            primary_quality_score < 0.55
+            or omission_risk >= 0.35
+            or entity_consistency < 0.5
+            or numeric_consistency < 0.5
+        ),
         notes=tuple(notes),
+        faithfulness=faithfulness_judge,
+        terminology_consistency=glossary_compliance,
+        named_entity_preservation=entity_consistency,
+        repeated_failure_terms=(),
     )
 
 
@@ -451,61 +610,67 @@ def _persist_improvement_proposals(
     state: GraphState,
     runtime: WorkflowRuntime,
     *,
+    evaluated_runs: list[EvaluatedRunReport],
     recurring_patterns: list[str],
     evaluation_refs: tuple[str, ...],
 ) -> tuple[str, ...]:
-    if not recurring_patterns:
+    current_compatibility = _current_run_compatibility(state, runtime)
+    if current_compatibility is None or not recurring_patterns:
         return ()
-    proposal_id = f"reference-eval-{state.run_id}"
-    proposal = PromptEvolutionProposal(
-        proposal_id=proposal_id,
-        job_id=state.job.job_id,
-        source_consolidation_id=f"reference-evaluation-{state.run_id}",
-        prompt_family="translation",
-        target_model_id=runtime.translation_adapter.model_id,
-        target_prompt_version=getattr(
-            runtime.translation_adapter,
-            "_prompt_version",
-            "unversioned",
-        ),
-        target_prompt_variant_id=None,
-        status="proposed",
-        activation_mode="approval_required",
-        auto_activate=False,
-        rationale=(
-            "Trusted transcript evidence shows repeated translation failures across prior runs."
-        ),
-        suggested_changes=tuple(
-            PromptChange(section="system", instruction=_proposal_instruction(pattern))
-            for pattern in recurring_patterns
-        ),
-        evidence_refs=evaluation_refs,
-        metadata={
-            "proposal_origin": "reference_evaluation",
-            "source_language": state.job.source_language,
-            "target_language": state.job.target_language,
-            "media_key": state.job.media_key,
-            "failure_patterns": recurring_patterns,
-        },
+    list_proposals = cast(
+        Callable[..., list[PromptEvolutionProposal]] | None,
+        getattr(runtime.run_store, "list_prompt_evolution_proposals", None),
     )
-    proposal_ref = asset_path(
-        state.job.media_key,
-        "improvement-proposals",
-        f"{proposal.proposal_id}.json",
+    save_proposal = cast(
+        Callable[[PromptEvolutionProposal], None] | None,
+        getattr(runtime.run_store, "save_prompt_evolution_proposal", None),
     )
-    proposal = proposal.model_copy(
-        update={
-            "metadata": {
-                **proposal.metadata,
-                "proposal_ref": proposal_ref,
-            }
-        }
+    existing = (
+        list_proposals(
+            prompt_family=current_compatibility.prompt_family,
+            target_model_id=current_compatibility.model_id,
+            source_language=current_compatibility.source_language,
+            target_language=current_compatibility.target_language,
+            prompt_variant_id=current_compatibility.prompt_variant_id,
+            base_prompt_version=current_compatibility.base_prompt_version,
+            scope_kind=current_compatibility.scope_kind,
+            scope_key=current_compatibility.scope_key,
+            media_key=state.job.media_key,
+        )
+        if callable(list_proposals)
+        else []
     )
-    write_model_artifact(runtime, proposal_ref, proposal)
-    save_proposal = getattr(runtime.run_store, "save_prompt_evolution_proposal", None)
-    if callable(save_proposal):
-        save_proposal(proposal)
-    return (proposal_ref,)
+    refs: list[str] = []
+    current_patterns = _qualifying_patterns_for_compatibility(evaluated_runs, current_compatibility)
+    if len(current_patterns) >= 3 and not existing:
+        proposal = _build_prompt_proposal(
+            state,
+            runtime,
+            compatibility=current_compatibility,
+            patterns=tuple(sorted(set(recurring_patterns))),
+            evidence_refs=evaluation_refs,
+            status="proposed",
+        )
+        refs.append(_save_proposal(runtime, proposal, save_proposal))
+        return tuple(refs)
+
+    active = [proposal for proposal in existing if proposal.status == "active"]
+    canaries = [proposal for proposal in existing if proposal.status == "canary"]
+    proposed = [proposal for proposal in existing if proposal.status == "proposed"]
+    if canaries:
+        canary = canaries[0]
+        updated = _update_canary_status(canary, evaluated_runs)
+        if updated.status == "active":
+            for proposal in active:
+                superseded = proposal.model_copy(update={"status": "superseded"})
+                refs.append(_save_proposal(runtime, superseded, save_proposal))
+        refs.append(_save_proposal(runtime, updated, save_proposal))
+        return tuple(refs)
+    if proposed and not canaries:
+        canary = proposed[0].model_copy(update={"status": "canary"})
+        refs.append(_save_proposal(runtime, canary, save_proposal))
+        return tuple(refs)
+    return ()
 
 
 def _generate_regenerated_draft(
@@ -544,6 +709,9 @@ def _generate_regenerated_draft(
         source_language=state.job.source_language,
         target_language=state.job.target_language,
         media_key=state.job.media_key,
+        run_id=state.run_id,
+        scope_kind="pair",
+        scope_key=f"{state.job.source_language}::{state.job.target_language}",
     )
     base_request_context = build_request_context(state, runtime)
     request_context = base_request_context.model_copy(
@@ -630,11 +798,13 @@ def _recurring_failure_patterns(evaluated_runs: list[EvaluatedRunReport]) -> lis
             continue
         if report.translation.omission_risk >= 0.25:
             counter["omission_risk_high"] += 1
-        if report.translation.named_entity_preservation < 0.8:
+        if report.translation.entity_consistency < 0.8:
             counter["named_entity_preservation_low"] += 1
-        if report.translation.terminology_consistency < 0.6:
-            counter["terminology_consistency_low"] += 1
-    return sorted(pattern for pattern, count in counter.items() if count >= 2)
+        if report.translation.numeric_date_unit_consistency < 1.0:
+            counter["numeric_date_unit_consistency_low"] += 1
+        if report.translation.addition_risk >= 0.25:
+            counter["addition_risk_high"] += 1
+    return sorted(pattern for pattern, count in counter.items() if count >= 3)
 
 
 def _proposal_instruction(pattern: str) -> str:
@@ -645,11 +815,262 @@ def _proposal_instruction(pattern: str) -> str:
         "named_entity_preservation_low": (
             "Preserve named entities exactly unless there is a clear localized form."
         ),
-        "terminology_consistency_low": (
-            "Keep repeated source terminology stable across the full transcript."
+        "numeric_date_unit_consistency_low": (
+            "Preserve numbers, dates, and units exactly unless localization "
+            "requires formatting changes."
+        ),
+        "addition_risk_high": (
+            "Do not add unsupported content beyond what is anchored in the source transcript."
         ),
     }
     return mapping.get(pattern, "Improve translation faithfulness against the trusted transcript.")
+
+
+def _current_run_compatibility(
+    state: GraphState,
+    runtime: WorkflowRuntime,
+) -> PromptCompatibilityTuple | None:
+    if state.final_translation_candidate_id is None:
+        return None
+    candidates = select_translation_candidates(
+        runtime,
+        job=state.job,
+        candidate_ids=(state.final_translation_candidate_id,),
+    )
+    if not candidates:
+        return None
+    candidate = candidates[0]
+    resolver = candidate.metadata.get("prompt_resolver")
+    base_prompt_version = (
+        resolver.get("base_prompt_version") if isinstance(resolver, dict) else None
+    ) or getattr(runtime.translation_adapter, "_prompt_version", candidate.prompt_version)
+    return PromptCompatibilityTuple(
+        prompt_family="translation",
+        model_id=candidate.model_id,
+        prompt_variant_id=candidate.prompt_variant_id,
+        base_prompt_version=str(base_prompt_version),
+        source_language=state.job.source_language,
+        target_language=state.job.target_language,
+        scope_kind="pair",
+        scope_key=f"{state.job.source_language}::{state.job.target_language}",
+    )
+
+
+def _qualifying_patterns_for_compatibility(
+    evaluated_runs: list[EvaluatedRunReport],
+    compatibility: PromptCompatibilityTuple,
+) -> list[str]:
+    counter: Counter[str] = Counter()
+    for report in evaluated_runs:
+        if report.translation is None:
+            continue
+        if _compatibility_from_link(report.run) != compatibility:
+            continue
+        if report.translation.omission_risk >= 0.25:
+            counter["omission_risk_high"] += 1
+        if report.translation.entity_consistency < 0.8:
+            counter["named_entity_preservation_low"] += 1
+        if report.translation.numeric_date_unit_consistency < 1.0:
+            counter["numeric_date_unit_consistency_low"] += 1
+        if report.translation.addition_risk >= 0.25:
+            counter["addition_risk_high"] += 1
+    return sorted(pattern for pattern, count in counter.items() if count >= 3)
+
+
+def _build_prompt_proposal(
+    state: GraphState,
+    runtime: WorkflowRuntime,
+    *,
+    compatibility: PromptCompatibilityTuple,
+    patterns: tuple[str, ...],
+    evidence_refs: tuple[str, ...],
+    status: str,
+) -> PromptEvolutionProposal:
+    proposal_id = f"reference-eval-{state.run_id}-{compatibility.prompt_variant_id}"
+    return PromptEvolutionProposal(
+        proposal_id=proposal_id,
+        job_id=state.job.job_id,
+        source_consolidation_id=f"reference-evaluation-{state.run_id}",
+        prompt_family="translation",
+        target_model_id=compatibility.model_id,
+        target_prompt_version=compatibility.base_prompt_version,
+        target_prompt_variant_id=compatibility.prompt_variant_id,
+        base_prompt_version=compatibility.base_prompt_version,
+        compatibility=compatibility,
+        status=status,  # type: ignore[arg-type]
+        rationale=(
+            "Trusted transcript evaluation found the same translation failure pattern across "
+            "at least three completed runs for one compatible prompt tuple."
+        ),
+        suggested_changes=tuple(
+            PromptChange(section="system", instruction=_proposal_instruction(pattern))
+            for pattern in patterns
+        ),
+        evidence_refs=evidence_refs,
+        metadata={
+            "proposal_origin": "reference_evaluation",
+            "source_language": state.job.source_language,
+            "target_language": state.job.target_language,
+            "media_key": state.job.media_key,
+            "failure_patterns": list(patterns),
+            "scope_kind": compatibility.scope_kind,
+            "scope_key": compatibility.scope_key,
+        },
+    )
+
+
+def _save_proposal(
+    runtime: WorkflowRuntime,
+    proposal: PromptEvolutionProposal,
+    save_proposal: Callable[[PromptEvolutionProposal], None] | None,
+) -> str:
+    media_key = proposal.metadata.get("media_key")
+    if not isinstance(media_key, str) or not media_key:
+        media_key = "unknown-media"
+    proposal_ref = asset_path(
+        media_key,
+        "improvement-proposals",
+        f"{proposal.proposal_id}.json",
+    )
+    proposal = proposal.model_copy(
+        update={
+            "metadata": {
+                **proposal.metadata,
+                "proposal_ref": proposal_ref,
+            }
+        }
+    )
+    write_model_artifact(runtime, proposal_ref, proposal)
+    if callable(save_proposal):
+        save_proposal(proposal)
+    return proposal_ref
+
+
+def _compatibility_from_link(link: HistoricalRunLink) -> PromptCompatibilityTuple | None:
+    if (
+        link.translation_model_id is None
+        or link.translation_prompt_variant_id is None
+        or link.translation_base_prompt_version is None
+        or link.prompt_scope_kind is None
+        or link.prompt_scope_key is None
+    ):
+        return None
+    return PromptCompatibilityTuple(
+        prompt_family="translation",
+        model_id=link.translation_model_id,
+        prompt_variant_id=link.translation_prompt_variant_id,
+        base_prompt_version=link.translation_base_prompt_version,
+        source_language=link.source_language,
+        target_language=link.target_language,
+        scope_kind=link.prompt_scope_kind,  # type: ignore[arg-type]
+        scope_key=link.prompt_scope_key,
+    )
+
+
+def _aggregate_outcomes_for_compatibility(
+    evaluated_runs: list[EvaluatedRunReport],
+    compatibility: PromptCompatibilityTuple | None,
+) -> tuple[ProposalAggregateMetrics | None, ProposalAggregateMetrics | None]:
+    if compatibility is None:
+        return None, None
+    canary_scores = [
+        report.translation
+        for report in evaluated_runs
+        if report.translation is not None
+        and _compatibility_from_link(report.run) == compatibility
+        and report.run.prompt_resolution_mode == "canary"
+    ]
+    control_scores = [
+        report.translation
+        for report in evaluated_runs
+        if report.translation is not None
+        and _compatibility_from_link(report.run) == compatibility
+        and report.run.prompt_resolution_mode in {"control", "active"}
+    ]
+    return _aggregate_scores(canary_scores), _aggregate_scores(control_scores)
+
+
+def _aggregate_scores(scores: list[TranslationScore]) -> ProposalAggregateMetrics | None:
+    if not scores:
+        return None
+    return ProposalAggregateMetrics(
+        run_count=len(scores),
+        primary_quality_score=round(mean(score.primary_quality_score for score in scores), 4),
+        faithfulness_judge=round(mean(score.faithfulness_judge for score in scores), 4),
+        segment_coverage=round(mean(score.segment_coverage for score in scores), 4),
+        entity_consistency=round(mean(score.entity_consistency for score in scores), 4),
+        numeric_date_unit_consistency=round(
+            mean(score.numeric_date_unit_consistency for score in scores), 4
+        ),
+        glossary_compliance=round(mean(score.glossary_compliance for score in scores), 4),
+        omission_risk=round(mean(score.omission_risk for score in scores), 4),
+        addition_risk=round(mean(score.addition_risk for score in scores), 4),
+        fluency_judge=round(mean(score.fluency_judge or 0.0 for score in scores), 4),
+        severe_failure_bucket_rate=round(
+            sum(1 for score in scores if score.severe_failure_bucket) / len(scores),
+            4,
+        ),
+    )
+
+
+def _update_canary_status(
+    proposal: PromptEvolutionProposal,
+    evaluated_runs: list[EvaluatedRunReport],
+) -> PromptEvolutionProposal:
+    compatibility = proposal.compatibility
+    if compatibility is None:
+        return proposal
+    canary_metrics, control_metrics = _aggregate_outcomes_for_compatibility(
+        evaluated_runs,
+        compatibility,
+    )
+    if canary_metrics is None:
+        return proposal
+    status = proposal.status
+    rollback_reason = proposal.rollback_reason
+    if control_metrics is not None:
+        last_ten_canary_scores = [
+            report.translation.primary_quality_score
+            for report in evaluated_runs[-10:]
+            if report.translation is not None
+            and _compatibility_from_link(report.run) == compatibility
+            and report.run.prompt_resolution_mode == "canary"
+        ]
+        rolling_canary = (
+            mean(last_ten_canary_scores)
+            if last_ten_canary_scores
+            else canary_metrics.primary_quality_score
+        )
+        if (
+            control_metrics.severe_failure_bucket_rate > 0
+            and canary_metrics.severe_failure_bucket_rate
+            >= control_metrics.severe_failure_bucket_rate * 2
+        ) or rolling_canary <= control_metrics.primary_quality_score - 0.02:
+            status = "rolled_back"
+            rollback_reason = "canary underperformed control on quality or severe failures"
+        elif (
+            canary_metrics.run_count >= 30
+            and canary_metrics.primary_quality_score >= control_metrics.primary_quality_score + 0.02
+            and canary_metrics.segment_coverage >= control_metrics.segment_coverage - 0.01
+            and canary_metrics.entity_consistency >= control_metrics.entity_consistency - 0.01
+            and canary_metrics.numeric_date_unit_consistency
+            >= control_metrics.numeric_date_unit_consistency - 0.01
+            and canary_metrics.glossary_compliance >= control_metrics.glossary_compliance - 0.01
+            and canary_metrics.omission_risk <= control_metrics.omission_risk + 0.01
+            and canary_metrics.addition_risk <= control_metrics.addition_risk + 0.01
+        ):
+            status = "active"
+            rollback_reason = None
+    return proposal.model_copy(
+        update={
+            "status": status,
+            "rollback_reason": rollback_reason,
+            "canary_run_count": canary_metrics.run_count,
+            "control_run_count": control_metrics.run_count if control_metrics is not None else 0,
+            "canary_metrics": canary_metrics,
+            "control_metrics": control_metrics or ProposalAggregateMetrics(),
+        }
+    )
 
 
 def _parse_srt(payload: str) -> tuple[ReferenceSegment, ...]:
@@ -677,16 +1098,47 @@ def _normalized_tokens(value: str) -> list[str]:
 
 
 def _named_entities(value: str) -> tuple[str, ...]:
-    entities = {token for token in re.findall(r"\b[A-Z][A-Za-z0-9]+\b", value) if len(token) > 1}
+    entities = {
+        token
+        for token in re.findall(r"\b[\w.-]+\b", value)
+        if len(token) > 1
+        and (
+            any(character.isupper() for character in token[1:])
+            or token.isupper()
+            or any(character.isdigit() for character in token)
+        )
+    }
     return tuple(sorted(entities))
 
 
-def _repeated_terms(value: str) -> tuple[str, ...]:
-    counts = Counter(token.lower() for token in _WORD_RE.findall(value) if len(token) >= 4)
-    return tuple(sorted(token for token, count in counts.items() if count >= 2))
+def _numeric_markers(value: str) -> tuple[str, ...]:
+    return tuple(
+        sorted(match.group(0).replace(",", ".") for match in re.finditer(r"\d+(?:[.,]\d+)?", value))
+    )
 
 
 def _token_similarity(left: tuple[str, ...], right: tuple[str, ...]) -> float:
     if not left and not right:
         return 1.0
     return round(SequenceMatcher(a=left, b=right).ratio(), 4)
+
+
+def _preservation_ratio(source_values: tuple[str, ...], target_values: tuple[str, ...]) -> float:
+    if not source_values:
+        return 1.0
+    return len(set(source_values) & set(target_values)) / max(len(set(source_values)), 1)
+
+
+def _fluency_score(values: tuple[str, ...]) -> float:
+    populated = [value for value in values if value.strip()]
+    if not populated:
+        return 0.0
+    punctuation_ratio = sum(
+        1 for value in populated if value.rstrip().endswith((".", "!", "?"))
+    ) / len(populated)
+    repetition_penalty = 0.0
+    for value in populated:
+        tokens = _normalized_tokens(value)
+        if len(tokens) != len(set(tokens)):
+            repetition_penalty += 0.05
+    return max(0.0, min(0.75 + punctuation_ratio * 0.2 - repetition_penalty, 1.0))

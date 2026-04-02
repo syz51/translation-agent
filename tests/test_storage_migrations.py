@@ -80,7 +80,7 @@ def test_upgrade_database_bootstraps_schema_on_empty_database(postgres_dsn: str)
     } <= tables
     assert "idx_node_executions_run_id_created_at" in indexes
     assert revision is not None
-    assert revision["version_num"] == "0003_reference_evaluation_assets"
+    assert revision["version_num"] == "0004_prompt_proposal_compat"
     assert node.run_id == run.run_id
 
 
@@ -154,7 +154,7 @@ def test_upgrade_database_preserves_existing_legacy_data(postgres_dsn: str) -> N
         revision = conn.execute("SELECT version_num FROM alembic_version").fetchone()
 
     assert revision is not None
-    assert revision[0] == "0003_reference_evaluation_assets"
+    assert revision[0] == "0004_prompt_proposal_compat"
 
 
 def _create_legacy_schema(dsn: str) -> None:

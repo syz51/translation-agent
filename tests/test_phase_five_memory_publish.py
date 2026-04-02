@@ -218,7 +218,6 @@ def test_phase_five_happy_path_publishes_audit_ready_outputs(tmp_path: Path) -> 
     final_state, runtime, blob_store = _run_workflow(tmp_path, scenario="happy")
     scope_token = job_scope_token(_job_context())
     consolidation_id = f"consolidation-batch-translation_adjudication-job-phase-five-{scope_token}"
-    prompt_id = f"prompt-evolution-{consolidation_id}"
 
     assert blob_store.exists(_artifact_path("published", "scorecard.json"))
     assert blob_store.exists(_artifact_path("exports", "translation.srt"))
@@ -232,13 +231,6 @@ def test_phase_five_happy_path_publishes_audit_ready_outputs(tmp_path: Path) -> 
             f"{consolidation_id}.json",
         )
     )
-    assert blob_store.exists(
-        _artifact_path(
-            "memory",
-            "prompt-evolution",
-            f"{prompt_id}.json",
-        )
-    )
 
     scorecard = json.loads(
         blob_store.read_bytes(_artifact_path("published", "scorecard.json")).decode("utf-8")
@@ -247,16 +239,6 @@ def test_phase_five_happy_path_publishes_audit_ready_outputs(tmp_path: Path) -> 
         blob_store.read_bytes(_artifact_path("exports", "translation.srt")).decode("utf-8"),
         format_="srt",
     )
-    prompt_proposal = json.loads(
-        blob_store.read_bytes(
-            _artifact_path(
-                "memory",
-                "prompt-evolution",
-                f"{prompt_id}.json",
-            )
-        ).decode("utf-8")
-    )
-
     assert scorecard["translation_decision"]["disagreement_bucket"] == "low"
     assert scorecard["translation_decision"]["adjudication_scorecard"]["candidate_count"] == 2
     assert scorecard["export_refs"] == [
@@ -264,14 +246,13 @@ def test_phase_five_happy_path_publishes_audit_ready_outputs(tmp_path: Path) -> 
         _artifact_path("exports", "translation.json"),
     ]
     assert scorecard["memory_consolidation_refs"]
-    assert scorecard["prompt_evolution_refs"]
+    assert scorecard["prompt_evolution_refs"] == []
     assert len(subtitles.events) == 1
     assert subtitles.events[0].text == "Bonjour tout le monde depuis le workflow."
     assert "speaker-" not in subtitles.events[0].text
-    assert prompt_proposal["target_model_id"] == runtime.translation_adapter.model_id
-    assert prompt_proposal["auto_activate"] is False
-    assert prompt_proposal["activation_mode"] == "approval_required"
-    assert any("/memory/prompt-evolution/" in ref for ref in final_state.published_artifact_refs)
+    assert not any(
+        "/memory/prompt-evolution/" in ref for ref in final_state.published_artifact_refs
+    )
 
 
 def test_phase_five_translation_failure_publishes_recoverable_manifest(tmp_path: Path) -> None:
@@ -371,6 +352,8 @@ def test_phase_five_memory_consolidation_dedupes_and_scopes_recall() -> None:
             MemoryWrite(
                 kind="semantic",
                 content="Prefer workflow terminology for stable UI copy.",
+                scope_kind="project_pair",
+                scope_key="tenant-a::project-1::en::fr",
                 metadata={"dedupe_key": "semantic:workflow"},
             ),
         ),
@@ -378,6 +361,8 @@ def test_phase_five_memory_consolidation_dedupes_and_scopes_recall() -> None:
             MemoryWrite(
                 kind="episodic",
                 content="Low-disagreement translation finalized automatically.",
+                scope_kind="project_pair",
+                scope_key="tenant-a::project-1::en::fr",
             ),
         ),
         metadata={
@@ -401,6 +386,8 @@ def test_phase_five_memory_consolidation_dedupes_and_scopes_recall() -> None:
                 MemoryWrite(
                     kind="semantic",
                     content="Do not bleed into the first project's recall scope.",
+                    scope_kind="project_pair",
+                    scope_key="tenant-a::project-2::en::fr",
                     metadata={"dedupe_key": "semantic:other-project"},
                 ),
             ),
@@ -450,11 +437,7 @@ def test_phase_five_prompt_evolution_uses_runtime_model_selection() -> None:
         evidence_ref="memory/consolidations/consolidation-batch-translation.json",
     )
 
-    assert proposal is not None
-    assert proposal.target_model_id == "openai-generic-model"
-    assert proposal.target_prompt_variant_id == "variant-b"
-    assert proposal.activation_mode == "approval_required"
-    assert proposal.auto_activate is False
+    assert proposal is None
 
 
 @pytest.mark.parametrize("bucket", ["medium", "high"])
@@ -477,10 +460,7 @@ def test_phase_five_prompt_evolution_keeps_higher_disagreement_gated(bucket: str
         evidence_ref="memory/consolidations/example.json",
     )
 
-    assert proposal is not None
-    assert proposal.target_model_id == "persisted-model"
-    assert proposal.activation_mode == "approval_required"
-    assert proposal.auto_activate is False
+    assert proposal is None
 
 
 def test_phase_five_prompt_evolution_returns_none_without_required_translation_inputs() -> None:

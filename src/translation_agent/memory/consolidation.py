@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
-from typing import Protocol, runtime_checkable
+from typing import Protocol, cast, runtime_checkable
 
-from translation_agent.memory.recall import MemoryEntryStore
-from translation_agent.models import MemoryConsolidation, MemoryEntry, MemoryWrite, MemoryWriteBatch
+from translation_agent.memory.recall import MemoryEntryStore, build_scope_key
+from translation_agent.models import (
+    MemoryConsolidation,
+    MemoryEntry,
+    MemoryScopeKind,
+    MemoryWrite,
+    MemoryWriteBatch,
+)
 
 
 @runtime_checkable
@@ -30,7 +36,11 @@ class DeterministicMemoryConsolidationBackend:
             batch,
             writes=batch.episodic_writes,
         )
-        skipped = tuple(dict.fromkeys((*skipped_semantic, *skipped_episodic)))
+        procedural_memory_ids, skipped_procedural = self._persist_writes(
+            batch,
+            writes=batch.procedural_writes,
+        )
+        skipped = tuple(dict.fromkeys((*skipped_semantic, *skipped_episodic, *skipped_procedural)))
         return MemoryConsolidation(
             consolidation_id=f"consolidation-{batch.batch_id}",
             batch_id=batch.batch_id,
@@ -44,8 +54,11 @@ class DeterministicMemoryConsolidationBackend:
             source_prompt_version=batch.prompt_version_winner,
             source_language=_metadata_string(batch.metadata, "source_language"),
             target_language=_metadata_string(batch.metadata, "target_language"),
+            scope_kind=_batch_scope_kind(batch),
+            scope_key=_batch_scope_key(batch),
             semantic_memory_ids=semantic_memory_ids,
             episodic_memory_ids=episodic_memory_ids,
+            procedural_memory_ids=procedural_memory_ids,
             skipped_dedupe_keys=skipped,
             procedural_write_count=len(batch.procedural_writes),
         )
@@ -60,12 +73,16 @@ class DeterministicMemoryConsolidationBackend:
         skipped_keys: list[str] = []
         for index, write in enumerate(writes, start=1):
             dedupe_key = _dedupe_key(write, batch=batch, index=index)
+            scope_kind, scope_key = _resolved_write_scope(batch=batch, write=write)
             entry = MemoryEntry(
                 memory_id=f"{write.kind}:{batch.batch_id}:{index}",
                 kind=write.kind,
                 content=write.content,
                 source_ref=write.source_ref or batch.decision_ref,
-                score=_score_for_write(batch),
+                scope_kind=scope_kind,
+                scope_key=scope_key,
+                updated_at=write.updated_at,
+                score=write.score,
                 metadata={
                     **batch.metadata,
                     **write.metadata,
@@ -90,15 +107,55 @@ def _dedupe_key(write: MemoryWrite, *, batch: MemoryWriteBatch, index: int) -> s
     return None
 
 
-def _score_for_write(batch: MemoryWriteBatch) -> float:
-    if batch.decision_confidence is None:
-        return 0.5
-    return round(max(0.0, min(batch.decision_confidence, 0.99)), 4)
-
-
 def _metadata_string(metadata: dict[str, object], key: str) -> str | None:
     value = metadata.get(key)
     if isinstance(value, str):
         normalized = value.strip()
         return normalized or None
+    return None
+
+
+def _resolved_write_scope(
+    *,
+    batch: MemoryWriteBatch,
+    write: MemoryWrite,
+) -> tuple[MemoryScopeKind, str]:
+    source_language = _metadata_string(batch.metadata, "source_language")
+    target_language = _metadata_string(batch.metadata, "target_language")
+    if (
+        write.scope_kind == "global"
+        and write.scope_key == "global"
+        and source_language is not None
+        and target_language is not None
+    ):
+        return (
+            "pair",
+            build_scope_key(
+                scope_kind="pair",
+                tenant_id=_metadata_string(batch.metadata, "tenant_id") or "",
+                project_id=_metadata_string(batch.metadata, "project_id") or "",
+                source_language=source_language,
+                target_language=target_language,
+            ),
+        )
+    return write.scope_kind, write.scope_key
+
+
+def _batch_scope_kind(batch: MemoryWriteBatch) -> MemoryScopeKind | None:
+    writes = (*batch.semantic_writes, *batch.episodic_writes, *batch.procedural_writes)
+    if not writes:
+        return None
+    scope_kinds = {_resolved_write_scope(batch=batch, write=write)[0] for write in writes}
+    if len(scope_kinds) == 1:
+        return cast(MemoryScopeKind, next(iter(scope_kinds)))
+    return None
+
+
+def _batch_scope_key(batch: MemoryWriteBatch) -> str | None:
+    writes = (*batch.semantic_writes, *batch.episodic_writes, *batch.procedural_writes)
+    if not writes:
+        return None
+    scope_keys = {_resolved_write_scope(batch=batch, write=write)[1] for write in writes}
+    if len(scope_keys) == 1:
+        return next(iter(scope_keys))
     return None

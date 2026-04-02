@@ -1,15 +1,15 @@
-"""Prompt evolution interfaces and deterministic reference implementation."""
+"""Prompt evolution interfaces for automatic, evaluation-driven proposals."""
 
 from __future__ import annotations
 
 from typing import Protocol, runtime_checkable
 
-from translation_agent.models import MemoryConsolidation, PromptChange, PromptEvolutionProposal
+from translation_agent.models import MemoryConsolidation, PromptEvolutionProposal
 
 
 @runtime_checkable
 class PromptEvolutionBackend(Protocol):
-    """Create gated prompt updates from consolidated outcomes only."""
+    """Create prompt updates from evaluated outcomes only."""
 
     def propose_prompt_evolution(
         self,
@@ -21,7 +21,7 @@ class PromptEvolutionBackend(Protocol):
 
 
 class DeterministicPromptEvolutionBackend:
-    """Reference prompt evolution logic for translation-only improvements."""
+    """Mainline adjudication no longer emits prompt proposals directly."""
 
     def propose_prompt_evolution(
         self,
@@ -30,48 +30,5 @@ class DeterministicPromptEvolutionBackend:
         translation_model_id: str | None,
         evidence_ref: str,
     ) -> PromptEvolutionProposal | None:
-        if consolidation.source_stage != "translation_adjudication":
-            return None
-        resolved_model_id = translation_model_id or consolidation.source_translation_model_id
-        if resolved_model_id is None or consolidation.source_prompt_variant_id is None:
-            return None
-        target_prompt_version = f"{consolidation.source_prompt_version or 'unversioned'}-phase5"
-        return PromptEvolutionProposal(
-            proposal_id=f"prompt-evolution-{consolidation.consolidation_id}",
-            job_id=consolidation.job_id,
-            source_consolidation_id=consolidation.consolidation_id,
-            prompt_family="translation",
-            target_model_id=resolved_model_id,
-            target_prompt_version=target_prompt_version,
-            target_prompt_variant_id=consolidation.source_prompt_variant_id,
-            activation_mode="approval_required",
-            auto_activate=False,
-            rationale=(
-                "Consolidated translation outcomes favored the winning prompt variant without "
-                "relying on raw reviewer prose."
-            ),
-            suggested_changes=(
-                PromptChange(
-                    section="system",
-                    instruction=(
-                        "Bias the prompt toward terminology preservation and stable named "
-                        "entity handling."
-                    ),
-                ),
-                PromptChange(
-                    section="guardrails",
-                    instruction=(
-                        "Keep the successful variant's style boundary while avoiding ad-lib "
-                        "wording changes."
-                    ),
-                ),
-            ),
-            evidence_refs=tuple(
-                ref for ref in (evidence_ref, consolidation.source_decision_ref) if ref is not None
-            ),
-            metadata={
-                "procedural_write_count": consolidation.procedural_write_count,
-                "source_language": consolidation.source_language,
-                "target_language": consolidation.target_language,
-            },
-        )
+        del consolidation, translation_model_id, evidence_ref
+        return None

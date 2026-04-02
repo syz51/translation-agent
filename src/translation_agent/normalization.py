@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from hashlib import sha256
 from typing import Any
 
 from translation_agent.models import Segment, TranscriptCandidate, TranslationCandidate
@@ -107,6 +108,9 @@ def _normalize_segment(segment: Segment, *, index: int, prefer_target: bool) -> 
     annotations.setdefault("normalized", True)
     annotations.setdefault("segment_index", index)
     canonical_text = target_text if prefer_target and target_text else source_text
+    annotations["source_span_id"] = _source_span_id(
+        segment, source_text=source_text, target_text=target_text
+    )
     return segment.model_copy(
         update={
             "segment_id": _normalize_identifier(segment.segment_id, fallback=f"segment-{index}"),
@@ -201,3 +205,25 @@ def _annotated_text_lengths(annotations: dict[str, Any], text: str | None) -> di
     if text is not None:
         annotations.setdefault("text_length", len(text))
     return annotations
+
+
+def _source_span_id(
+    segment: Segment,
+    *,
+    source_text: str | None,
+    target_text: str | None,
+) -> str:
+    existing = segment.annotations.get("source_span_id")
+    if isinstance(existing, str) and existing.strip():
+        return existing
+    if segment.start_ms != 0 or segment.end_ms != 0:
+        start_bucket = _round_ms(segment.start_ms)
+        end_bucket = _round_ms(segment.end_ms)
+        return f"span:{start_bucket}:{end_bucket}"
+    text_seed = source_text or target_text or segment.segment_id
+    digest = sha256(text_seed.encode("utf-8")).hexdigest()[:12]
+    return f"text-span:{digest}"
+
+
+def _round_ms(value: int) -> int:
+    return int(round(value / 250.0) * 250)

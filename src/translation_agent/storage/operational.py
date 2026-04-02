@@ -142,9 +142,14 @@ _POSTGRES_PROPOSAL_LIST_SQL = """
     SELECT proposal_json
     FROM prompt_evolution_proposals
     WHERE (%s IS NULL OR status = %s)
+      AND (%s IS NULL OR prompt_family = %s)
       AND (%s IS NULL OR target_model_id = %s)
       AND (%s IS NULL OR target_language = %s)
       AND (%s IS NULL OR source_language = %s)
+      AND (%s IS NULL OR prompt_variant_id = %s)
+      AND (%s IS NULL OR base_prompt_version = %s)
+      AND (%s IS NULL OR scope_kind = %s)
+      AND (%s IS NULL OR scope_key = %s)
       AND (%s IS NULL OR media_key = %s)
     ORDER BY proposal_id ASC
 """
@@ -157,9 +162,14 @@ _SQLITE_PROPOSAL_LIST_SQL = """
     SELECT proposal_json
     FROM prompt_evolution_proposals
     WHERE (? IS NULL OR status = ?)
+      AND (? IS NULL OR prompt_family = ?)
       AND (? IS NULL OR target_model_id = ?)
       AND (? IS NULL OR target_language = ?)
       AND (? IS NULL OR source_language = ?)
+      AND (? IS NULL OR prompt_variant_id = ?)
+      AND (? IS NULL OR base_prompt_version = ?)
+      AND (? IS NULL OR scope_kind = ?)
+      AND (? IS NULL OR scope_key = ?)
       AND (? IS NULL OR media_key = ?)
     ORDER BY proposal_id ASC
 """
@@ -255,9 +265,14 @@ class OperationalStore(DecisionStore, MemoryBatchStore, Protocol):
         self,
         *,
         status: str | None = None,
+        prompt_family: str | None = None,
         target_model_id: str | None = None,
         target_language: str | None = None,
         source_language: str | None = None,
+        prompt_variant_id: str | None = None,
+        base_prompt_version: str | None = None,
+        scope_kind: str | None = None,
+        scope_key: str | None = None,
         media_key: str | None = None,
     ) -> list[PromptEvolutionProposal]: ...
 
@@ -505,19 +520,29 @@ class PostgresOperationalStore(PostgresRunStore):
                     proposal_id,
                     proposal_json,
                     status,
+                    prompt_family,
                     target_model_id,
                     target_language,
                     source_language,
+                    prompt_variant_id,
+                    base_prompt_version,
+                    scope_kind,
+                    scope_key,
                     media_key,
                     created_at,
                     updated_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (proposal_id) DO UPDATE SET
                     proposal_json = EXCLUDED.proposal_json,
                     status = EXCLUDED.status,
+                    prompt_family = EXCLUDED.prompt_family,
                     target_model_id = EXCLUDED.target_model_id,
                     target_language = EXCLUDED.target_language,
                     source_language = EXCLUDED.source_language,
+                    prompt_variant_id = EXCLUDED.prompt_variant_id,
+                    base_prompt_version = EXCLUDED.base_prompt_version,
+                    scope_kind = EXCLUDED.scope_kind,
+                    scope_key = EXCLUDED.scope_key,
                     media_key = EXCLUDED.media_key,
                     updated_at = EXCLUDED.updated_at
                 """,
@@ -525,9 +550,14 @@ class PostgresOperationalStore(PostgresRunStore):
                     proposal.proposal_id,
                     _encode_json(payload),
                     proposal.status,
+                    proposal.prompt_family,
                     proposal.target_model_id,
                     _proposal_metadata_value(proposal, "target_language"),
                     _proposal_metadata_value(proposal, "source_language"),
+                    _proposal_compatibility_value(proposal, "prompt_variant_id"),
+                    _proposal_compatibility_value(proposal, "base_prompt_version"),
+                    _proposal_compatibility_value(proposal, "scope_kind"),
+                    _proposal_compatibility_value(proposal, "scope_key"),
                     _proposal_metadata_value(proposal, "media_key"),
                     now,
                     now,
@@ -538,22 +568,38 @@ class PostgresOperationalStore(PostgresRunStore):
         self,
         *,
         status: str | None = None,
+        prompt_family: str | None = None,
         target_model_id: str | None = None,
         target_language: str | None = None,
         source_language: str | None = None,
+        prompt_variant_id: str | None = None,
+        base_prompt_version: str | None = None,
+        scope_kind: str | None = None,
+        scope_key: str | None = None,
         media_key: str | None = None,
     ) -> list[PromptEvolutionProposal]:
+        status = _normalized_proposal_status(status)
         rows = self._conn.execute(
             _POSTGRES_PROPOSAL_LIST_SQL,
             (
                 status,
                 status,
+                prompt_family,
+                prompt_family,
                 target_model_id,
                 target_model_id,
                 target_language,
                 target_language,
                 source_language,
                 source_language,
+                prompt_variant_id,
+                prompt_variant_id,
+                base_prompt_version,
+                base_prompt_version,
+                scope_kind,
+                scope_kind,
+                scope_key,
+                scope_key,
                 media_key,
                 media_key,
             ),
@@ -1203,19 +1249,29 @@ class SQLiteOperationalStore(AbstractContextManager["SQLiteOperationalStore"]):
                     proposal_id,
                     proposal_json,
                     status,
+                    prompt_family,
                     target_model_id,
                     target_language,
                     source_language,
+                    prompt_variant_id,
+                    base_prompt_version,
+                    scope_kind,
+                    scope_key,
                     media_key,
                     created_at,
                     updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(proposal_id) DO UPDATE SET
                     proposal_json = excluded.proposal_json,
                     status = excluded.status,
+                    prompt_family = excluded.prompt_family,
                     target_model_id = excluded.target_model_id,
                     target_language = excluded.target_language,
                     source_language = excluded.source_language,
+                    prompt_variant_id = excluded.prompt_variant_id,
+                    base_prompt_version = excluded.base_prompt_version,
+                    scope_kind = excluded.scope_kind,
+                    scope_key = excluded.scope_key,
                     media_key = excluded.media_key,
                     updated_at = excluded.updated_at
                 """,
@@ -1223,9 +1279,14 @@ class SQLiteOperationalStore(AbstractContextManager["SQLiteOperationalStore"]):
                     proposal.proposal_id,
                     _encode_sqlite_json(proposal.model_dump(mode="json")),
                     proposal.status,
+                    proposal.prompt_family,
                     proposal.target_model_id,
                     _proposal_metadata_value(proposal, "target_language"),
                     _proposal_metadata_value(proposal, "source_language"),
+                    _proposal_compatibility_value(proposal, "prompt_variant_id"),
+                    _proposal_compatibility_value(proposal, "base_prompt_version"),
+                    _proposal_compatibility_value(proposal, "scope_kind"),
+                    _proposal_compatibility_value(proposal, "scope_key"),
                     _proposal_metadata_value(proposal, "media_key"),
                     now,
                     now,
@@ -1236,22 +1297,38 @@ class SQLiteOperationalStore(AbstractContextManager["SQLiteOperationalStore"]):
         self,
         *,
         status: str | None = None,
+        prompt_family: str | None = None,
         target_model_id: str | None = None,
         target_language: str | None = None,
         source_language: str | None = None,
+        prompt_variant_id: str | None = None,
+        base_prompt_version: str | None = None,
+        scope_kind: str | None = None,
+        scope_key: str | None = None,
         media_key: str | None = None,
     ) -> list[PromptEvolutionProposal]:
+        status = _normalized_proposal_status(status)
         rows = self._conn.execute(
             _SQLITE_PROPOSAL_LIST_SQL,
             (
                 status,
                 status,
+                prompt_family,
+                prompt_family,
                 target_model_id,
                 target_model_id,
                 target_language,
                 target_language,
                 source_language,
                 source_language,
+                prompt_variant_id,
+                prompt_variant_id,
+                base_prompt_version,
+                base_prompt_version,
+                scope_kind,
+                scope_kind,
+                scope_key,
+                scope_key,
                 media_key,
                 media_key,
             ),
@@ -1379,16 +1456,31 @@ class SQLiteOperationalStore(AbstractContextManager["SQLiteOperationalStore"]):
                 proposal_id TEXT PRIMARY KEY,
                 proposal_json TEXT NOT NULL,
                 status TEXT NOT NULL,
+                prompt_family TEXT NOT NULL,
                 target_model_id TEXT NOT NULL,
                 target_language TEXT,
                 source_language TEXT,
+                prompt_variant_id TEXT,
+                base_prompt_version TEXT,
+                scope_kind TEXT,
+                scope_key TEXT,
                 media_key TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
 
             CREATE INDEX IF NOT EXISTS idx_prompt_evolution_proposals_scope
-            ON prompt_evolution_proposals(status, target_model_id, target_language, media_key);
+            ON prompt_evolution_proposals(
+                status,
+                prompt_family,
+                target_model_id,
+                source_language,
+                target_language,
+                prompt_variant_id,
+                base_prompt_version,
+                scope_kind,
+                scope_key
+            );
             """
         )
         self._conn.commit()
@@ -1694,7 +1786,42 @@ def _proposal_metadata_value(
     proposal: PromptEvolutionProposal,
     key: str,
 ) -> str | None:
+    compatibility_value = _proposal_compatibility_value(proposal, key)
+    if compatibility_value is not None:
+        return compatibility_value
     value = proposal.metadata.get(key)
+    if isinstance(value, str):
+        normalized = value.strip()
+        return normalized or None
+    return None
+
+
+def _normalized_proposal_status(status: str | None) -> str | None:
+    if status == "approved":
+        return "active"
+    if status == "rejected":
+        return "rolled_back"
+    return status
+
+
+def _proposal_compatibility_value(
+    proposal: PromptEvolutionProposal,
+    key: str,
+) -> str | None:
+    compatibility = proposal.compatibility
+    if compatibility is None:
+        return None
+    mapping = {
+        "prompt_family": compatibility.prompt_family,
+        "model_id": compatibility.model_id,
+        "prompt_variant_id": compatibility.prompt_variant_id,
+        "base_prompt_version": compatibility.base_prompt_version,
+        "source_language": compatibility.source_language,
+        "target_language": compatibility.target_language,
+        "scope_kind": compatibility.scope_kind,
+        "scope_key": compatibility.scope_key,
+    }
+    value = mapping.get(key)
     if isinstance(value, str):
         normalized = value.strip()
         return normalized or None

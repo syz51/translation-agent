@@ -1,18 +1,33 @@
-"""Deterministic disagreement scoring and non-recursive escalation policy."""
+"""Deterministic disagreement scoring over structured review evidence."""
 
 from __future__ import annotations
 
+import unicodedata
 from collections import defaultdict
 from dataclasses import dataclass
 
-from translation_agent.models import AdjudicationContext, ReviewBundle
+from translation_agent.models import (
+    AdjudicationContext,
+    ReviewBundle,
+    ReviewIssue,
+    StructuredEvidence,
+)
 from translation_agent.models.review import DecisionMode, DisagreementBucket, ReviewStage
-from translation_agent.review.parser import IssueSeverity, ParsedReview, parse_reviewer_output
+from translation_agent.review.parser import (
+    IssueSeverity,
+    ParsedReviewIssue,
+    parse_reviewer_output,
+)
 
 _SEVERITY_WEIGHTS = {
     "minor": 0.5,
     "major": 1.2,
     "critical": 2.6,
+}
+_EVIDENCE_WEIGHTS = {
+    "minor": 0.2,
+    "major": 0.45,
+    "critical": 0.8,
 }
 _RISK_MULTIPLIERS = {
     "standard": 1.0,
@@ -22,6 +37,7 @@ _RISK_MULTIPLIERS = {
     "medical": 1.5,
     "critical": 1.75,
 }
+_HARD_CONTRADICTION_DIMENSIONS = {"meaning", "entity", "number_date_unit", "coverage"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,6 +49,8 @@ class DisagreementAssessment:
     average_confidence: float
     confidence_spread: float
     contradictory_evidence_count: int
+    hard_contradiction_count: int
+    blocking_hard_contradiction_count: int
     highest_issue_severity: IssueSeverity
     winner_mismatch: bool
     escalation_signal_count: int
@@ -68,51 +86,64 @@ class InvestigationResult:
     payload: dict[str, object]
 
 
+@dataclass(frozen=True, slots=True)
+class _ContradictionSummary:
+    total_count: int
+    hard_count: int
+    blocking_hard_count: int
+
+
 def assess_review_disagreement(
-    parsed_reviews: tuple[ParsedReview, ...],
+    reviews: tuple[ReviewBundle, ...],
     *,
     candidate_ids: tuple[str, ...],
     fallback_candidate_id: str | None,
     content_risk_class: str = "standard",
 ) -> DisagreementAssessment:
-    """Choose the adjudication path from parsed reviewer outputs."""
+    """Choose the adjudication path from structured reviewer outputs."""
 
-    winners = [
-        review.winner_candidate_id for review in parsed_reviews if review.winner_candidate_id
-    ]
-    preferred_candidate_id = _preferred_candidate_id(parsed_reviews, fallback_candidate_id)
+    preferred_candidate_id = _preferred_candidate_id(reviews, fallback_candidate_id)
     if preferred_candidate_id not in set(candidate_ids):
         preferred_candidate_id = fallback_candidate_id
 
-    confidences = [review.confidence for review in parsed_reviews]
+    confidences = [_review_confidence(review) for review in reviews]
     average_confidence = sum(confidences) / len(confidences) if confidences else 0.0
     confidence_spread = max(confidences) - min(confidences) if len(confidences) > 1 else 0.0
-    contradictory_evidence_count = _contradictory_evidence_count(parsed_reviews)
-    highest_issue_severity = _highest_issue_severity(parsed_reviews)
+    contradiction_summary = _contradiction_summary(reviews)
+    material_refute_count = _material_refute_count(reviews)
+    highest_issue_severity = _highest_issue_severity(reviews)
+    winners = [winner for review in reviews if (winner := _review_winner(review)) is not None]
     winner_mismatch = len(set(winners)) > 1
-    escalation_signal_count = sum(1 for review in parsed_reviews if review.escalation_signal)
+    escalation_signal_count = sum(1 for review in reviews if _review_escalation_signal(review))
 
     base_score = (
         (2.4 if winner_mismatch else 0.0)
         + confidence_spread * 2.0
-        + contradictory_evidence_count * 1.3
+        + contradiction_summary.total_count * 1.3
+        + material_refute_count * 1.2
         + _SEVERITY_WEIGHTS[highest_issue_severity]
         + (0.8 if escalation_signal_count else 0.0)
     )
     total_score = round(base_score * _RISK_MULTIPLIERS.get(content_risk_class, 1.0), 4)
-
     human_review_required = (
         preferred_candidate_id is None
-        or total_score >= 8.0
+        or contradiction_summary.blocking_hard_count >= 2
         or (
-            escalation_signal_count == len(parsed_reviews)
-            and winner_mismatch
+            contradiction_summary.blocking_hard_count >= 1
+            and content_risk_class in {"legal", "medical", "critical"}
             and highest_issue_severity == "critical"
         )
-        or (content_risk_class in {"legal", "medical", "critical"} and total_score >= 6.4)
+        or (
+            highest_issue_severity == "critical"
+            and escalation_signal_count == len(reviews)
+            and content_risk_class == "critical"
+        )
+        or total_score >= 15.0
     )
     if human_review_required:
         decision_mode = "human_review"
+    elif contradiction_summary.blocking_hard_count >= 1:
+        decision_mode = "stronger_adjudicator" if total_score >= 4.5 else "conflict_investigation"
     elif total_score >= 5.2:
         decision_mode = "stronger_adjudicator"
     elif total_score >= 3.0:
@@ -125,7 +156,9 @@ def assess_review_disagreement(
         preferred_candidate_id=preferred_candidate_id,
         average_confidence=round(average_confidence, 4),
         confidence_spread=round(confidence_spread, 4),
-        contradictory_evidence_count=contradictory_evidence_count,
+        contradictory_evidence_count=contradiction_summary.total_count,
+        hard_contradiction_count=contradiction_summary.hard_count,
+        blocking_hard_contradiction_count=contradiction_summary.blocking_hard_count,
         highest_issue_severity=highest_issue_severity,
         winner_mismatch=winner_mismatch,
         escalation_signal_count=escalation_signal_count,
@@ -145,9 +178,8 @@ def adjudicate_reviews(
 
     candidate_list = tuple(candidates)
     fallback_candidate_id = candidate_list[0].candidate_id if candidate_list else None
-    parsed_reviews = tuple(parse_reviewer_output(review.raw_review_text) for review in reviews)
     assessment = assess_review_disagreement(
-        parsed_reviews,
+        reviews,
         candidate_ids=context.candidate_ids,
         fallback_candidate_id=fallback_candidate_id,
         content_risk_class=context.content_risk_class,
@@ -155,7 +187,7 @@ def adjudicate_reviews(
     candidate_count = len(candidate_list)
     single_candidate_escalation = candidate_count == 1 and context.stage == "transcript"
     investigation_result = _execute_escalation(
-        parsed_reviews=parsed_reviews,
+        reviews=reviews,
         assessment=assessment,
         context=context,
         single_candidate_escalation=single_candidate_escalation,
@@ -206,8 +238,6 @@ def adjudicate_reviews(
 
 
 def content_risk_class_for_scenario(scenario: str) -> str:
-    """Map deterministic dry-run scenarios onto adjudication risk classes."""
-
     mapping = {
         "transcript_escalation": "critical",
         "translation_high_risk": "high",
@@ -218,81 +248,327 @@ def content_risk_class_for_scenario(scenario: str) -> str:
 
 
 def _preferred_candidate_id(
-    parsed_reviews: tuple[ParsedReview, ...],
+    reviews: tuple[ReviewBundle, ...],
     fallback_candidate_id: str | None,
 ) -> str | None:
-    winner_scores: dict[str, tuple[int, float]] = {}
-    for review in parsed_reviews:
-        if review.winner_candidate_id is None:
-            continue
-        count, confidence = winner_scores.get(review.winner_candidate_id, (0, 0.0))
-        winner_scores[review.winner_candidate_id] = (count + 1, confidence + review.confidence)
-    if not winner_scores:
+    scores: dict[str, float] = defaultdict(float)
+    for review in reviews:
+        review_confidence = _review_confidence(review)
+        for preference in _review_preferences(review):
+            scores[preference.candidate_id] += (
+                max(0.0, 1.5 - (preference.rank - 1) * 0.5) * review_confidence
+            )
+        for evidence in _review_evidence(review):
+            weight = _EVIDENCE_WEIGHTS[evidence.severity]
+            if evidence.polarity == "supports":
+                scores[evidence.candidate_id] += weight
+            else:
+                scores[evidence.candidate_id] -= weight
+        for issue in _review_issues(review):
+            if issue.candidate_id is None:
+                continue
+            scores[issue.candidate_id] -= _SEVERITY_WEIGHTS[issue.severity] * 0.15
+        winner = _review_winner(review)
+        if winner is not None and not review.candidate_preferences:
+            scores[winner] += review_confidence
+    if not scores:
         return fallback_candidate_id
-    ranked = sorted(winner_scores.items(), key=lambda item: (-item[1][0], -item[1][1], item[0]))
+    ranked = sorted(scores.items(), key=lambda item: (-item[1], item[0]))
     return ranked[0][0]
 
 
-def _contradictory_evidence_count(parsed_reviews: tuple[ParsedReview, ...]) -> int:
-    evidence_by_key: dict[str, set[str]] = defaultdict(set)
-    for review in parsed_reviews:
-        for evidence in review.quoted_evidence:
-            evidence_key = evidence.segment_id or evidence.quote.lower().strip()
-            candidate_id = evidence.candidate_id or review.winner_candidate_id
-            if candidate_id is not None:
-                evidence_by_key[evidence_key].add(candidate_id)
-    return sum(1 for candidate_ids in evidence_by_key.values() if len(candidate_ids) > 1)
+def _review_evidence(review: ReviewBundle) -> tuple[StructuredEvidence, ...]:
+    if review.structured_evidence:
+        return review.structured_evidence
+    parsed = _parse_legacy_review(review)
+    if parsed is None:
+        return ()
+    severity_by_candidate: dict[str, str] = {}
+    for issue in parsed.issues:
+        if issue.candidate_id is None:
+            continue
+        current = severity_by_candidate.get(issue.candidate_id, "minor")
+        if issue.severity == "critical" or (issue.severity == "major" and current == "minor"):
+            severity_by_candidate[issue.candidate_id] = issue.severity
+    evidence: list[StructuredEvidence] = []
+    for quoted in parsed.quoted_evidence:
+        candidate_id = quoted.candidate_id or parsed.winner_candidate_id
+        if candidate_id is None:
+            continue
+        severity = severity_by_candidate.get(
+            candidate_id,
+            "minor" if candidate_id == parsed.winner_candidate_id else "major",
+        )
+        evidence.append(
+            StructuredEvidence(
+                source_span_id=quoted.segment_id,
+                candidate_id=candidate_id,
+                dimension="meaning",
+                polarity="supports" if candidate_id == parsed.winner_candidate_id else "refutes",
+                normalized_value=None,
+                severity=severity,  # type: ignore[arg-type]
+                evidence_text=quoted.quote,
+            )
+        )
+    return tuple(evidence)
 
 
-def _highest_issue_severity(parsed_reviews: tuple[ParsedReview, ...]) -> IssueSeverity:
+def _review_preferences(review: ReviewBundle):
+    if review.candidate_preferences:
+        return review.candidate_preferences
+    winner = _review_winner(review)
+    if winner is None:
+        return ()
+    from translation_agent.models import CandidatePreference
+
+    return (
+        CandidatePreference(
+            candidate_id=winner,
+            rank=1,
+            rationale="legacy winner from parsed review prose",
+        ),
+    )
+
+
+def _review_issues(review: ReviewBundle) -> tuple[ReviewIssue, ...]:
+    if review.review_issues:
+        return review.review_issues
+    try:
+        parsed = parse_reviewer_output(review.raw_review_text)
+    except Exception:
+        return ()
+    return tuple(_legacy_issue_to_review_issue(issue) for issue in parsed.issues)
+
+
+def _review_winner(review: ReviewBundle) -> str | None:
+    if review.candidate_preferences:
+        return review.candidate_preferences[0].candidate_id
+    parsed = _parse_legacy_review(review)
+    return parsed.winner_candidate_id if parsed is not None else None
+
+
+def _review_confidence(review: ReviewBundle) -> float:
+    if review.candidate_preferences or review.structured_evidence:
+        return review.confidence
+    parsed = _parse_legacy_review(review)
+    if parsed is not None:
+        return parsed.confidence
+    return review.confidence
+
+
+def _review_escalation_signal(review: ReviewBundle) -> bool:
+    if review.structured_evidence or review.escalation_signal:
+        return review.escalation_signal
+    parsed = _parse_legacy_review(review)
+    return parsed.escalation_signal if parsed is not None else review.escalation_signal
+
+
+def _parse_legacy_review(review: ReviewBundle):
+    try:
+        return parse_reviewer_output(review.raw_review_text)
+    except Exception:
+        return None
+
+
+def _legacy_issue_to_review_issue(issue: ParsedReviewIssue) -> ReviewIssue:
+    dimension = (
+        issue.category
+        if issue.category
+        in {
+            "meaning",
+            "entity",
+            "number_date_unit",
+            "terminology",
+            "coverage",
+            "formatting",
+            "style",
+        }
+        else "meaning"
+    )
+    return ReviewIssue(
+        candidate_id=issue.candidate_id,
+        dimension=dimension,  # type: ignore[arg-type]
+        severity=issue.severity,
+        description=issue.description,
+    )
+
+
+def _contradiction_summary(reviews: tuple[ReviewBundle, ...]) -> _ContradictionSummary:
+    grouped: dict[tuple[str, str], list[StructuredEvidence]] = defaultdict(list)
+    for review in reviews:
+        for evidence in _review_evidence(review):
+            span_id = evidence.source_span_id or _quote_fallback_key(evidence.evidence_text)
+            if span_id is None:
+                continue
+            grouped[(span_id, evidence.dimension)].append(evidence)
+    total = 0
+    hard = 0
+    blocking_hard = 0
+    for (_, dimension), evidence_group in grouped.items():
+        if not _is_contradiction(evidence_group):
+            continue
+        total += 1
+        if dimension in _HARD_CONTRADICTION_DIMENSIONS:
+            hard += 1
+            if any(item.severity in {"major", "critical"} for item in evidence_group):
+                blocking_hard += 1
+        elif dimension == "terminology":
+            if any(item.severity in {"major", "critical"} for item in evidence_group):
+                total += 0
+        elif dimension in {"style", "formatting"}:
+            severities = {item.severity for item in evidence_group}
+            if severities <= {"minor"}:
+                total -= 1
+    return _ContradictionSummary(
+        total_count=max(total, 0),
+        hard_count=hard,
+        blocking_hard_count=blocking_hard,
+    )
+
+
+def _is_contradiction(evidence_group: list[StructuredEvidence]) -> bool:
+    if len({item.candidate_id for item in evidence_group}) < 2:
+        return False
+    polarities = {item.polarity for item in evidence_group}
+    if len(polarities) > 1:
+        return True
+    normalized_values = {
+        item.normalized_value for item in evidence_group if item.normalized_value is not None
+    }
+    if "omitted" in normalized_values and "preserved" in normalized_values:
+        return True
+    if len(normalized_values) > 1:
+        return True
+    if evidence_group[0].dimension == "meaning":
+        normalized_quotes = {_quote_fallback_key(item.evidence_text) for item in evidence_group}
+        return len({value for value in normalized_quotes if value is not None}) > 1
+    if evidence_group[0].dimension in {"style", "formatting"}:
+        return all(item.severity in {"major", "critical"} for item in evidence_group)
+    if evidence_group[0].dimension == "terminology":
+        return (
+            any(item.severity in {"major", "critical"} for item in evidence_group)
+            and len(normalized_values) > 1
+        )
+    return False
+
+
+def _quote_fallback_key(evidence_text: str) -> str | None:
+    normalized = unicodedata.normalize("NFKC", evidence_text).casefold()
+    normalized = "".join("<num>" if character.isdigit() else character for character in normalized)
+    normalized = " ".join(normalized.split()).strip(".,!?;:'\"()[]{}")
+    return normalized or None
+
+
+def _highest_issue_severity(reviews: tuple[ReviewBundle, ...]) -> IssueSeverity:
     highest = "minor"
-    for review in parsed_reviews:
-        for issue in review.issues:
+    for review in reviews:
+        for issue in _review_issues(review):
             if issue.severity == "critical":
                 return "critical"
             if issue.severity == "major":
                 highest = "major"
+        for evidence in _review_evidence(review):
+            if evidence.polarity != "refutes":
+                continue
+            if evidence.severity == "critical":
+                return "critical"
+            if evidence.severity == "major":
+                highest = "major"
     return highest
+
+
+def _material_refute_count(reviews: tuple[ReviewBundle, ...]) -> int:
+    keys = {
+        (
+            evidence.source_span_id or _quote_fallback_key(evidence.evidence_text),
+            evidence.candidate_id,
+            evidence.dimension,
+        )
+        for review in reviews
+        for evidence in _review_evidence(review)
+        if evidence.polarity == "refutes" and evidence.severity in {"major", "critical"}
+    }
+    return len({key for key in keys if key[0] is not None})
 
 
 def _bucket_for_score(
     assessment: DisagreementAssessment,
     *,
-    final_decision_mode: DecisionMode | None = None,
+    final_decision_mode: DecisionMode,
 ) -> DisagreementBucket:
-    mode = final_decision_mode or assessment.decision_mode
-    if mode == "human_review":
+    if final_decision_mode == "human_review":
         return "unresolved"
-    if mode == "stronger_adjudicator":
+    if assessment.total_score >= 5.2 or assessment.blocking_hard_contradiction_count:
         return "high"
-    if mode == "conflict_investigation":
+    if assessment.total_score >= 3.0 or assessment.contradictory_evidence_count:
         return "medium"
     return "low"
+
+
+def _execute_escalation(
+    *,
+    reviews: tuple[ReviewBundle, ...],
+    assessment: DisagreementAssessment,
+    context: AdjudicationContext,
+    single_candidate_escalation: bool,
+) -> InvestigationResult | None:
+    if assessment.decision_mode == "automatic_finalize" and not single_candidate_escalation:
+        return None
+    if single_candidate_escalation:
+        payload = {
+            "status": "checked",
+            "strategy": "single-candidate escalation check",
+            "review_ids": list(context.review_ids),
+        }
+        return InvestigationResult(
+            status="checked",
+            strategy="single-candidate escalation check",
+            recommended_candidate_id=assessment.preferred_candidate_id,
+            confidence_adjustment=-0.12,
+            rationale="Single surviving transcript candidate keeps a small confidence penalty.",
+            payload=payload,
+        )
+    strategy = (
+        "stronger adjudicator"
+        if assessment.decision_mode == "stronger_adjudicator"
+        else "conflict investigator"
+    )
+    payload = {
+        "status": "resolved",
+        "strategy": strategy,
+        "review_ids": list(context.review_ids),
+        "blocking_hard_contradictions": assessment.blocking_hard_contradiction_count,
+        "hard_contradictions": assessment.hard_contradiction_count,
+        "contradictions": assessment.contradictory_evidence_count,
+        "winner": assessment.preferred_candidate_id,
+    }
+    return InvestigationResult(
+        status="resolved",
+        strategy=strategy,
+        recommended_candidate_id=assessment.preferred_candidate_id,
+        confidence_adjustment=-0.05 if assessment.decision_mode != "automatic_finalize" else 0.0,
+        rationale="Structured contradiction normalization informed the escalation route.",
+        payload=payload,
+    )
 
 
 def _decision_confidence(
     *,
     assessment: DisagreementAssessment,
     candidate_count: int,
-    confidence_adjustment: float = 0.0,
-    final_decision_mode: DecisionMode | None = None,
+    confidence_adjustment: float,
+    final_decision_mode: DecisionMode,
 ) -> float:
-    penalty = (
-        assessment.confidence_spread * 0.35
-        + assessment.contradictory_evidence_count * 0.08
-        + {"minor": 0.05, "major": 0.18, "critical": 0.32}[assessment.highest_issue_severity]
-    )
-    mode = final_decision_mode or assessment.decision_mode
-    if mode == "conflict_investigation":
-        penalty += 0.12
-    elif mode == "stronger_adjudicator":
-        penalty += 0.2
-    elif mode == "human_review":
-        penalty += 0.42
-    if candidate_count == 1:
-        penalty += 0.1
-    confidence = assessment.average_confidence - penalty + confidence_adjustment
-    return round(max(0.0, min(confidence, 0.99)), 4)
+    base = assessment.average_confidence
+    if candidate_count <= 1:
+        base -= 0.07
+    if assessment.contradictory_evidence_count:
+        base -= min(0.04 * assessment.contradictory_evidence_count, 0.18)
+    if assessment.blocking_hard_contradiction_count:
+        base -= min(0.1 * assessment.blocking_hard_contradiction_count, 0.25)
+    if final_decision_mode == "human_review":
+        return 0.0
+    return round(max(0.0, min(base + confidence_adjustment, 0.99)), 2)
 
 
 def _rationale_summary(
@@ -301,266 +577,17 @@ def _rationale_summary(
     decision_mode: DecisionMode,
     candidate_count: int,
     assessment: DisagreementAssessment,
-    investigation_result: InvestigationResult | None = None,
+    investigation_result: InvestigationResult | None,
 ) -> str:
     stage_label = "Transcript" if stage == "transcript" else "Translation"
+    base = (
+        f"{stage_label} adjudication reviewed {candidate_count} candidate(s), "
+        f"{assessment.contradictory_evidence_count} contradiction group(s), and "
+        f"{assessment.blocking_hard_contradiction_count} blocking hard contradiction(s)."
+    )
     if decision_mode == "automatic_finalize":
-        if candidate_count == 1:
-            return (
-                f"{stage_label} finalized from the only surviving candidate with reduced "
-                "confidence."
-            )
-        return (
-            f"{stage_label} reviewers stayed within the low-disagreement band and finalized "
-            f"automatically after scoring {assessment.total_score:.2f} points."
-        )
-    if decision_mode == "conflict_investigation":
-        if investigation_result is not None:
-            return (
-                f"{stage_label} disagreement landed in the medium band; "
-                f"{investigation_result.strategy} ran before re-adjudication and "
-                f"{investigation_result.rationale}"
-            )
-        return (
-            f"{stage_label} disagreement landed in the medium band, so conflict investigation "
-            "resolved the winner without reopening the graph."
-        )
-    if decision_mode == "stronger_adjudicator":
-        if investigation_result is not None:
-            return (
-                f"{stage_label} disagreement was high enough to invoke "
-                f"{investigation_result.strategy}, "
-                f"which {investigation_result.rationale}"
-            )
-        return (
-            f"{stage_label} disagreement was high enough to invoke the stronger adjudicator hook "
-            "before finalization."
-        )
-    if investigation_result is not None and investigation_result.status in {
-        "timed_out",
-        "unresolved",
-    }:
-        return (
-            f"{stage_label} escalation remained unresolved after {investigation_result.strategy} "
-            "and now requires human review."
-        )
-    return (
-        f"{stage_label} disagreement remained unresolved after deterministic scoring and now "
-        "requires human review."
-    )
-
-
-def _execute_escalation(
-    *,
-    parsed_reviews: tuple[ParsedReview, ...],
-    assessment: DisagreementAssessment,
-    context: AdjudicationContext,
-    single_candidate_escalation: bool,
-) -> InvestigationResult | None:
-    if assessment.decision_mode == "automatic_finalize" and not single_candidate_escalation:
-        return None
-    if assessment.decision_mode == "conflict_investigation":
-        return _run_conflict_investigator(
-            parsed_reviews=parsed_reviews,
-            assessment=assessment,
-            context=context,
-        )
-    if assessment.decision_mode == "stronger_adjudicator":
-        return _run_stronger_adjudicator(
-            parsed_reviews=parsed_reviews,
-            assessment=assessment,
-            context=context,
-        )
-    if assessment.decision_mode == "human_review":
-        return _build_unresolved_investigation(
-            assessment=assessment,
-            context=context,
-            reason="kept the disagreement unresolved after deterministic scoring",
-        )
-    if single_candidate_escalation:
-        return InvestigationResult(
-            status="reviewed",
-            strategy="single-candidate escalation check",
-            recommended_candidate_id=assessment.preferred_candidate_id,
-            confidence_adjustment=-0.04,
-            rationale="confirmed the only surviving transcript without broadening the route.",
-            payload=_base_investigation_payload(
-                assessment=assessment,
-                context=context,
-                strategy="single-candidate escalation check",
-                status="reviewed",
-                recommended_candidate_id=assessment.preferred_candidate_id,
-                notes=["Only one transcript candidate survived; the path stayed deterministic."],
-            ),
-        )
-    return None
-
-
-def _run_conflict_investigator(
-    *,
-    parsed_reviews: tuple[ParsedReview, ...],
-    assessment: DisagreementAssessment,
-    context: AdjudicationContext,
-) -> InvestigationResult:
-    candidate_scores = _candidate_scores(parsed_reviews, candidate_ids=context.candidate_ids)
-    ranked = sorted(candidate_scores.items(), key=lambda item: (-item[1], item[0]))
-    recommended_candidate_id = ranked[0][0] if ranked else assessment.preferred_candidate_id
-    margin = 0.0
-    if len(ranked) > 1:
-        margin = round(ranked[0][1] - ranked[1][1], 4)
-    notes = [
-        (
-            "Conflict investigator synthesized winner counts, confidence, evidence overlap, "
-            "and issue severity."
-        ),
-        f"Top recommendation margin: {margin:.4f}",
-    ]
-    if recommended_candidate_id is None:
-        return _build_unresolved_investigation(
-            assessment=assessment,
-            context=context,
-            reason="could not recommend a candidate after conflict investigation",
-        )
-    return InvestigationResult(
-        status="resolved",
-        strategy="conflict investigator then re-adjudication",
-        recommended_candidate_id=recommended_candidate_id,
-        confidence_adjustment=0.04 if margin >= 0.2 else 0.02,
-        rationale=f"resolved the winner as {recommended_candidate_id} before re-adjudication.",
-        payload=_base_investigation_payload(
-            assessment=assessment,
-            context=context,
-            strategy="conflict investigator",
-            status="resolved",
-            recommended_candidate_id=recommended_candidate_id,
-            notes=notes,
-            stage_payload={
-                "re_adjudication": {
-                    "decision_mode": "conflict_investigation",
-                    "recommended_candidate_id": recommended_candidate_id,
-                    "margin": margin,
-                }
-            },
-        ),
-    )
-
-
-def _run_stronger_adjudicator(
-    *,
-    parsed_reviews: tuple[ParsedReview, ...],
-    assessment: DisagreementAssessment,
-    context: AdjudicationContext,
-) -> InvestigationResult:
-    candidate_scores = _candidate_scores(parsed_reviews, candidate_ids=context.candidate_ids)
-    ranked = sorted(candidate_scores.items(), key=lambda item: (-item[1], item[0]))
-    recommended_candidate_id = ranked[0][0] if ranked else assessment.preferred_candidate_id
-    margin = 0.0
-    if len(ranked) > 1:
-        margin = round(ranked[0][1] - ranked[1][1], 4)
-    if recommended_candidate_id is None or (
-        assessment.highest_issue_severity == "critical" and margin < 0.15
-    ):
-        return _build_unresolved_investigation(
-            assessment=assessment,
-            context=context,
-            reason="stronger adjudicator stayed unconvinced by the remaining evidence",
-        )
-    notes = [
-        "Stronger adjudicator applied stricter evidence weighting and higher severity penalties.",
-        f"Top recommendation margin: {margin:.4f}",
-    ]
-    return InvestigationResult(
-        status="resolved",
-        strategy="stronger adjudicator",
-        recommended_candidate_id=recommended_candidate_id,
-        confidence_adjustment=0.03 if margin >= 0.25 else 0.01,
-        rationale=f"selected {recommended_candidate_id} after stronger adjudication.",
-        payload=_base_investigation_payload(
-            assessment=assessment,
-            context=context,
-            strategy="stronger adjudicator",
-            status="resolved",
-            recommended_candidate_id=recommended_candidate_id,
-            notes=notes,
-            stage_payload={"margin": margin},
-        ),
-    )
-
-
-def _build_unresolved_investigation(
-    *,
-    assessment: DisagreementAssessment,
-    context: AdjudicationContext,
-    reason: str,
-) -> InvestigationResult:
-    return InvestigationResult(
-        status="unresolved",
-        strategy="escalation review",
-        recommended_candidate_id=None,
-        confidence_adjustment=0.0,
-        rationale=f"{reason} and escalated to human review.",
-        payload=_base_investigation_payload(
-            assessment=assessment,
-            context=context,
-            strategy="escalation review",
-            status="unresolved",
-            recommended_candidate_id=None,
-            notes=[reason],
-        ),
-    )
-
-
-def _base_investigation_payload(
-    *,
-    assessment: DisagreementAssessment,
-    context: AdjudicationContext,
-    strategy: str,
-    status: str,
-    recommended_candidate_id: str | None,
-    notes: list[str],
-    stage_payload: dict[str, object] | None = None,
-) -> dict[str, object]:
-    payload: dict[str, object] = {
-        "stage": context.stage,
-        "candidate_ids": list(context.candidate_ids),
-        "review_ids": list(context.review_ids),
-        "preferred_candidate_id": assessment.preferred_candidate_id,
-        "recommended_candidate_id": recommended_candidate_id,
-        "winner_mismatch": assessment.winner_mismatch,
-        "confidence_spread": assessment.confidence_spread,
-        "contradictory_evidence_count": assessment.contradictory_evidence_count,
-        "highest_issue_severity": assessment.highest_issue_severity,
-        "total_score": assessment.total_score,
-        "content_risk_class": context.content_risk_class,
-        "strategy": strategy,
-        "status": status,
-        "notes": notes,
-    }
-    if stage_payload:
-        payload.update(stage_payload)
-    return payload
-
-
-def _candidate_scores(
-    parsed_reviews: tuple[ParsedReview, ...],
-    *,
-    candidate_ids: tuple[str, ...],
-) -> dict[str, float]:
-    scores = {candidate_id: 0.0 for candidate_id in candidate_ids}
-    for review in parsed_reviews:
-        if review.winner_candidate_id is not None:
-            scores.setdefault(review.winner_candidate_id, 0.0)
-            scores[review.winner_candidate_id] += 1.0 + review.confidence
-        for evidence in review.quoted_evidence:
-            if evidence.candidate_id is None:
-                continue
-            scores.setdefault(evidence.candidate_id, 0.0)
-            scores[evidence.candidate_id] += 0.15
-        for issue in review.issues:
-            if issue.candidate_id is None:
-                continue
-            scores.setdefault(issue.candidate_id, 0.0)
-            scores[issue.candidate_id] -= {"minor": 0.12, "major": 0.35, "critical": 0.7}[
-                issue.severity
-            ]
-    return scores
+        return base + " Structured evidence stayed below the escalation threshold."
+    if decision_mode == "human_review":
+        return base + " Remaining hard contradictions require human review."
+    strategy = investigation_result.strategy if investigation_result is not None else "escalation"
+    return base + f" The run continued through {strategy} before final selection."

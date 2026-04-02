@@ -111,10 +111,6 @@ def test_reference_evaluation_path_publishes_asset_artifacts_and_keeps_canonical
     regenerated_draft = json.loads(
         blob_store.read_bytes(manifest["regenerated_draft_refs"][0]).decode("utf-8")
     )
-    proposal = json.loads(
-        blob_store.read_bytes(manifest["improvement_proposal_refs"][0]).decode("utf-8")
-    )
-
     assert blob_store.exists(
         asset_path("asset-id:asset-1", "references", "transcript", "latest.json")
     )
@@ -123,8 +119,11 @@ def test_reference_evaluation_path_publishes_asset_artifacts_and_keeps_canonical
     assert len(evaluation_report["evaluated_runs"]) == 2
     assert regenerated_draft["generated_from_reference_transcript"] is True
     assert regenerated_draft["replaces_canonical"] is False
-    assert proposal["status"] == "proposed"
-    assert proposal["activation_mode"] == "approval_required"
+    assert manifest["improvement_proposal_refs"] == []
+    assert evaluation_report["failures"] == []
+    assert evaluation_report["proposal_refs"] == []
+    assert evaluation_report["proposal_compatibility"][0]["scope_kind"] == "pair"
+    assert "control_metrics" in evaluation_report
 
 
 def test_parse_srt_uses_pysubs2_plaintext_for_reference_segments() -> None:
@@ -166,21 +165,20 @@ def test_parse_srt_rejects_malformed_payloads_without_timing_lines() -> None:
         )
 
 
-def test_approved_prompt_proposals_affect_prompt_resolution(tmp_path: Path) -> None:
+def test_active_prompt_proposals_affect_prompt_resolution(tmp_path: Path) -> None:
     store = SQLiteOperationalStore(tmp_path / "state.sqlite3")
     try:
         proposal = PromptEvolutionProposal(
-            proposal_id="proposal-approved",
+            proposal_id="proposal-active",
             job_id="job-1",
             source_consolidation_id="consolidation-1",
             prompt_family="translation",
             target_model_id="gpt-5.4-mini",
             target_prompt_version="phase-5-v1",
             target_prompt_variant_id="variant-a",
-            status="approved",
-            activation_mode="approval_required",
-            auto_activate=False,
-            rationale="Approved correction.",
+            base_prompt_version="phase-5-v1",
+            status="active",
+            rationale="Automatic canary promotion.",
             suggested_changes=(
                 PromptChange(
                     section="system",
@@ -190,9 +188,11 @@ def test_approved_prompt_proposals_affect_prompt_resolution(tmp_path: Path) -> N
             metadata={
                 "source_language": "en",
                 "target_language": "fr",
+                "scope_kind": "pair",
+                "scope_key": "en::fr",
                 "media_key": "asset-id:asset-1",
                 "proposal_ref": (
-                    "assets/asset-id-asset-1/improvement-proposals/proposal-approved.json"
+                    "assets/asset-id-asset-1/improvement-proposals/proposal-active.json"
                 ),
             },
         )
@@ -213,5 +213,6 @@ def test_approved_prompt_proposals_affect_prompt_resolution(tmp_path: Path) -> N
     assert resolved.effective_prompt_version != "phase-5-v1"
     assert "Preserve OpenAI exactly across the translation." in resolved.instructions
     assert resolved.applied_proposal_refs == (
-        "assets/asset-id-asset-1/improvement-proposals/proposal-approved.json",
+        "assets/asset-id-asset-1/improvement-proposals/proposal-active.json",
     )
+    assert resolved.resolution_mode == "active"
