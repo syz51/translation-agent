@@ -163,6 +163,7 @@ def _job_context(job_id: str = "job-phase-four") -> JobContext:
         requested_by="tester@example.com",
         created_at=datetime(2026, 3, 30, 12, 0, tzinfo=UTC),
         profile_ref="profiles/default",
+        media_key=f"source-ref:{job_id}",
     )
 
 

@@ -12,6 +12,7 @@ from translation_agent.models import (
     JobContext,
     MemoryWrite,
     MemoryWriteBatch,
+    PromptEvolutionProposal,
     Segment,
     TranscriptCandidate,
     TranslationCandidate,
@@ -35,6 +36,7 @@ def _job(job_id: str = "job-operational") -> JobContext:
         requested_by="tester@example.com",
         created_at=datetime(2026, 3, 31, 12, 0, tzinfo=UTC),
         profile_ref="profiles/default",
+        media_key=f"source-ref:{job_id}",
     )
 
 
@@ -405,3 +407,94 @@ def test_sqlite_operational_store_missing_lookups_and_updates_are_explicit(
             store.update_run("missing-run", status="failed")
         with pytest.raises(KeyError, match="missing-node"):
             store.update_node_execution("missing-node", status="failed")
+
+
+@pytest.mark.unit
+def test_sqlite_operational_store_resolves_assets_and_persists_prompt_proposals(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.sqlite3"
+
+    with SQLiteOperationalStore(db_path) as store:
+        asset = store.resolve_asset(
+            asset_id="asset-1",
+            media_fingerprint="sha256:abc123",
+            first_seen_run_id="run-1",
+            source_language="en",
+            target_language="fr",
+        )
+        proposal = PromptEvolutionProposal(
+            proposal_id="proposal-1",
+            job_id="job-operational",
+            source_consolidation_id="consolidation-1",
+            prompt_family="translation",
+            target_model_id="gpt-5.4-mini",
+            target_prompt_version="phase-5-v1",
+            target_prompt_variant_id="variant-a",
+            status="approved",
+            activation_mode="approval_required",
+            auto_activate=False,
+            rationale="Approved reference-evaluation improvement.",
+            metadata={
+                "source_language": "en",
+                "target_language": "fr",
+                "media_key": asset.media_key,
+                "proposal_ref": "assets/asset-id-asset-1/improvement-proposals/proposal-1.json",
+            },
+        )
+        store.save_prompt_evolution_proposal(proposal)
+
+    with SQLiteOperationalStore(db_path) as reopened:
+        resolved = reopened.resolve_asset(
+            asset_id="asset-1",
+            media_fingerprint=None,
+            first_seen_run_id="run-2",
+            source_language="en",
+            target_language="fr",
+        )
+        stored_asset = reopened.get_asset(asset.media_key)
+        proposals = reopened.list_prompt_evolution_proposals(
+            status="approved",
+            target_model_id="gpt-5.4-mini",
+            target_language="fr",
+            source_language="en",
+            media_key=asset.media_key,
+        )
+
+    assert resolved.media_key == asset.media_key
+    assert stored_asset is not None
+    assert stored_asset.asset_id == "asset-1"
+    assert stored_asset.media_fingerprint == "sha256:abc123"
+    assert proposals == [proposal]
+
+
+@pytest.mark.unit
+def test_sqlite_operational_store_rejects_conflicting_asset_mappings(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.sqlite3"
+    with SQLiteOperationalStore(db_path) as store:
+        store.resolve_asset(
+            asset_id="asset-1",
+            media_fingerprint="sha256:aaa",
+            first_seen_run_id="run-1",
+            source_language="en",
+            target_language="fr",
+        )
+        store.resolve_asset(
+            asset_id="asset-2",
+            media_fingerprint="sha256:bbb",
+            first_seen_run_id="run-2",
+            source_language="en",
+            target_language="fr",
+        )
+
+        with pytest.raises(
+            ValueError,
+            match="conflicting asset_id and media_fingerprint mappings require operator action",
+        ):
+            store.resolve_asset(
+                asset_id="asset-1",
+                media_fingerprint="sha256:bbb",
+                first_seen_run_id="run-3",
+                source_language="en",
+                target_language="fr",
+            )

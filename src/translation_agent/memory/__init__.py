@@ -8,6 +8,7 @@ from .prompt_evolution import (
     DeterministicPromptEvolutionBackend,
     PromptEvolutionBackend,
 )
+from .prompt_resolution import PromptResolver, ProposalBackedPromptResolver
 from .recall import (
     BlobBackedLongTermMemoryStore,
     InMemoryLongTermMemoryStore,
@@ -26,5 +27,7 @@ __all__ = [
     "MemoryConsolidationBackend",
     "MemoryRecallBackend",
     "MemoryStagingBackend",
+    "PromptResolver",
     "PromptEvolutionBackend",
+    "ProposalBackedPromptResolver",
 ]

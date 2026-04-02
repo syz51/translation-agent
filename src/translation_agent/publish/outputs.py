@@ -31,6 +31,16 @@ def publish_outputs(state: GraphState, runtime: WorkflowRuntime) -> tuple[Publis
 
     transcript = _final_transcript(state, runtime)
     translation = _final_translation(state, runtime)
+    transcript_decision = _decision(
+        runtime,
+        state.final_transcript_decision_ref,
+        FinalTranscriptDecision,
+    )
+    translation_decision = _decision(
+        runtime,
+        state.final_translation_decision_ref,
+        FinalTranslationDecision,
+    )
     transcript_ref = None
     translation_ref = None
     translation_failure_ref = None
@@ -54,6 +64,12 @@ def publish_outputs(state: GraphState, runtime: WorkflowRuntime) -> tuple[Publis
                 "recoverable": True,
                 "transcript_ref": transcript_ref,
                 "translation_decision_ref": state.final_translation_decision_ref,
+                "failure_summary": (
+                    translation_decision.rationale_summary
+                    if translation_decision is not None
+                    else None
+                ),
+                "failure_reasons": _translation_failure_reasons(state),
             },
         )
 
@@ -61,6 +77,17 @@ def publish_outputs(state: GraphState, runtime: WorkflowRuntime) -> tuple[Publis
     memory_batch_refs = _refs_for_fact(state, "memory_batch_staged")
     memory_consolidation_refs = _refs_for_fact(state, "memory_batch_consolidated")
     prompt_evolution_refs = _refs_for_fact(state, "translation_prompt_evolution")
+    reference_transcript_refs = _artifact_refs(state.reference_transcript_ref)
+    evaluation_report_refs = _artifact_refs(state.evaluation_report_ref)
+    regenerated_draft_refs = _artifact_refs(state.regenerated_translation_draft_ref)
+    improvement_proposal_refs = tuple(
+        dict.fromkeys(
+            (
+                *state.improvement_proposal_refs,
+                *_refs_for_fact(state, "reference_improvement_proposal"),
+            )
+        )
+    )
 
     export_text_ref = job_path(state.job, "exports", "translation.txt")
     export_json_ref = job_path(state.job, "exports", "translation.json")
@@ -113,16 +140,12 @@ def publish_outputs(state: GraphState, runtime: WorkflowRuntime) -> tuple[Publis
             memory_batch_refs=memory_batch_refs,
             memory_consolidation_refs=memory_consolidation_refs,
             prompt_evolution_refs=prompt_evolution_refs,
-            transcript_decision=_decision(
-                runtime,
-                state.final_transcript_decision_ref,
-                FinalTranscriptDecision,
-            ),
-            translation_decision=_decision(
-                runtime,
-                state.final_translation_decision_ref,
-                FinalTranslationDecision,
-            ),
+            reference_transcript_refs=reference_transcript_refs,
+            evaluation_report_refs=evaluation_report_refs,
+            regenerated_draft_refs=regenerated_draft_refs,
+            improvement_proposal_refs=improvement_proposal_refs,
+            transcript_decision=transcript_decision,
+            translation_decision=translation_decision,
         ),
     )
 
@@ -137,6 +160,10 @@ def publish_outputs(state: GraphState, runtime: WorkflowRuntime) -> tuple[Publis
         memory_batch_refs=memory_batch_refs,
         memory_consolidation_refs=memory_consolidation_refs,
         prompt_evolution_refs=prompt_evolution_refs,
+        reference_transcript_refs=reference_transcript_refs,
+        evaluation_report_refs=evaluation_report_refs,
+        regenerated_draft_refs=regenerated_draft_refs,
+        improvement_proposal_refs=improvement_proposal_refs,
     )
     manifest_key = published_artifacts_key(state.job)
     manifest_ref = write_model_artifact(runtime, manifest_key, artifacts)
@@ -196,6 +223,10 @@ def _scorecard_payload(
     memory_batch_refs: tuple[str, ...],
     memory_consolidation_refs: tuple[str, ...],
     prompt_evolution_refs: tuple[str, ...],
+    reference_transcript_refs: tuple[str, ...],
+    evaluation_report_refs: tuple[str, ...],
+    regenerated_draft_refs: tuple[str, ...],
+    improvement_proposal_refs: tuple[str, ...],
     transcript_decision: FinalTranscriptDecision | None,
     translation_decision: FinalTranslationDecision | None,
 ) -> dict[str, Any]:
@@ -213,6 +244,10 @@ def _scorecard_payload(
         "memory_batch_refs": list(memory_batch_refs),
         "memory_consolidation_refs": list(memory_consolidation_refs),
         "prompt_evolution_refs": list(prompt_evolution_refs),
+        "reference_transcript_refs": list(reference_transcript_refs),
+        "evaluation_report_refs": list(evaluation_report_refs),
+        "regenerated_draft_refs": list(regenerated_draft_refs),
+        "improvement_proposal_refs": list(improvement_proposal_refs),
         "routing_facts": [fact.model_dump(mode="json") for fact in state.routing_facts],
         "transcript_decision": (
             transcript_decision.model_dump(mode="json") if transcript_decision is not None else None
@@ -291,6 +326,26 @@ def _refs_for_fact(state: GraphState, fact_type: str) -> tuple[str, ...]:
         for fact in state.routing_facts
         if fact.fact_type == fact_type and fact.source_ref is not None
     )
+
+
+def _artifact_refs(ref: str | None) -> tuple[str, ...]:
+    if ref is None:
+        return ()
+    return (ref,)
+
+
+def _translation_failure_reasons(state: GraphState) -> list[str]:
+    reasons: list[str] = []
+    seen_reasons: set[str] = set()
+    for fact in state.routing_facts:
+        if fact.fact_type != "translation_variant_failed" or fact.source_ref is None:
+            continue
+        reason = f"{fact.value}: {fact.source_ref}"
+        if reason in seen_reasons:
+            continue
+        seen_reasons.add(reason)
+        reasons.append(reason)
+    return reasons
 
 
 def _delivery_status(state: GraphState) -> str:

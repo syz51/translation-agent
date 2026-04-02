@@ -27,6 +27,7 @@ def _request_context(job_id: str = "job-ffmpeg") -> RequestContext:
             requested_by="tester@example.com",
             created_at=datetime(2026, 3, 31, 12, 0, tzinfo=UTC),
             profile_ref="profiles/default",
+            media_key=f"source-ref:{job_id}",
         ),
         source_artifact_ref=f"jobs/{job_id}.json",
         metadata={},

@@ -42,6 +42,10 @@ class GraphState(ContractModel):
     translation_review_ids: tuple[str, ...] = ()
     final_translation_candidate_id: str | None = None
     final_translation_decision_ref: str | None = None
+    reference_transcript_ref: str | None = None
+    evaluation_report_ref: str | None = None
+    regenerated_translation_draft_ref: str | None = None
+    improvement_proposal_refs: tuple[str, ...] = ()
     memory_batch_ids: tuple[str, ...] = ()
     published_artifact_refs: tuple[str, ...] = ()
     routing_facts: tuple[RoutingFact, ...] = ()

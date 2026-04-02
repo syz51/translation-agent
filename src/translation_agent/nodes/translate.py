@@ -40,6 +40,26 @@ def generate_translation_candidates(
     routing_facts = list(state.routing_facts)
 
     for prompt_variant_id in PROMPT_VARIANTS:
+        resolved_prompt = runtime.prompt_resolver.resolve_translation_prompt(
+            base_prompt_version=getattr(
+                runtime.translation_adapter,
+                "_prompt_version",
+                "unversioned",
+            ),
+            prompt_variant_id=prompt_variant_id,
+            model_id=runtime.translation_adapter.model_id,
+            source_language=state.job.source_language,
+            target_language=state.job.target_language,
+            media_key=state.job.media_key,
+        )
+        variant_request_context = request_context.model_copy(
+            update={
+                "metadata": {
+                    **request_context.metadata,
+                    "resolved_translation_prompt": resolved_prompt.model_dump(mode="json"),
+                }
+            }
+        )
         try:
             raw_payload: dict[str, object] | None = None
             if isinstance(runtime.translation_adapter, RawPayloadTranslationAdapter):
@@ -47,14 +67,14 @@ def generate_translation_candidates(
                     runtime.translation_adapter.generate_translation_with_payload(
                         transcript,
                         prompt_variant_id,
-                        request_context,
+                        variant_request_context,
                     )
                 )
             else:
                 candidate = runtime.translation_adapter.generate_translation(
                     transcript,
                     prompt_variant_id,
-                    request_context,
+                    variant_request_context,
                 )
         except Exception as exc:
             routing_facts.append(
@@ -78,8 +98,14 @@ def generate_translation_candidates(
             payload_refs.append(raw_payload_ref)
         staged_candidate = candidate.model_copy(
             update={
+                "prompt_version": resolved_prompt.effective_prompt_version,
                 "raw_response_ref": raw_payload_ref,
-                "metadata": strip_private_metadata(candidate.metadata),
+                "metadata": strip_private_metadata(
+                    {
+                        **candidate.metadata,
+                        "prompt_resolver": resolved_prompt.model_dump(mode="json"),
+                    }
+                ),
             }
         )
         staged_refs.append(

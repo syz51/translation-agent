@@ -92,6 +92,25 @@ def test_classify_http_error_extracts_nested_message_and_retryability() -> None:
     assert str(terminal) == "plain failure"
 
 
+def test_classify_http_error_marks_insufficient_quota_as_terminal() -> None:
+    quota_error = classify_http_error(
+        "openai",
+        HttpResponse(
+            status_code=429,
+            headers={},
+            body=(
+                b'{"error": {"message": "quota exceeded", "type": "insufficient_quota", '
+                b'"code": "insufficient_quota"}}'
+            ),
+        ),
+    )
+
+    assert quota_error is not None
+    assert quota_error.retryable is False
+    assert quota_error.status_code == 429
+    assert str(quota_error) == "quota exceeded"
+
+
 def test_perform_with_retries_retries_coerced_provider_errors() -> None:
     attempts = 0
     sleeps: list[float] = []

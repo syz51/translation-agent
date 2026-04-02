@@ -24,6 +24,14 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser = subparsers.add_parser("run-job", help="Execute the local dry-run workflow")
     run_parser.add_argument("source")
     run_parser.add_argument("--job-id")
+    run_parser.add_argument("--asset-id")
+    run_parser.add_argument("--reference-transcript-source")
+    run_parser.add_argument("--reference-transcript-format", choices=["srt"])
+    run_parser.add_argument(
+        "--reference-mode",
+        choices=["none", "evaluate_and_regenerate"],
+        default="none",
+    )
     run_parser.add_argument("--json", action="store_true", dest="as_json")
     return parser
 
@@ -84,7 +92,16 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "run-job":
-        result = run_job(RunJobRequest(source=args.source, job_id=args.job_id))
+        result = run_job(
+            RunJobRequest(
+                source=args.source,
+                job_id=args.job_id,
+                asset_id=args.asset_id,
+                reference_transcript_source=args.reference_transcript_source,
+                reference_transcript_format=args.reference_transcript_format,
+                reference_mode=args.reference_mode,
+            )
+        )
         payload = {
             key: str(value) if hasattr(value, "__fspath__") else value
             for key, value in asdict(result).items()
@@ -96,6 +113,10 @@ def main(argv: list[str] | None = None) -> int:
             print(result.status)
             print(f"{result.state_backend}: {result.state_db_target}")
             print(result.trace_path)
+            if result.failure_summary:
+                print(result.failure_summary)
+            for reason in result.failure_reasons:
+                print(reason)
         return 0
 
     parser.error(f"unsupported command: {args.command}")

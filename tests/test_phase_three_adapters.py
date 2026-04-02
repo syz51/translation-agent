@@ -219,6 +219,7 @@ def _job_context(job_id: str = "job-phase-three") -> JobContext:
         requested_by="tester@example.com",
         created_at=datetime(2026, 3, 30, 12, 0, tzinfo=UTC),
         profile_ref="profiles/default",
+        media_key=f"source-ref:{job_id}",
     )
 
 
@@ -1097,6 +1098,55 @@ def test_openai_translation_adapter_retries_retryable_error(tmp_path: Path) -> N
 
     assert candidate.full_text == "Bonjour le monde"
     assert len(transport.requests) == 2
+
+
+def test_openai_translation_adapter_does_not_retry_insufficient_quota(
+    tmp_path: Path,
+) -> None:
+    blob_store = LocalBlobStore(tmp_path / "blobs")
+    transport = SequencedTransport(
+        [
+            _json_response(
+                {
+                    "error": {
+                        "message": "quota exceeded",
+                        "type": "insufficient_quota",
+                        "code": "insufficient_quota",
+                    }
+                },
+                status_code=429,
+            ),
+            _json_response(
+                {
+                    "output_text": json.dumps(
+                        {
+                            "full_text": "Bonjour le monde",
+                            "segments": [
+                                {
+                                    "segment_id": "seg-1",
+                                    "target_text": "Bonjour le monde",
+                                }
+                            ],
+                        }
+                    )
+                }
+            ),
+        ]
+    )
+    adapter = OpenAITranslationAdapter(
+        api_key="test-key",
+        blob_store=blob_store,
+        transport=transport,
+        retry_policy=_retry_policy(),
+        sleep=lambda _: None,
+    )
+
+    with pytest.raises(AdapterError, match="quota exceeded") as exc_info:
+        adapter.generate_translation(_transcript_candidate(), "variant-a", _request_context())
+
+    assert exc_info.value.retryable is False
+    assert exc_info.value.status_code == 429
+    assert len(transport.requests) == 1
 
 
 def test_openai_translation_adapter_rejects_non_json_output(tmp_path: Path) -> None:

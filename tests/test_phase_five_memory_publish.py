@@ -13,6 +13,7 @@ from translation_agent.graph import (
     build_phase_two_runtime,
     run_workflow,
 )
+from translation_agent.graph.state import RoutingFact
 from translation_agent.memory import (
     DeterministicMemoryConsolidationBackend,
     DeterministicPromptEvolutionBackend,
@@ -27,6 +28,7 @@ from translation_agent.models import (
     MemoryWriteBatch,
 )
 from translation_agent.observability import NoOpTraceSink
+from translation_agent.publish.outputs import publish_outputs
 from translation_agent.storage import (
     LocalBlobStore,
     NodeExecutionRecord,
@@ -175,6 +177,7 @@ def _job_context(job_id: str = "job-phase-five") -> JobContext:
         requested_by="tester@example.com",
         created_at=datetime(2026, 3, 31, 12, 0, tzinfo=UTC),
         profile_ref="profiles/default",
+        media_key=f"source-ref:{job_id}",
     )
 
 
@@ -253,7 +256,8 @@ def test_phase_five_happy_path_publishes_audit_ready_outputs(tmp_path: Path) -> 
     assert scorecard["memory_consolidation_refs"]
     assert scorecard["prompt_evolution_refs"]
     assert prompt_proposal["target_model_id"] == runtime.translation_adapter.model_id
-    assert prompt_proposal["auto_activate"] is True
+    assert prompt_proposal["auto_activate"] is False
+    assert prompt_proposal["activation_mode"] == "approval_required"
     assert any("/memory/prompt-evolution/" in ref for ref in final_state.published_artifact_refs)
 
 
@@ -263,10 +267,48 @@ def test_phase_five_translation_failure_publishes_recoverable_manifest(tmp_path:
     assert blob_store.exists(_artifact_path("published", "translation-failed.json"))
     assert not blob_store.exists(_artifact_path("published", "translation.json"))
 
+    failure_manifest = json.loads(
+        blob_store.read_bytes(_artifact_path("published", "translation-failed.json")).decode(
+            "utf-8"
+        )
+    )
     scorecard = json.loads(
         blob_store.read_bytes(_artifact_path("published", "scorecard.json")).decode("utf-8")
     )
+    assert failure_manifest["failure_summary"] == (
+        "All translation variants failed; transcript preserved for recovery."
+    )
+    assert failure_manifest["failure_reasons"] == [
+        "variant-a: simulated translation failure for variant-a",
+        "variant-b: simulated translation failure for variant-b",
+    ]
     assert scorecard["translation_failed"] is True
+
+
+def test_phase_five_translation_failure_manifest_dedupes_duplicate_reasons(tmp_path: Path) -> None:
+    final_state, runtime, blob_store = _run_workflow(tmp_path, scenario="translation_failed")
+    duplicate_reason = RoutingFact(
+        stage="translate",
+        fact_type="translation_variant_failed",
+        value="variant-a",
+        source_ref="simulated translation failure for variant-a",
+    )
+    deduped_state = final_state.model_copy(
+        update={"routing_facts": (*final_state.routing_facts, duplicate_reason)}
+    )
+
+    runtime.run_store.update_run(deduped_state.run_id, status="running")
+    publish_outputs(deduped_state, runtime)
+
+    failure_manifest = json.loads(
+        blob_store.read_bytes(_artifact_path("published", "translation-failed.json")).decode(
+            "utf-8"
+        )
+    )
+    assert failure_manifest["failure_reasons"] == [
+        "variant-a: simulated translation failure for variant-a",
+        "variant-b: simulated translation failure for variant-b",
+    ]
 
 
 def test_phase_five_background_memory_failures_do_not_block_finalization(tmp_path: Path) -> None:
@@ -398,7 +440,8 @@ def test_phase_five_prompt_evolution_uses_runtime_model_selection() -> None:
     assert proposal is not None
     assert proposal.target_model_id == "openai-generic-model"
     assert proposal.target_prompt_variant_id == "variant-b"
-    assert proposal.auto_activate is True
+    assert proposal.activation_mode == "approval_required"
+    assert proposal.auto_activate is False
 
 
 @pytest.mark.parametrize("bucket", ["medium", "high"])

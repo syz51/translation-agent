@@ -1,7 +1,25 @@
 """Canonical models package."""
 
 from .artifacts import AudioArtifact, PublishContext, PublishedArtifacts
-from .jobs import JobContext, RequestContext, RoutingContext
+from .evaluation import (
+    AssetRecord,
+    EvaluatedRunReport,
+    EvaluationReport,
+    HistoricalRunLink,
+    ReferenceSegment,
+    ReferenceTranscript,
+    RegeneratedTranslationDraft,
+    TranscriptAlignmentReport,
+    TranscriptMismatchSpan,
+    TranslationScore,
+)
+from .jobs import (
+    JobContext,
+    ReferenceMode,
+    ReferenceTranscriptFormat,
+    RequestContext,
+    RoutingContext,
+)
 from .memory import (
     MemoryBundle,
     MemoryConsolidation,
@@ -12,6 +30,7 @@ from .memory import (
     PromptChange,
     PromptEvolutionProposal,
     ProviderCaveat,
+    ResolvedTranslationPrompt,
 )
 from .review import (
     AdjudicationContext,
@@ -30,10 +49,14 @@ from .translation import TranslationCandidate
 __all__ = [
     "AdjudicationContext",
     "AdjudicationScorecard",
+    "AssetRecord",
     "AudioArtifact",
     "CandidatePreference",
+    "EvaluatedRunReport",
+    "EvaluationReport",
     "FinalTranscriptDecision",
     "FinalTranslationDecision",
+    "HistoricalRunLink",
     "JobContext",
     "MemoryBundle",
     "MemoryConsolidation",
@@ -47,12 +70,21 @@ __all__ = [
     "PublishContext",
     "PublishedArtifacts",
     "QuotedEvidence",
+    "ReferenceMode",
+    "ReferenceSegment",
+    "ReferenceTranscript",
+    "ReferenceTranscriptFormat",
+    "RegeneratedTranslationDraft",
     "RequestContext",
+    "ResolvedTranslationPrompt",
     "ReviewBundle",
     "ReviewContext",
     "RoutingContext",
     "Segment",
     "SuggestedFix",
+    "TranscriptAlignmentReport",
+    "TranscriptMismatchSpan",
     "TranscriptCandidate",
+    "TranslationScore",
     "TranslationCandidate",
 ]

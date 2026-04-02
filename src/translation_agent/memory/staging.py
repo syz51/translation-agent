@@ -5,10 +5,12 @@ from __future__ import annotations
 from typing import Protocol, runtime_checkable
 
 from translation_agent.models import (
+    EvaluationReport,
     FinalTranscriptDecision,
     FinalTranslationDecision,
     MemoryWrite,
     MemoryWriteBatch,
+    PromptEvolutionProposal,
 )
 
 
@@ -22,6 +24,13 @@ class MemoryStagingBackend(Protocol):
         *,
         source_stage: str,
     ) -> MemoryWriteBatch: ...
+
+    def stage_evaluation_candidates(
+        self,
+        report: EvaluationReport,
+        *,
+        proposals: tuple[PromptEvolutionProposal, ...],
+    ) -> MemoryWriteBatch | None: ...
 
 
 class DeterministicMemoryStagingBackend:
@@ -117,6 +126,66 @@ class DeterministicMemoryStagingBackend:
             ),
             procedural_writes=procedural_writes,
             dedupe_keys=tuple(dedupe_keys),
+        )
+
+    def stage_evaluation_candidates(
+        self,
+        report: EvaluationReport,
+        *,
+        proposals: tuple[PromptEvolutionProposal, ...],
+    ) -> MemoryWriteBatch | None:
+        if not report.recurring_failure_patterns and not proposals:
+            return None
+        semantic_writes = tuple(
+            MemoryWrite(
+                kind="semantic",
+                content=f"Reference evaluation observed recurring issue: {pattern}.",
+                source_ref=report.trusted_transcript_ref,
+                metadata={"dedupe_key": f"evaluation:{report.media_key}:{pattern}"},
+            )
+            for pattern in report.recurring_failure_patterns
+        )
+        procedural_writes = tuple(
+            MemoryWrite(
+                kind="procedural",
+                content=proposal.suggested_changes[0].instruction
+                if proposal.suggested_changes
+                else proposal.rationale,
+                source_ref=proposal.evidence_refs[0] if proposal.evidence_refs else None,
+                metadata={
+                    "dedupe_key": f"evaluation:{report.media_key}:{proposal.proposal_id}",
+                    "prompt_family": proposal.prompt_family,
+                    "proposal_id": proposal.proposal_id,
+                },
+            )
+            for proposal in proposals
+        )
+        dedupe_keys = tuple(write.metadata["dedupe_key"] for write in semantic_writes) + tuple(
+            write.metadata["dedupe_key"] for write in procedural_writes
+        )
+        episodic_key = f"evaluation:{report.media_key}:episodic"
+        return MemoryWriteBatch(
+            batch_id=f"batch-reference-evaluation-{report.run_id}",
+            job_id=report.run_id,
+            source_stage="reference_evaluation",
+            decision_ref=report.trusted_transcript_ref,
+            investigation_ref=None,
+            winner_candidate_id=None,
+            decision_mode="reference_evaluation",
+            decision_confidence=1.0 if report.evaluated_runs else 0.0,
+            disagreement_bucket="low" if proposals else "medium",
+            semantic_writes=semantic_writes,
+            episodic_writes=(
+                MemoryWrite(
+                    kind="episodic",
+                    content="Reference evaluation produced approval-gated learning proposals.",
+                    source_ref=report.trusted_transcript_ref,
+                    metadata={"dedupe_key": episodic_key},
+                ),
+            ),
+            procedural_writes=procedural_writes,
+            dedupe_keys=dedupe_keys + (episodic_key,),
+            metadata={"media_key": report.media_key, "proposal_count": len(proposals)},
         )
 
 

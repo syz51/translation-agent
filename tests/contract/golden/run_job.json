@@ -1,5 +1,8 @@
 {
   "blob_root": "<blob_root>",
+  "failure_reasons": [],
+  "failure_ref": null,
+  "failure_summary": null,
   "job_id": "job-123",
   "run_id": "<run_id>",
   "source": "input.wav",

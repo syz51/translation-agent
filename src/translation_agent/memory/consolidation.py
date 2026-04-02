@@ -42,6 +42,8 @@ class DeterministicMemoryConsolidationBackend:
             source_translation_model_id=batch.translation_model_winner,
             source_prompt_variant_id=batch.prompt_variant_winner,
             source_prompt_version=batch.prompt_version_winner,
+            source_language=_metadata_string(batch.metadata, "source_language"),
+            target_language=_metadata_string(batch.metadata, "target_language"),
             semantic_memory_ids=semantic_memory_ids,
             episodic_memory_ids=episodic_memory_ids,
             skipped_dedupe_keys=skipped,
@@ -92,3 +94,11 @@ def _score_for_write(batch: MemoryWriteBatch) -> float:
     if batch.decision_confidence is None:
         return 0.5
     return round(max(0.0, min(batch.decision_confidence, 0.99)), 4)
+
+
+def _metadata_string(metadata: dict[str, object], key: str) -> str | None:
+    value = metadata.get(key)
+    if isinstance(value, str):
+        normalized = value.strip()
+        return normalized or None
+    return None

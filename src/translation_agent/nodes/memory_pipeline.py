@@ -12,7 +12,7 @@ from translation_agent.nodes.common import (
     write_model_artifact,
 )
 from translation_agent.publish.outputs import publish_outputs
-from translation_agent.storage import job_scope_token, operational_job_key
+from translation_agent.storage import asset_path, job_scope_token, operational_job_key
 
 
 def background_memory_pipeline(state: GraphState, runtime: WorkflowRuntime) -> dict[str, object]:
@@ -102,11 +102,33 @@ def drain_background_memory(state: GraphState, runtime: WorkflowRuntime) -> Grap
                 evidence_ref=consolidation_ref,
             )
             if proposal is not None:
+                proposal_ref = prompt_evolution_key(state.job, proposal.proposal_id)
+                asset_proposal_ref = asset_path(
+                    state.job.media_key,
+                    "improvement-proposals",
+                    f"{proposal.proposal_id}.json",
+                )
+                proposal = proposal.model_copy(
+                    update={
+                        "metadata": {
+                            **proposal.metadata,
+                            "media_key": state.job.media_key,
+                            "source_language": state.job.source_language,
+                            "target_language": state.job.target_language,
+                            "proposal_ref": proposal_ref,
+                            "asset_proposal_ref": asset_proposal_ref,
+                        }
+                    }
+                )
                 proposal_ref = write_model_artifact(
                     runtime,
-                    prompt_evolution_key(state.job, proposal.proposal_id),
+                    proposal_ref,
                     proposal,
                 )
+                write_model_artifact(runtime, asset_proposal_ref, proposal)
+                save_proposal = getattr(runtime.run_store, "save_prompt_evolution_proposal", None)
+                if callable(save_proposal):
+                    save_proposal(proposal)
                 routing_facts.append(
                     RoutingFact(
                         stage="background_memory_pipeline",
@@ -141,6 +163,10 @@ def drain_background_memory(state: GraphState, runtime: WorkflowRuntime) -> Grap
             artifacts.final_transcript_ref,
             artifacts.final_translation_ref,
             artifacts.recoverable_translation_failure_ref,
+            *artifacts.reference_transcript_refs,
+            *artifacts.evaluation_report_refs,
+            *artifacts.regenerated_draft_refs,
+            *artifacts.improvement_proposal_refs,
             *artifacts.scorecard_refs,
             *artifacts.trace_refs,
             *artifacts.export_refs,

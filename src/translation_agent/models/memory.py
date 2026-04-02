@@ -94,6 +94,8 @@ class MemoryConsolidation(ContractModel):
     source_translation_model_id: str | None = None
     source_prompt_variant_id: str | None = None
     source_prompt_version: str | None = None
+    source_language: str | None = None
+    target_language: str | None = None
     semantic_memory_ids: tuple[str, ...] = ()
     episodic_memory_ids: tuple[str, ...] = ()
     skipped_dedupe_keys: tuple[str, ...] = ()
@@ -103,6 +105,16 @@ class MemoryConsolidation(ContractModel):
 class PromptChange(ContractModel):
     section: NonEmptyStr
     instruction: NonEmptyStr
+
+
+class ResolvedTranslationPrompt(ContractModel):
+    """Prompt resolver output used by translation-generation boundaries."""
+
+    prompt_variant_id: NonEmptyStr
+    base_prompt_version: NonEmptyStr
+    effective_prompt_version: NonEmptyStr
+    instructions: tuple[str, ...] = ()
+    applied_proposal_refs: tuple[str, ...] = ()
 
 
 class PromptEvolutionProposal(ContractModel):

@@ -35,6 +35,8 @@ from translation_agent.memory import (
     MemoryRecallBackend,
     MemoryStagingBackend,
     PromptEvolutionBackend,
+    PromptResolver,
+    ProposalBackedPromptResolver,
 )
 from translation_agent.models import (
     AudioArtifact,
@@ -77,6 +79,7 @@ class WorkflowRuntime:
     memory_staging_backend: MemoryStagingBackend
     memory_consolidation_backend: MemoryConsolidationBackend
     prompt_evolution_backend: PromptEvolutionBackend
+    prompt_resolver: PromptResolver
     source_artifact_ref: str
     scenario: str = DEFAULT_SCENARIO
     adapter_mode: str = "fake"
@@ -337,6 +340,7 @@ class FakeTranslationAdapter:
         if prompt_variant_id in failed_variants:
             raise RuntimeError(f"simulated translation failure for {prompt_variant_id}")
 
+        resolved_prompt = request_context.metadata.get("resolved_translation_prompt", {})
         text = _translation_text_for_variant(prompt_variant_id, scenario)
         raw_response_ref = job_path(
             request_context.job,
@@ -361,13 +365,23 @@ class FakeTranslationAdapter:
             source_transcript_candidate_id=final_transcript.candidate_id,
             model_id=self.model_id,
             prompt_variant_id=prompt_variant_id,
-            prompt_version="phase-2-v1",
+            prompt_version=str(resolved_prompt.get("effective_prompt_version", "phase-2-v1")),
             language=request_context.job.target_language,
             segments=(
                 Segment(
-                    segment_id=f"seg-{prompt_variant_id}-1",
-                    start_ms=0,
-                    end_ms=1_200,
+                    segment_id=(
+                        f"seg-{prompt_variant_id}-1"
+                        if prompt_variant_id in {"variant-a", "variant-b"}
+                        else final_transcript.segments[0].segment_id
+                        if final_transcript.segments
+                        else f"seg-{prompt_variant_id}-1"
+                    ),
+                    start_ms=(
+                        final_transcript.segments[0].start_ms if final_transcript.segments else 0
+                    ),
+                    end_ms=(
+                        final_transcript.segments[0].end_ms if final_transcript.segments else 1_200
+                    ),
                     speaker="speaker-1",
                     source_text=final_transcript.full_text,
                     target_text=text,
@@ -376,7 +390,7 @@ class FakeTranslationAdapter:
             full_text=text,
             raw_response_ref=raw_response_ref,
             normalization_version=PHASE_TWO_NORMALIZATION_VERSION,
-            metadata={"scenario": scenario},
+            metadata={"scenario": scenario, "prompt_resolver": resolved_prompt},
         )
 
 
@@ -412,6 +426,7 @@ def build_phase_two_runtime(
         memory_staging_backend=DeterministicMemoryStagingBackend(),
         memory_consolidation_backend=DeterministicMemoryConsolidationBackend(memory_store),
         prompt_evolution_backend=DeterministicPromptEvolutionBackend(),
+        prompt_resolver=ProposalBackedPromptResolver(blob_store),
         source_artifact_ref=source_artifact_ref,
         scenario=scenario,
         adapter_mode="fake",
@@ -527,6 +542,7 @@ def build_phase_three_runtime(
         memory_staging_backend=DeterministicMemoryStagingBackend(),
         memory_consolidation_backend=DeterministicMemoryConsolidationBackend(memory_store),
         prompt_evolution_backend=DeterministicPromptEvolutionBackend(),
+        prompt_resolver=ProposalBackedPromptResolver(blob_store),
         source_artifact_ref=source_artifact_ref,
         scenario=scenario,
         adapter_mode="real",
@@ -653,6 +669,8 @@ def _transcript_text_for_provider(provider_id: str, scenario: str) -> str:
 
 
 def _translation_text_for_variant(prompt_variant_id: str, scenario: str) -> str:
+    if prompt_variant_id not in {"variant-a", "variant-b"}:
+        prompt_variant_id = "variant-a"
     text_by_scenario = {
         "happy": {
             "variant-a": "Bonjour tout le monde depuis le workflow.",

@@ -27,6 +27,8 @@ from translation_agent.storage import BlobStore, job_path, job_scope_token
 class OpenAITranslationAdapter:
     """Direct OpenAI Responses API adapter for translation candidate generation."""
 
+    provider_id = "openai"
+
     def __init__(
         self,
         *,
@@ -56,6 +58,7 @@ class OpenAITranslationAdapter:
         prompt_variant_id: str,
         request_context: RequestContext,
     ) -> TranslationCandidate:
+        resolved_prompt = _resolved_prompt_payload(request_context)
         raw_payload = perform_with_retries(
             lambda: self._generate_once(final_transcript, prompt_variant_id, request_context),
             provider_id="openai",
@@ -80,7 +83,9 @@ class OpenAITranslationAdapter:
             request_context=request_context,
             language=request_context.job.target_language,
             prompt_variant_id=prompt_variant_id,
-            prompt_version=self._prompt_version,
+            prompt_version=str(
+                resolved_prompt.get("effective_prompt_version", self._prompt_version)
+            ),
             model_id=self.model_id,
             raw_response_ref=raw_response_ref,
         )
@@ -102,6 +107,9 @@ class OpenAITranslationAdapter:
                             "text": _system_prompt(
                                 target_language=request_context.job.target_language,
                                 prompt_variant_id=prompt_variant_id,
+                                resolved_prompt=request_context.metadata.get(
+                                    "resolved_translation_prompt"
+                                ),
                             ),
                         }
                     ],
@@ -129,7 +137,7 @@ class OpenAITranslationAdapter:
                 timeout_seconds=self._timeout_seconds,
             )
         )
-        error = classify_http_error("openai", response)
+        error = _classify_openai_http_error(response)
         if error is not None:
             raise error
         payload = response.json()
@@ -143,17 +151,73 @@ class OpenAITranslationAdapter:
         return payload
 
 
-def _system_prompt(*, target_language: str, prompt_variant_id: str) -> str:
+def _classify_openai_http_error(response) -> AdapterError | None:
+    error = classify_http_error("openai", response)
+    if error is None or response.status_code != 429:
+        return error
+
+    payload = _openai_error_payload(response.body)
+    error_details = payload.get("error")
+    if not isinstance(error_details, dict):
+        return error
+    error_type = error_details.get("type")
+    error_code = error_details.get("code")
+    if error_type != "insufficient_quota" and error_code != "insufficient_quota":
+        return error
+
+    return AdapterError(
+        provider_id="openai",
+        message=str(error_details.get("message") or error),
+        category="quota_exhausted",
+        retryable=False,
+        status_code=response.status_code,
+    )
+
+
+def _openai_error_payload(body: bytes) -> dict[str, Any]:
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _system_prompt(
+    *,
+    target_language: str,
+    prompt_variant_id: str,
+    resolved_prompt: object | None = None,
+) -> str:
     if prompt_variant_id == "variant-b":
         directive = "Preserve tone and idioms when they remain faithful."
     else:
         directive = "Prefer literal fidelity and stable terminology."
-    return (
+    instructions = _resolved_prompt_instructions(resolved_prompt)
+    prompt = (
         "Translate the transcript into "
         f"{target_language}. Return JSON only with keys full_text and segments. "
         "Each segment must contain segment_id and target_text. "
         f"{directive}"
     )
+    if instructions:
+        prompt += " Additional approved guidance: " + " ".join(instructions)
+    return prompt
+
+
+def _resolved_prompt_instructions(resolved_prompt: object | None) -> tuple[str, ...]:
+    if not isinstance(resolved_prompt, dict):
+        return ()
+    raw_instructions = resolved_prompt.get("instructions")
+    if not isinstance(raw_instructions, list):
+        return ()
+    return tuple(item for item in raw_instructions if isinstance(item, str) and item.strip())
+
+
+def _resolved_prompt_payload(request_context: RequestContext) -> dict[str, Any]:
+    payload = request_context.metadata.get("resolved_translation_prompt")
+    if isinstance(payload, dict):
+        return payload
+    return {}
 
 
 def _user_prompt(final_transcript: TranscriptCandidate) -> str:
@@ -270,6 +334,7 @@ def _candidate_from_translation_payload(
                 "variant_id": prompt_variant_id,
                 "version": prompt_version,
             },
+            "prompt_resolver": _resolved_prompt_payload(request_context),
         },
     )
 

@@ -65,6 +65,7 @@ def _job_context() -> JobContext:
         requested_by="tester@example.com",
         created_at=datetime(2026, 3, 30, 12, 0, tzinfo=UTC),
         profile_ref="profiles/default",
+        media_key="source-ref:job-123",
     )
 
 
@@ -601,6 +602,15 @@ def test_phase_one_protocols_accept_fake_implementations(tmp_path: Path) -> None
                 source_stage=source_stage,
                 disagreement_bucket=decision.disagreement_bucket,
             )
+
+        def stage_evaluation_candidates(
+            self,
+            report,  # noqa: ANN001
+            *,
+            proposals,
+        ):  # noqa: ANN001
+            del report, proposals
+            return None
 
     job = _job_context()
     request_context = RequestContext(

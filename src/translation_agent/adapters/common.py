@@ -168,9 +168,13 @@ def classify_http_error(
     if 200 <= response.status_code < 300:
         return None
 
+    error_payload = _parsed_error_payload(response.body)
     retryable_codes = retryable_status_codes or {408, 409, 425, 429, 500, 502, 503, 504}
-    retryable = response.status_code in retryable_codes
-    message = _extract_error_message(response.body) or f"http {response.status_code}"
+    error_code = _error_code(error_payload)
+    retryable = response.status_code in retryable_codes and error_code != "insufficient_quota"
+    message = _extract_error_message(error_payload or response.body)
+    if message is None:
+        message = f"http {response.status_code}"
     return AdapterError(
         provider_id=provider_id,
         message=message,
@@ -247,6 +251,30 @@ def poll_until_complete(
         category="timeout",
         retryable=True,
     )
+
+
+def _parsed_error_payload(body: bytes) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _error_code(payload: dict[str, Any] | None) -> str | None:
+    if payload is None:
+        return None
+    candidates = [
+        payload.get("code"),
+        payload.get("type"),
+    ]
+    nested_error = payload.get("error")
+    if isinstance(nested_error, dict):
+        candidates.extend((nested_error.get("code"), nested_error.get("type")))
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return None
 
 
 def build_multipart_form_data(

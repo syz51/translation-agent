@@ -7,7 +7,13 @@ from pathlib import Path
 
 import pytest
 
-from translation_agent.api import RunJobRequest, _final_status, run_job
+from translation_agent.api import (
+    RunJobRequest,
+    RunJobResult,
+    _failure_details,
+    _final_status,
+    run_job,
+)
 from translation_agent.cli import main
 from translation_agent.config import (
     ValidationResult,
@@ -20,7 +26,13 @@ from translation_agent.config import (
 from translation_agent.graph import GraphState
 from translation_agent.graph.state import RoutingFact
 from translation_agent.models import JobContext
-from translation_agent.storage import PostgresRunStore, job_path, job_scope_token
+from translation_agent.storage import (
+    LocalBlobStore,
+    PostgresRunStore,
+    SQLiteOperationalStore,
+    job_path,
+    job_scope_token,
+)
 
 
 def _job_context(job_id: str = "job-123") -> JobContext:
@@ -34,6 +46,7 @@ def _job_context(job_id: str = "job-123") -> JobContext:
         requested_by="system@local",
         created_at=datetime(2026, 3, 31, 0, 0, tzinfo=UTC),
         profile_ref="profiles/default",
+        media_key=f"source-ref:{job_id}",
     )
 
 
@@ -460,6 +473,50 @@ def test_cli_run_job_plain_output_reports_run_status_and_trace(
 
 
 @pytest.mark.unit
+def test_cli_run_job_plain_output_reports_failure_details(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    trace_path = tmp_path / "runtime" / "traces" / "run-failed.jsonl"
+    trace_path.parent.mkdir(parents=True, exist_ok=True)
+    trace_path.write_text("", encoding="utf-8")
+    monkeypatch.setattr(
+        "translation_agent.cli.run_job",
+        lambda request: RunJobResult(
+            run_id="run-failed",
+            job_id=request.job_id or "job-failed",
+            status="translation_failed",
+            source=request.source,
+            blob_root=tmp_path / "runtime" / "blobs",
+            trace_path=trace_path,
+            state_backend="sqlite",
+            state_db_target=str((tmp_path / "runtime" / "state.sqlite3").resolve()),
+            failure_ref="jobs/job-failed/published/translation-failed.json",
+            failure_summary="All translation variants failed; transcript preserved for recovery.",
+            failure_reasons=(
+                "variant-a: simulated translation failure for variant-a",
+                "variant-b: simulated translation failure for variant-b",
+            ),
+        ),
+    )
+
+    exit_code = main(["run-job", "input.wav", "--job-id", "job-failed"])
+
+    lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
+    assert exit_code == 0
+    assert lines == [
+        "run-failed",
+        "translation_failed",
+        f"sqlite: {(tmp_path / 'runtime' / 'state.sqlite3').resolve()}",
+        str(trace_path),
+        "All translation variants failed; transcript preserved for recovery.",
+        "variant-a: simulated translation failure for variant-a",
+        "variant-b: simulated translation failure for variant-b",
+    ]
+
+
+@pytest.mark.unit
 def test_cli_unsupported_command_uses_parser_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -502,6 +559,9 @@ def test_run_job_bootstraps_local_artifacts_and_postgres_record(
     assert (result.blob_root / _artifact_path("published", "translation.json")).exists()
     assert result.state_backend == "postgres"
     assert result.state_db_target == sanitize_db_target(migrated_postgres_dsn)
+    assert result.failure_ref is None
+    assert result.failure_summary is None
+    assert result.failure_reasons == ()
 
     with PostgresRunStore(migrated_postgres_dsn) as store:
         record = store.get_run(result.run_id)
@@ -511,7 +571,11 @@ def test_run_job_bootstraps_local_artifacts_and_postgres_record(
     assert record.status == "completed"
     assert record.input_data == {
         "artifact_ref": f"jobs/{result.run_id}-request.json",
+        "asset_id": None,
         "job_id": "job-123",
+        "media_fingerprint": None,
+        "media_key": f"source-ref:{result.run_id}",
+        "reference_mode": "none",
         "source": "input.mp4",
     }
     assert record.output_data is not None
@@ -532,6 +596,9 @@ def test_run_job_defaults_to_local_sqlite_runtime(
     assert result.status == "completed"
     assert result.state_backend == "sqlite"
     assert result.state_db_target == str((tmp_path / "runtime" / "state.sqlite3").resolve())
+    assert result.failure_ref is None
+    assert result.failure_summary is None
+    assert result.failure_reasons == ()
     assert (tmp_path / "runtime" / "state.sqlite3").exists()
     local_job = _job_context(job_id="job-local")
     assert (result.blob_root / Path(job_path(local_job, "published", "transcript.json"))).exists()
@@ -629,6 +696,117 @@ def test_run_job_persists_long_term_memory_across_separate_runs(
     assert any(expected_fragment in entry["content"] for entry in memory_bundle["semantic_memory"])
 
 
+@pytest.mark.unit
+def test_run_job_returns_translation_failure_details(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("TA_DATA_DIR", str(tmp_path / "runtime"))
+    monkeypatch.delenv("TA_STATE_DB_DSN", raising=False)
+
+    result = run_job(
+        RunJobRequest(
+            source="input.mp4",
+            job_id="job-translation-failed",
+            metadata={"scenario": "translation_failed"},
+        )
+    )
+
+    assert result.status == "translation_failed"
+    assert result.failure_ref == str(
+        job_path(_job_context("job-translation-failed"), "published", "translation-failed.json")
+    )
+    assert result.failure_summary == (
+        "All translation variants failed; transcript preserved for recovery."
+    )
+    assert result.failure_reasons == (
+        "variant-a: simulated translation failure for variant-a",
+        "variant-b: simulated translation failure for variant-b",
+    )
+
+
+@pytest.mark.unit
+def test_run_job_persists_structured_translation_failure_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("TA_DATA_DIR", str(tmp_path / "runtime"))
+    monkeypatch.delenv("TA_STATE_DB_DSN", raising=False)
+
+    result = run_job(
+        RunJobRequest(
+            source="input.mp4",
+            job_id="job-translation-failed-structured",
+            metadata={"scenario": "translation_failed"},
+        )
+    )
+
+    with SQLiteOperationalStore(tmp_path / "runtime" / "state.sqlite3") as store:
+        record = store.get_run(result.run_id)
+
+    assert record is not None
+    assert record.status == "translation_failed"
+    assert record.error == {
+        "category": "translation_failed",
+        "reason": "all_translation_variants_failed",
+        "message": "All translation variants failed; transcript preserved for recovery.",
+        "failure_ref": str(
+            job_path(
+                _job_context("job-translation-failed-structured"),
+                "published",
+                "translation-failed.json",
+            )
+        ),
+        "failure_summary": "All translation variants failed; transcript preserved for recovery.",
+        "failure_reasons": [
+            "variant-a: simulated translation failure for variant-a",
+            "variant-b: simulated translation failure for variant-b",
+        ],
+        "retryable": False,
+    }
+    assert record.output_data["failure_ref"] == str(
+        job_path(
+            _job_context("job-translation-failed-structured"),
+            "published",
+            "translation-failed.json",
+        )
+    )
+    assert record.output_data["failure_summary"] == (
+        "All translation variants failed; transcript preserved for recovery."
+    )
+    assert record.output_data["failure_reasons"] == [
+        "variant-a: simulated translation failure for variant-a",
+        "variant-b: simulated translation failure for variant-b",
+    ]
+
+
+@pytest.mark.unit
+def test_failure_details_returns_ref_when_manifest_missing(tmp_path: Path) -> None:
+    blob_store = LocalBlobStore(tmp_path / "blobs")
+    final_state = GraphState(
+        run_id="run-missing-failure-manifest",
+        job=_job_context("job-missing-failure-manifest"),
+        current_stage="finalize_outputs",
+        source_video_ref="input.mp4",
+        translation_failed=True,
+    )
+
+    failure_ref, failure_summary, failure_reasons = _failure_details(
+        final_state=final_state,
+        blob_store=blob_store,
+    )
+
+    assert failure_ref == str(
+        job_path(
+            _job_context("job-missing-failure-manifest"),
+            "published",
+            "translation-failed.json",
+        )
+    )
+    assert failure_summary is None
+    assert failure_reasons == ()
+
+
 @pytest.mark.integration
 def test_run_job_marks_bootstrap_failure_and_emits_failed_trace(
     migrated_postgres_dsn: str,
@@ -698,6 +876,9 @@ def test_cli_run_job_json(migrated_postgres_dsn: str, monkeypatch, tmp_path: Pat
     assert payload["status"] == "completed"
     assert payload["state_backend"] == "postgres"
     assert payload["state_db_target"] == sanitize_db_target(migrated_postgres_dsn)
+    assert payload["failure_ref"] is None
+    assert payload["failure_summary"] is None
+    assert payload["failure_reasons"] == []
     assert Path(payload["trace_path"]).exists()
 
     with PostgresRunStore(migrated_postgres_dsn) as store:

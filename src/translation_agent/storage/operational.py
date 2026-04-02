@@ -6,13 +6,17 @@ import json
 import sqlite3
 from collections.abc import Mapping
 from contextlib import AbstractContextManager
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol, cast
 
 from translation_agent.models import (
+    AssetRecord,
     FinalTranscriptDecision,
     FinalTranslationDecision,
+    HistoricalRunLink,
     MemoryWriteBatch,
+    PromptEvolutionProposal,
     TranscriptCandidate,
     TranslationCandidate,
 )
@@ -129,6 +133,36 @@ _SQLITE_LIST_SQL = {
         "SELECT batch_json FROM memory_batches WHERE job_id = ? ORDER BY batch_id ASC"
     ),
 }
+_POSTGRES_ASSET_SELECT_SQL = {
+    "media_key": "SELECT asset_json FROM asset_records WHERE media_key = %s",
+    "asset_id": "SELECT asset_json FROM asset_records WHERE asset_id = %s",
+    "media_fingerprint": "SELECT asset_json FROM asset_records WHERE media_fingerprint = %s",
+}
+_POSTGRES_PROPOSAL_LIST_SQL = """
+    SELECT proposal_json
+    FROM prompt_evolution_proposals
+    WHERE (%s IS NULL OR status = %s)
+      AND (%s IS NULL OR target_model_id = %s)
+      AND (%s IS NULL OR target_language = %s)
+      AND (%s IS NULL OR source_language = %s)
+      AND (%s IS NULL OR media_key = %s)
+    ORDER BY proposal_id ASC
+"""
+_SQLITE_ASSET_SELECT_SQL = {
+    "media_key": "SELECT asset_json FROM asset_records WHERE media_key = ?",
+    "asset_id": "SELECT asset_json FROM asset_records WHERE asset_id = ?",
+    "media_fingerprint": "SELECT asset_json FROM asset_records WHERE media_fingerprint = ?",
+}
+_SQLITE_PROPOSAL_LIST_SQL = """
+    SELECT proposal_json
+    FROM prompt_evolution_proposals
+    WHERE (? IS NULL OR status = ?)
+      AND (? IS NULL OR target_model_id = ?)
+      AND (? IS NULL OR target_language = ?)
+      AND (? IS NULL OR source_language = ?)
+      AND (? IS NULL OR media_key = ?)
+    ORDER BY proposal_id ASC
+"""
 
 
 class OperationalStore(DecisionStore, MemoryBatchStore, Protocol):
@@ -191,6 +225,41 @@ class OperationalStore(DecisionStore, MemoryBatchStore, Protocol):
         error: Any = _UNSET,
         updated_at: str | None = None,
     ) -> NodeExecutionRecord: ...
+
+    def resolve_asset(
+        self,
+        *,
+        asset_id: str | None,
+        media_fingerprint: str | None,
+        first_seen_run_id: str,
+        source_language: str,
+        target_language: str,
+    ) -> AssetRecord: ...
+
+    def get_asset(self, media_key: str) -> AssetRecord | None: ...
+
+    def save_asset_record(self, asset: AssetRecord) -> AssetRecord: ...
+
+    def upsert_historical_run_link(self, link: HistoricalRunLink) -> None: ...
+
+    def list_historical_run_links(
+        self,
+        media_key: str,
+        *,
+        exclude_run_id: str | None = None,
+    ) -> list[HistoricalRunLink]: ...
+
+    def save_prompt_evolution_proposal(self, proposal: PromptEvolutionProposal) -> None: ...
+
+    def list_prompt_evolution_proposals(
+        self,
+        *,
+        status: str | None = None,
+        target_model_id: str | None = None,
+        target_language: str | None = None,
+        source_language: str | None = None,
+        media_key: str | None = None,
+    ) -> list[PromptEvolutionProposal]: ...
 
 
 class PostgresOperationalStore(PostgresRunStore):
@@ -426,6 +495,151 @@ class PostgresOperationalStore(PostgresRunStore):
         ).fetchall()
         return [MemoryWriteBatch.model_validate(_decode_db_json(row["batch_json"])) for row in rows]
 
+    def save_prompt_evolution_proposal(self, proposal: PromptEvolutionProposal) -> None:
+        payload = proposal.model_dump(mode="json")
+        now = _utc_now()
+        with self._conn.transaction():
+            self._conn.execute(
+                """
+                INSERT INTO prompt_evolution_proposals (
+                    proposal_id,
+                    proposal_json,
+                    status,
+                    target_model_id,
+                    target_language,
+                    source_language,
+                    media_key,
+                    created_at,
+                    updated_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (proposal_id) DO UPDATE SET
+                    proposal_json = EXCLUDED.proposal_json,
+                    status = EXCLUDED.status,
+                    target_model_id = EXCLUDED.target_model_id,
+                    target_language = EXCLUDED.target_language,
+                    source_language = EXCLUDED.source_language,
+                    media_key = EXCLUDED.media_key,
+                    updated_at = EXCLUDED.updated_at
+                """,
+                (
+                    proposal.proposal_id,
+                    _encode_json(payload),
+                    proposal.status,
+                    proposal.target_model_id,
+                    _proposal_metadata_value(proposal, "target_language"),
+                    _proposal_metadata_value(proposal, "source_language"),
+                    _proposal_metadata_value(proposal, "media_key"),
+                    now,
+                    now,
+                ),
+            )
+
+    def list_prompt_evolution_proposals(
+        self,
+        *,
+        status: str | None = None,
+        target_model_id: str | None = None,
+        target_language: str | None = None,
+        source_language: str | None = None,
+        media_key: str | None = None,
+    ) -> list[PromptEvolutionProposal]:
+        rows = self._conn.execute(
+            _POSTGRES_PROPOSAL_LIST_SQL,
+            (
+                status,
+                status,
+                target_model_id,
+                target_model_id,
+                target_language,
+                target_language,
+                source_language,
+                source_language,
+                media_key,
+                media_key,
+            ),
+        ).fetchall()
+        return [
+            PromptEvolutionProposal.model_validate(_decode_db_json(row["proposal_json"]))
+            for row in rows
+        ]
+
+    def resolve_asset(
+        self,
+        *,
+        asset_id: str | None,
+        media_fingerprint: str | None,
+        first_seen_run_id: str,
+        source_language: str,
+        target_language: str,
+    ) -> AssetRecord:
+        return _resolve_asset_record(
+            resolver=_PostgresAssetResolver(self._conn),
+            asset_id=asset_id,
+            media_fingerprint=media_fingerprint,
+            first_seen_run_id=first_seen_run_id,
+            source_language=source_language,
+            target_language=target_language,
+        )
+
+    def get_asset(self, media_key: str) -> AssetRecord | None:
+        row = self._conn.execute(_POSTGRES_ASSET_SELECT_SQL["media_key"], (media_key,)).fetchone()
+        if row is None:
+            return None
+        return AssetRecord.model_validate(_decode_db_json(row["asset_json"]))
+
+    def save_asset_record(self, asset: AssetRecord) -> AssetRecord:
+        return _PostgresAssetResolver(self._conn).save(asset)
+
+    def upsert_historical_run_link(self, link: HistoricalRunLink) -> None:
+        now = _utc_now()
+        with self._conn.transaction():
+            self._conn.execute(
+                """
+                INSERT INTO historical_run_links (
+                    run_id, media_key, link_json, created_at, updated_at
+                ) VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (run_id) DO UPDATE SET
+                    media_key = EXCLUDED.media_key,
+                    link_json = EXCLUDED.link_json,
+                    updated_at = EXCLUDED.updated_at
+                """,
+                (
+                    link.run_id,
+                    link.media_key,
+                    _encode_json(link.model_dump(mode="json")),
+                    now,
+                    now,
+                ),
+            )
+
+    def list_historical_run_links(
+        self,
+        media_key: str,
+        *,
+        exclude_run_id: str | None = None,
+    ) -> list[HistoricalRunLink]:
+        if exclude_run_id is None:
+            rows = self._conn.execute(
+                """
+                SELECT link_json
+                FROM historical_run_links
+                WHERE media_key = %s
+                ORDER BY created_at ASC, run_id ASC
+                """,
+                (media_key,),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                """
+                SELECT link_json
+                FROM historical_run_links
+                WHERE media_key = %s AND run_id <> %s
+                ORDER BY created_at ASC, run_id ASC
+                """,
+                (media_key, exclude_run_id),
+            ).fetchall()
+        return [HistoricalRunLink.model_validate(_decode_db_json(row["link_json"])) for row in rows]
+
     def _save_singleton_model(
         self,
         *,
@@ -483,6 +697,48 @@ class PostgresOperationalStore(PostgresRunStore):
         if row is None:
             return None
         return _decode_db_json(row["payload_json"])
+
+    def _get_asset_by(self, field_name: str, value: str | None) -> AssetRecord | None:
+        if value is None:
+            return None
+        row = self._conn.execute(
+            _POSTGRES_ASSET_SELECT_SQL[field_name],
+            (value,),
+        ).fetchone()
+        if row is None:
+            return None
+        return AssetRecord.model_validate(_decode_db_json(row["asset_json"]))
+
+    def _save_asset_record(self, record: AssetRecord) -> AssetRecord:
+        payload = record.model_dump(mode="json")
+        now = _utc_now()
+        with self._conn.transaction():
+            self._conn.execute(
+                """
+                INSERT INTO asset_records (
+                    media_key,
+                    asset_id,
+                    media_fingerprint,
+                    asset_json,
+                    created_at,
+                    updated_at
+                ) VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (media_key) DO UPDATE SET
+                    asset_id = EXCLUDED.asset_id,
+                    media_fingerprint = EXCLUDED.media_fingerprint,
+                    asset_json = EXCLUDED.asset_json,
+                    updated_at = EXCLUDED.updated_at
+                """,
+                (
+                    record.media_key,
+                    record.asset_id,
+                    record.media_fingerprint,
+                    _encode_json(payload),
+                    now,
+                    now,
+                ),
+            )
+        return record
 
 
 class SQLiteOperationalStore(AbstractContextManager["SQLiteOperationalStore"]):
@@ -872,6 +1128,139 @@ class SQLiteOperationalStore(AbstractContextManager["SQLiteOperationalStore"]):
             )
         ]
 
+    def resolve_asset(
+        self,
+        *,
+        asset_id: str | None,
+        media_fingerprint: str | None,
+        first_seen_run_id: str,
+        source_language: str,
+        target_language: str,
+    ) -> AssetRecord:
+        return _resolve_asset_record(
+            resolver=_SQLiteAssetResolver(self._conn),
+            asset_id=asset_id,
+            media_fingerprint=media_fingerprint,
+            first_seen_run_id=first_seen_run_id,
+            source_language=source_language,
+            target_language=target_language,
+        )
+
+    def get_asset(self, media_key: str) -> AssetRecord | None:
+        row = self._conn.execute(_SQLITE_ASSET_SELECT_SQL["media_key"], (media_key,)).fetchone()
+        if row is None:
+            return None
+        return AssetRecord.model_validate(_decode_sqlite_json(row["asset_json"]))
+
+    def save_asset_record(self, asset: AssetRecord) -> AssetRecord:
+        return _SQLiteAssetResolver(self._conn).save(asset)
+
+    def upsert_historical_run_link(self, link: HistoricalRunLink) -> None:
+        now = _utc_now()
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO historical_run_links (
+                    run_id, media_key, link_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(run_id) DO UPDATE SET
+                    media_key = excluded.media_key,
+                    link_json = excluded.link_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    link.run_id,
+                    link.media_key,
+                    _encode_sqlite_json(link.model_dump(mode="json")),
+                    now,
+                    now,
+                ),
+            )
+
+    def list_historical_run_links(
+        self,
+        media_key: str,
+        *,
+        exclude_run_id: str | None = None,
+    ) -> list[HistoricalRunLink]:
+        params: list[str] = [media_key]
+        query = "SELECT link_json FROM historical_run_links WHERE media_key = ?"
+        if exclude_run_id is not None:
+            query += " AND run_id <> ?"
+            params.append(exclude_run_id)
+        query += " ORDER BY created_at ASC, run_id ASC"
+        rows = self._conn.execute(query, tuple(params)).fetchall()
+        return [
+            HistoricalRunLink.model_validate(_decode_sqlite_json(row["link_json"])) for row in rows
+        ]
+
+    def save_prompt_evolution_proposal(self, proposal: PromptEvolutionProposal) -> None:
+        now = _utc_now()
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO prompt_evolution_proposals (
+                    proposal_id,
+                    proposal_json,
+                    status,
+                    target_model_id,
+                    target_language,
+                    source_language,
+                    media_key,
+                    created_at,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(proposal_id) DO UPDATE SET
+                    proposal_json = excluded.proposal_json,
+                    status = excluded.status,
+                    target_model_id = excluded.target_model_id,
+                    target_language = excluded.target_language,
+                    source_language = excluded.source_language,
+                    media_key = excluded.media_key,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    proposal.proposal_id,
+                    _encode_sqlite_json(proposal.model_dump(mode="json")),
+                    proposal.status,
+                    proposal.target_model_id,
+                    _proposal_metadata_value(proposal, "target_language"),
+                    _proposal_metadata_value(proposal, "source_language"),
+                    _proposal_metadata_value(proposal, "media_key"),
+                    now,
+                    now,
+                ),
+            )
+
+    def list_prompt_evolution_proposals(
+        self,
+        *,
+        status: str | None = None,
+        target_model_id: str | None = None,
+        target_language: str | None = None,
+        source_language: str | None = None,
+        media_key: str | None = None,
+    ) -> list[PromptEvolutionProposal]:
+        rows = self._conn.execute(
+            _SQLITE_PROPOSAL_LIST_SQL,
+            (
+                status,
+                status,
+                target_model_id,
+                target_model_id,
+                target_language,
+                target_language,
+                source_language,
+                source_language,
+                media_key,
+                media_key,
+            ),
+        ).fetchall()
+        return [
+            PromptEvolutionProposal.model_validate(_decode_sqlite_json(row["proposal_json"]))
+            for row in rows
+        ]
+
     def _bootstrap_schema(self) -> None:
         self._conn.executescript(
             """
@@ -958,6 +1347,48 @@ class SQLiteOperationalStore(AbstractContextManager["SQLiteOperationalStore"]):
 
             CREATE INDEX IF NOT EXISTS idx_memory_batches_job_id_batch_id
             ON memory_batches(job_id, batch_id);
+
+            CREATE TABLE IF NOT EXISTS asset_records (
+                media_key TEXT PRIMARY KEY,
+                asset_id TEXT UNIQUE,
+                media_fingerprint TEXT UNIQUE,
+                asset_json TEXT NOT NULL,
+                first_seen_run_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_asset_records_asset_id
+            ON asset_records(asset_id);
+
+            CREATE INDEX IF NOT EXISTS idx_asset_records_media_fingerprint
+            ON asset_records(media_fingerprint);
+
+            CREATE TABLE IF NOT EXISTS historical_run_links (
+                run_id TEXT PRIMARY KEY,
+                media_key TEXT NOT NULL REFERENCES asset_records(media_key) ON DELETE CASCADE,
+                link_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_historical_run_links_media_key_created_at
+            ON historical_run_links(media_key, created_at, run_id);
+
+            CREATE TABLE IF NOT EXISTS prompt_evolution_proposals (
+                proposal_id TEXT PRIMARY KEY,
+                proposal_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                target_model_id TEXT NOT NULL,
+                target_language TEXT,
+                source_language TEXT,
+                media_key TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_prompt_evolution_proposals_scope
+            ON prompt_evolution_proposals(status, target_model_id, target_language, media_key);
             """
         )
         self._conn.commit()
@@ -1047,6 +1478,227 @@ class SQLiteOperationalStore(AbstractContextManager["SQLiteOperationalStore"]):
             (job_id,),
         ).fetchall()
         return [_decode_sqlite_json(row[column]) for row in rows]
+
+
+class _AssetResolver(Protocol):
+    def get_by_media_key(self, media_key: str) -> AssetRecord | None: ...
+
+    def get_by_asset_id(self, asset_id: str) -> AssetRecord | None: ...
+
+    def get_by_media_fingerprint(self, media_fingerprint: str) -> AssetRecord | None: ...
+
+    def save(self, asset: AssetRecord) -> AssetRecord: ...
+
+
+class _PostgresAssetResolver:
+    def __init__(self, conn: Any) -> None:
+        self._conn = conn
+
+    def get_by_media_key(self, media_key: str) -> AssetRecord | None:
+        return self._get_one("media_key", media_key)
+
+    def get_by_asset_id(self, asset_id: str) -> AssetRecord | None:
+        return self._get_one("asset_id", asset_id)
+
+    def get_by_media_fingerprint(self, media_fingerprint: str) -> AssetRecord | None:
+        return self._get_one("media_fingerprint", media_fingerprint)
+
+    def save(self, asset: AssetRecord) -> AssetRecord:
+        now = _utc_now()
+        with self._conn.transaction():
+            self._conn.execute(
+                """
+                INSERT INTO asset_records (
+                    media_key,
+                    asset_id,
+                    media_fingerprint,
+                    asset_json,
+                    first_seen_run_id,
+                    created_at,
+                    updated_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (media_key) DO UPDATE SET
+                    asset_id = EXCLUDED.asset_id,
+                    media_fingerprint = EXCLUDED.media_fingerprint,
+                    asset_json = EXCLUDED.asset_json,
+                    updated_at = EXCLUDED.updated_at
+                """,
+                (
+                    asset.media_key,
+                    asset.asset_id,
+                    asset.media_fingerprint,
+                    _encode_json(asset.model_dump(mode="json")),
+                    asset.first_seen_run_id,
+                    _isoformat_timestamp(asset.created_at),
+                    now,
+                ),
+            )
+        resolved = self.get_by_media_key(asset.media_key)
+        if resolved is None:
+            raise RuntimeError(f"asset {asset.media_key} was not persisted")
+        return resolved
+
+    def _get_one(self, field_name: str, value: str) -> AssetRecord | None:
+        row = self._conn.execute(_POSTGRES_ASSET_SELECT_SQL[field_name], (value,)).fetchone()
+        if row is None:
+            return None
+        return AssetRecord.model_validate(_decode_db_json(row["asset_json"]))
+
+
+class _SQLiteAssetResolver:
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def get_by_media_key(self, media_key: str) -> AssetRecord | None:
+        return self._get_one("media_key", media_key)
+
+    def get_by_asset_id(self, asset_id: str) -> AssetRecord | None:
+        return self._get_one("asset_id", asset_id)
+
+    def get_by_media_fingerprint(self, media_fingerprint: str) -> AssetRecord | None:
+        return self._get_one("media_fingerprint", media_fingerprint)
+
+    def save(self, asset: AssetRecord) -> AssetRecord:
+        now = _utc_now()
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO asset_records (
+                    media_key,
+                    asset_id,
+                    media_fingerprint,
+                    asset_json,
+                    first_seen_run_id,
+                    created_at,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(media_key) DO UPDATE SET
+                    asset_id = excluded.asset_id,
+                    media_fingerprint = excluded.media_fingerprint,
+                    asset_json = excluded.asset_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    asset.media_key,
+                    asset.asset_id,
+                    asset.media_fingerprint,
+                    _encode_sqlite_json(asset.model_dump(mode="json")),
+                    asset.first_seen_run_id,
+                    _isoformat_timestamp(asset.created_at),
+                    now,
+                ),
+            )
+        resolved = self.get_by_media_key(asset.media_key)
+        if resolved is None:
+            raise RuntimeError(f"asset {asset.media_key} was not persisted")
+        return resolved
+
+    def _get_one(self, field_name: str, value: str) -> AssetRecord | None:
+        row = self._conn.execute(_SQLITE_ASSET_SELECT_SQL[field_name], (value,)).fetchone()
+        if row is None:
+            return None
+        return AssetRecord.model_validate(_decode_sqlite_json(row["asset_json"]))
+
+
+def _resolve_asset_record(
+    *,
+    resolver: _AssetResolver,
+    asset_id: str | None,
+    media_fingerprint: str | None,
+    first_seen_run_id: str,
+    source_language: str,
+    target_language: str,
+) -> AssetRecord:
+    normalized_asset_id = _normalized_optional_identifier(asset_id)
+    normalized_media_fingerprint = _normalized_optional_identifier(media_fingerprint)
+
+    asset_match = (
+        resolver.get_by_asset_id(normalized_asset_id) if normalized_asset_id is not None else None
+    )
+    fingerprint_match = (
+        resolver.get_by_media_fingerprint(normalized_media_fingerprint)
+        if normalized_media_fingerprint is not None
+        else None
+    )
+    if (
+        asset_match is not None
+        and fingerprint_match is not None
+        and asset_match.media_key != fingerprint_match.media_key
+    ):
+        raise ValueError(
+            "conflicting asset_id and media_fingerprint mappings require operator action"
+        )
+
+    existing = asset_match or fingerprint_match
+    now = datetime.now(UTC)
+    if existing is not None:
+        if normalized_asset_id is not None and existing.asset_id not in {None, normalized_asset_id}:
+            raise ValueError("asset_id conflicts with existing asset mapping")
+        if normalized_media_fingerprint is not None and existing.media_fingerprint not in {
+            None,
+            normalized_media_fingerprint,
+        }:
+            raise ValueError("media_fingerprint conflicts with existing asset mapping")
+        return resolver.save(
+            existing.model_copy(
+                update={
+                    "asset_id": existing.asset_id or normalized_asset_id,
+                    "media_fingerprint": existing.media_fingerprint or normalized_media_fingerprint,
+                    "source_language": existing.source_language or source_language,
+                    "target_language": existing.target_language or target_language,
+                    "updated_at": now,
+                }
+            )
+        )
+
+    media_key = _build_media_key(
+        asset_id=normalized_asset_id,
+        media_fingerprint=normalized_media_fingerprint,
+        fallback_seed=first_seen_run_id,
+    )
+    return resolver.save(
+        AssetRecord(
+            media_key=media_key,
+            asset_id=normalized_asset_id,
+            media_fingerprint=normalized_media_fingerprint,
+            first_seen_run_id=first_seen_run_id,
+            source_language=source_language,
+            target_language=target_language,
+            created_at=now,
+            updated_at=now,
+        )
+    )
+
+
+def _build_media_key(
+    *,
+    asset_id: str | None,
+    media_fingerprint: str | None,
+    fallback_seed: str,
+) -> str:
+    if asset_id is not None:
+        return f"asset-id:{asset_id}"
+    if media_fingerprint is not None:
+        return f"media-fingerprint:{media_fingerprint}"
+    return f"source-ref:{fallback_seed}"
+
+
+def _normalized_optional_identifier(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
+def _proposal_metadata_value(
+    proposal: PromptEvolutionProposal,
+    key: str,
+) -> str | None:
+    value = proposal.metadata.get(key)
+    if isinstance(value, str):
+        normalized = value.strip()
+        return normalized or None
+    return None
 
 
 def _sqlite_row_to_run(row: sqlite3.Row) -> RunRecord:

@@ -163,6 +163,9 @@ The public result payload contains:
 - `trace_path`
 - `state_backend`
 - `state_db_target`
+- `failure_ref`
+- `failure_summary`
+- `failure_reasons`
 
 Final statuses currently emitted by the API are:
 

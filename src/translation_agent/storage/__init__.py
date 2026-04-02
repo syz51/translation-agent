@@ -9,7 +9,14 @@ from .blobs import BlobEntry, LocalBlobStore
 from .decisions import DecisionStore
 from .memory_batches import MemoryBatchStore
 from .operational import OperationalStore, PostgresOperationalStore, SQLiteOperationalStore
-from .paths import job_path, job_scope_prefix, job_scope_token, operational_job_key
+from .paths import (
+    asset_path,
+    asset_scope_prefix,
+    job_path,
+    job_scope_prefix,
+    job_scope_token,
+    operational_job_key,
+)
 from .runs import NodeExecutionRecord, PostgresRunStore, RunRecord
 
 
@@ -96,6 +103,8 @@ __all__ = [
     "RunRecord",
     "RunStore",
     "SQLiteOperationalStore",
+    "asset_path",
+    "asset_scope_prefix",
     "job_path",
     "job_scope_prefix",
     "job_scope_token",

@@ -31,6 +31,19 @@ def job_path(job: JobContext, *parts: str) -> str:
     return "/".join((job_scope_prefix(job), *clean_parts))
 
 
+def asset_scope_prefix(media_key: str) -> str:
+    """Return a stable blob prefix for one durable media identity."""
+
+    return "/".join(("assets", _segment(media_key)))
+
+
+def asset_path(media_key: str, *parts: str) -> str:
+    """Join an asset-scoped prefix with relative artifact parts."""
+
+    clean_parts = [part.strip("/") for part in parts if part]
+    return "/".join((asset_scope_prefix(media_key), *clean_parts))
+
+
 def operational_job_key(job: JobContext) -> str:
     """Return the shared operational-store key for one scoped job identity."""
 

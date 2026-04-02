@@ -35,11 +35,6 @@ class DeterministicPromptEvolutionBackend:
         resolved_model_id = translation_model_id or consolidation.source_translation_model_id
         if resolved_model_id is None or consolidation.source_prompt_variant_id is None:
             return None
-        activation_mode = (
-            "auto_activate_eligible"
-            if consolidation.source_disagreement_bucket == "low"
-            else "approval_required"
-        )
         target_prompt_version = f"{consolidation.source_prompt_version or 'unversioned'}-phase5"
         return PromptEvolutionProposal(
             proposal_id=f"prompt-evolution-{consolidation.consolidation_id}",
@@ -49,8 +44,8 @@ class DeterministicPromptEvolutionBackend:
             target_model_id=resolved_model_id,
             target_prompt_version=target_prompt_version,
             target_prompt_variant_id=consolidation.source_prompt_variant_id,
-            activation_mode=activation_mode,
-            auto_activate=activation_mode == "auto_activate_eligible",
+            activation_mode="approval_required",
+            auto_activate=False,
             rationale=(
                 "Consolidated translation outcomes favored the winning prompt variant without "
                 "relying on raw reviewer prose."
@@ -74,5 +69,9 @@ class DeterministicPromptEvolutionBackend:
             evidence_refs=tuple(
                 ref for ref in (evidence_ref, consolidation.source_decision_ref) if ref is not None
             ),
-            metadata={"procedural_write_count": consolidation.procedural_write_count},
+            metadata={
+                "procedural_write_count": consolidation.procedural_write_count,
+                "source_language": consolidation.source_language,
+                "target_language": consolidation.target_language,
+            },
         )

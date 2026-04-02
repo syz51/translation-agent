@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from pydantic import Field
 
 from .base import ContractModel
 
 NonEmptyStr = Annotated[str, Field(min_length=1)]
+ReferenceTranscriptFormat = Literal["srt"]
+ReferenceMode = Literal["none", "evaluate_and_regenerate"]
 
 
 class JobContext(ContractModel):
@@ -24,6 +26,12 @@ class JobContext(ContractModel):
     requested_by: NonEmptyStr
     created_at: datetime
     profile_ref: str | None = None
+    asset_id: str | None = None
+    media_fingerprint: str | None = None
+    media_key: NonEmptyStr
+    reference_transcript_source: str | None = None
+    reference_transcript_format: ReferenceTranscriptFormat | None = None
+    reference_mode: ReferenceMode = "none"
 
 
 class RequestContext(ContractModel):
