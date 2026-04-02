@@ -370,6 +370,7 @@ The decision store persists:
 - transcript decisions
 - translation decisions
 - investigations
+- transcript provider quality stats
 
 ### Memory Batch Store
 
@@ -419,6 +420,38 @@ The API and CLI result contract includes:
 - `trace_path`
 - `state_backend`
 - `state_db_target`
+- `review_required_stage`
+- `approval_ref`
+- `approved_candidate_id`
+- `approved_source_transcript_candidate_id`
+- `resume_commands`
+
+### `review-job --json`
+
+The review payload includes:
+
+- `run_id`
+- `job_id`
+- `status`
+- `review_required_stage`
+- `summary`
+- ranked translation candidates
+- source transcript provenance per candidate
+- transcript disagreement and investigation summary
+- preview paths for rendered translation and transcript artifacts
+
+### `approve-review --json`
+
+The approval payload includes:
+
+- `run_id`
+- `job_id`
+- `status`
+- `approval_ref`
+- `approved_candidate_id`
+- `approved_source_transcript_candidate_id`
+- final transcript and translation refs
+- `default_output_path`
 
 ### Published Scorecard
 
@@ -426,6 +459,7 @@ The scorecard is the main audit payload and includes:
 
 - job and run identity
 - final status flags
+- review and approval metadata
 - transcript and translation refs
 - trace refs
 - export refs
@@ -434,6 +468,22 @@ The scorecard is the main audit payload and includes:
 - routing facts
 - transcript decision payload
 - translation decision payload
+
+### Human Approval And Learning Artifacts
+
+New approval-side artifacts include:
+
+- `HumanApprovalRecord` at `approvals/translation.json`
+- `TranscriptApprovalLearningEvent` at `learning/transcript-approval.json`
+
+The operational store also keeps `TranscriptProviderQualityStats` keyed by:
+
+- transcript provider ID
+- source language
+- target language
+
+These provider stats are used only as bounded transcript-ranking priors; they do not override hard
+validation failures or invent transcript winners when no candidates survive.
 
 ## Replay Contract
 

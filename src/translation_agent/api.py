@@ -19,6 +19,7 @@ from translation_agent.observability.events import (
     log_structured_event,
 )
 from translation_agent.observability.tracing import JsonlTraceSink, TraceEvent
+from translation_agent.review_flow import approve_translation_review, build_review_payload
 from translation_agent.storage import (
     PostgresOperationalStore,
     SQLiteOperationalStore,
@@ -43,6 +44,7 @@ class RunJobRequest:
     reference_transcript_source: str | None = None
     reference_transcript_format: Literal["srt"] | None = None
     reference_mode: Literal["none", "evaluate_and_regenerate"] = "none"
+    review_mode: Literal["auto", "always", "never"] = "auto"
 
 
 @dataclass(slots=True)
@@ -61,6 +63,11 @@ class RunJobResult:
     failure_ref: str | None = None
     failure_summary: str | None = None
     failure_reasons: tuple[str, ...] = ()
+    review_required_stage: str | None = None
+    approval_ref: str | None = None
+    approved_candidate_id: str | None = None
+    approved_source_transcript_candidate_id: str | None = None
+    resume_commands: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)
@@ -255,13 +262,29 @@ def run_job(request: RunJobRequest, settings: Settings | None = None) -> RunJobR
                 "final_stage": final_state.current_stage,
                 "published_artifact_refs": list(final_state.published_artifact_refs),
                 "human_review_required": final_state.human_review_required,
+                "review_required_stage": final_state.review_required_stage,
                 "translation_failed": final_state.translation_failed,
                 "memory_batch_ids": list(final_state.memory_batch_ids),
                 "media_key": final_state.job.media_key,
+                "transcript_decision_ref": final_state.final_transcript_decision_ref,
+                "translation_decision_ref": final_state.final_translation_decision_ref,
+                "transcript_investigation_ref": _investigation_ref(
+                    final_state,
+                    stage="transcript",
+                ),
+                "translation_investigation_ref": _investigation_ref(
+                    final_state,
+                    stage="translation",
+                ),
                 "reference_transcript_ref": final_state.reference_transcript_ref,
                 "evaluation_report_ref": final_state.evaluation_report_ref,
                 "regenerated_translation_draft_ref": final_state.regenerated_translation_draft_ref,
                 "improvement_proposal_refs": list(final_state.improvement_proposal_refs),
+                "approval_ref": final_state.approval_ref,
+                "approved_candidate_id": final_state.approved_candidate_id,
+                "approved_source_transcript_candidate_id": (
+                    final_state.approved_source_transcript_candidate_id
+                ),
                 "failure_ref": failure_ref,
                 "failure_summary": failure_summary,
                 "failure_reasons": list(failure_reasons),
@@ -306,7 +329,48 @@ def run_job(request: RunJobRequest, settings: Settings | None = None) -> RunJobR
         failure_ref=failure_ref,
         failure_summary=failure_summary,
         failure_reasons=failure_reasons,
+        review_required_stage=final_state.review_required_stage,
+        approval_ref=final_state.approval_ref,
+        approved_candidate_id=final_state.approved_candidate_id,
+        approved_source_transcript_candidate_id=final_state.approved_source_transcript_candidate_id,
+        resume_commands=_resume_commands(run_id, final_state),
     )
+
+
+def review_job(
+    run_id: str,
+    *,
+    settings: Settings | None = None,
+) -> dict[str, object]:
+    """Load a machine-readable translation review payload for one run."""
+
+    settings = settings or load_settings()
+    blob_store = LocalBlobStore(settings.blob_dir)
+    with _open_operational_store(settings) as store:
+        return build_review_payload(run_id, store=store, blob_store=blob_store)
+
+
+def approve_review(
+    run_id: str,
+    *,
+    candidate_id: str,
+    approved_by: str | None = None,
+    note: str | None = None,
+    settings: Settings | None = None,
+) -> dict[str, object]:
+    """Approve a persisted translation review and republish canonical outputs."""
+
+    settings = settings or load_settings()
+    blob_store = LocalBlobStore(settings.blob_dir)
+    with _open_operational_store(settings) as store:
+        return approve_translation_review(
+            run_id,
+            candidate_id=candidate_id,
+            approved_by=approved_by,
+            note=note,
+            store=store,
+            blob_store=blob_store,
+        )
 
 
 def convert_translation_json_to_srt(
@@ -435,7 +499,7 @@ def _normalized_optional_identifier(value: str | None) -> str | None:
 
 
 def _default_output_path(blob_root: Path, state: GraphState) -> Path | None:
-    if state.translation_failed or state.human_review_required:
+    if state.translation_failed or (state.human_review_required and state.approval_ref is None):
         return None
     default_output_ref = job_path(state.job, "exports", "translation.srt")
     default_output_path = blob_root / default_output_ref
@@ -445,6 +509,8 @@ def _default_output_path(blob_root: Path, state: GraphState) -> Path | None:
 
 
 def _final_status(state: GraphState) -> str:
+    if state.approval_ref is not None:
+        return "completed_after_human_review"
     if state.translation_failed:
         return "translation_failed"
     if state.human_review_required:
@@ -528,3 +594,25 @@ def _translation_failure_retryable(failure_reasons: tuple[str, ...]) -> bool:
     if error_code == "rate_limit":
         return True
     return False
+
+
+def _resume_commands(run_id: str, state: GraphState) -> tuple[str, ...]:
+    if state.review_required_stage != "translation":
+        return ()
+    return (
+        f"uv run translation-agent review-job {run_id}",
+        f"uv run translation-agent approve-review {run_id} --candidate-id <candidate-id>",
+    )
+
+
+def _investigation_ref(state: GraphState, *, stage: str) -> str | None:
+    return next(
+        (
+            fact.source_ref
+            for fact in state.routing_facts
+            if fact.fact_type == "investigation_ref"
+            and fact.stage == f"adjudicate_{stage}"
+            and fact.source_ref is not None
+        ),
+        None,
+    )

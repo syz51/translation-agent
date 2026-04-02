@@ -28,6 +28,8 @@ def finalize_outputs(state: GraphState, runtime: WorkflowRuntime) -> dict[str, o
             artifacts.final_transcript_ref,
             artifacts.final_translation_ref,
             artifacts.recoverable_translation_failure_ref,
+            *artifacts.approval_refs,
+            *artifacts.learning_refs,
             *artifacts.reference_transcript_refs,
             *artifacts.evaluation_report_refs,
             *artifacts.regenerated_draft_refs,

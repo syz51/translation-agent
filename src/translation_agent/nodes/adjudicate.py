@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 from translation_agent.graph.runtime import WorkflowRuntime
 from translation_agent.graph.state import GraphState, RoutingFact
@@ -67,6 +68,11 @@ def adjudicate_transcript(state: GraphState, runtime: WorkflowRuntime) -> dict[s
             memory_bundle=adjudication_memory,
         ),
         content_risk_class=content_risk_class_for_scenario(runtime.scenario),
+        ranking_priors=_transcript_provider_ranking_priors(
+            runtime=runtime,
+            candidates=candidates,
+            state=state,
+        ),
     )
     memory_ref = write_model_artifact(
         runtime,
@@ -80,12 +86,33 @@ def adjudicate_transcript(state: GraphState, runtime: WorkflowRuntime) -> dict[s
         job=state.job,
         payload=outcome.investigation_payload,
     )
+    selected_transcript_candidate_id = (
+        outcome.winner_candidate_id
+        or outcome.assessment.preferred_candidate_id
+        or (candidates[0].candidate_id if candidates else None)
+    )
+    deferred_review_fact = ()
+    rationale_summary = outcome.rationale_summary
+    if outcome.human_review_required:
+        rationale_summary = (
+            "Transcript disagreement remained unresolved after machine adjudication; "
+            "translation generation will continue across all surviving transcript candidates "
+            "and transcript provenance will be surfaced during translation review."
+        )
+        deferred_review_fact = (
+            RoutingFact(
+                stage="adjudicate_transcript",
+                fact_type="transcript_review_deferred_to_translation",
+                value=selected_transcript_candidate_id or "none",
+                source_ref=investigation_ref or memory_ref,
+            ),
+        )
     decision = FinalTranscriptDecision(
         job_id=state.job.job_id,
-        winner_candidate_id=outcome.winner_candidate_id,
+        winner_candidate_id=selected_transcript_candidate_id,
         decision_mode=outcome.decision_mode,
         decision_confidence=outcome.decision_confidence,
-        rationale_summary=outcome.rationale_summary,
+        rationale_summary=rationale_summary,
         review_refs=state.transcript_review_ids,
         investigation_ref=investigation_ref,
         disagreement_bucket=outcome.disagreement_bucket,
@@ -95,7 +122,7 @@ def adjudicate_transcript(state: GraphState, runtime: WorkflowRuntime) -> dict[s
             content_risk_class=context.content_risk_class,
         ),
         escalated=outcome.escalated,
-        human_review_required=outcome.human_review_required,
+        human_review_required=False,
     )
     runtime.decision_store.save_transcript_decision(
         decision,
@@ -108,11 +135,12 @@ def adjudicate_transcript(state: GraphState, runtime: WorkflowRuntime) -> dict[s
     )
     return {
         "current_stage": "adjudicate_transcript",
-        "final_transcript_candidate_id": outcome.winner_candidate_id,
+        "final_transcript_candidate_id": selected_transcript_candidate_id,
         "final_transcript_decision_ref": decision_ref,
         "pending_memory_source_stage": "transcript_adjudication",
         "escalation_pending": decision.escalated,
-        "human_review_required": decision.human_review_required,
+        "human_review_required": False,
+        "review_required_stage": None,
         "routing_facts": state.routing_facts
         + (
             RoutingFact(
@@ -122,6 +150,7 @@ def adjudicate_transcript(state: GraphState, runtime: WorkflowRuntime) -> dict[s
                 source_ref=memory_ref,
             ),
         )
+        + deferred_review_fact
         + _routing_facts(
             stage="adjudicate_transcript",
             decision_mode=decision.decision_mode,
@@ -188,10 +217,12 @@ def adjudicate_translation(state: GraphState, runtime: WorkflowRuntime) -> dict[
         return {
             "current_stage": "adjudicate_translation",
             "final_translation_candidate_id": None,
+            "final_transcript_candidate_id": state.final_transcript_candidate_id,
             "final_translation_decision_ref": decision_ref,
             "pending_memory_source_stage": None,
             "escalation_pending": True,
             "human_review_required": True,
+            "review_required_stage": None,
             "translation_failed": True,
             "routing_facts": state.routing_facts
             + _routing_facts(
@@ -310,10 +341,20 @@ def adjudicate_translation(state: GraphState, runtime: WorkflowRuntime) -> dict[
     return {
         "current_stage": "adjudicate_translation",
         "final_translation_candidate_id": winner_candidate_id,
+        "final_transcript_candidate_id": (
+            winner.source_transcript_candidate_id
+            if winner is not None
+            else state.final_transcript_candidate_id
+        ),
         "final_translation_decision_ref": decision_ref,
         "pending_memory_source_stage": "translation_adjudication",
         "escalation_pending": decision.escalated,
         "human_review_required": decision.human_review_required,
+        "review_required_stage": (
+            TRANSLATION_REVIEW_STAGE
+            if decision.human_review_required and not state.translation_failed and candidates
+            else None
+        ),
         "translation_failed": False,
         "routing_facts": state.routing_facts
         + (
@@ -453,3 +494,33 @@ def _scorecard(
         total_score=assessment.total_score,
         content_risk_class=content_risk_class,
     )
+
+
+def _transcript_provider_ranking_priors(
+    *,
+    runtime: WorkflowRuntime,
+    candidates,
+    state: GraphState,
+) -> dict[str, float]:
+    getter = getattr(runtime.decision_store, "get_transcript_provider_quality_stats", None)
+    if not callable(getter):
+        return {}
+
+    priors: dict[str, float] = {}
+    for candidate in candidates:
+        stats = getter(
+            provider_id=candidate.provider_id,
+            source_language=state.job.source_language,
+            target_language=state.job.target_language,
+        )
+        if stats is None:
+            continue
+        priors[candidate.candidate_id] = _bounded_provider_prior(stats)
+    return {candidate_id: boost for candidate_id, boost in priors.items() if boost > 0.0}
+
+
+def _bounded_provider_prior(stats: Any) -> float:
+    recent_boost = min(float(getattr(stats, "recent_approved_outcomes_30d", 0)) * 0.01, 0.05)
+    volume_boost = min(float(getattr(stats, "total_approved_outcomes", 0)) * 0.01, 0.05)
+    rate_boost = min(float(getattr(stats, "indirect_approval_rate", 0.0)) * 0.12, 0.15)
+    return round(min(0.25, recent_boost + volume_boost + rate_boost), 4)

@@ -93,6 +93,7 @@ class AdjudicationContext(ContractModel):
     memory_bundle: MemoryBundle
     investigation_ref: str | None = None
     content_risk_class: str = "standard"
+    ranking_priors: dict[str, float] = Field(default_factory=dict)
 
 
 class ReviewBundle(ContractModel):

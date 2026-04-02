@@ -141,15 +141,16 @@ Purpose:
 
 Behavior:
 
-- after transcript adjudication, the router decides whether translation should run
+- after transcript adjudication, the router always continues into translation generation unless a
+  translation decision already exists
 - after translation adjudication, the next step is always finalization
 
 ### `generate_translation_candidates`
 
 Purpose:
 
-- load the winning transcript
-- generate one translation candidate per prompt variant
+- load every surviving transcript candidate
+- generate one translation candidate per transcript candidate and prompt variant
 - persist raw payloads and staged translation candidates
 
 Current prompt variants:
@@ -161,6 +162,7 @@ Behavior:
 
 - single-variant survival is allowed
 - if both variants fail, the node sets `translation_failed=True`
+- candidate provenance remains explicit through `source_transcript_candidate_id`
 
 ### `normalize_translations`
 
@@ -178,7 +180,7 @@ Outputs:
 Purpose:
 
 - recall translation-stage memory
-- include the final transcript ref in the review prompt context
+- include transcript provenance on every translation candidate
 - render and parse deterministic reviewer output
 
 Reviewer roles:
@@ -200,10 +202,13 @@ Special cases:
 
 - if there are no translation candidates, the node creates a `FinalTranslationDecision` with `human_review_required=True` and `translation_failed=True`
 - a translation conflict investigation can time out and be converted into `human_review`
+- human review is translation-only; approving a translation candidate implicitly selects its source
+  transcript candidate
 
 Outputs:
 
 - final translation candidate ID or `None`
+- final transcript candidate ID follows the winning translation when machine adjudication resolves
 - translation decision ref
 - optional investigation ref
 - optional `pending_memory_source_stage="translation_adjudication"`
@@ -219,6 +224,8 @@ Outputs:
 
 - published transcript when a transcript winner exists
 - published translation when a translation winner exists and human review is not required
+- approval-driven republish of transcript, translation, exports, and deliveries when a human
+  selects a translation candidate
 - recoverable translation failure manifest when translation generation failed
 - scorecard
 - exports
@@ -237,7 +244,7 @@ The only conditional edge lives after `background_memory_pipeline`.
 
 Implications:
 
-- transcript-stage escalation can skip the entire translation path
+- transcript-stage disagreement no longer skips the translation path
 - translation adjudication always leads to finalization
 
 ## Status Semantics
@@ -248,8 +255,11 @@ The API maps final graph state into these public statuses:
   The workflow reached finalization without human review and without transcription degradation.
 - `completed_with_degraded_transcription`
   At least one transcription provider failed, but another candidate survived and the run completed.
+- `completed_after_human_review`
+  Translation review was reopened later, a human approved a translation candidate, and canonical
+  transcript and translation artifacts were republished in place.
 - `human_review_required`
-  The workflow escalated to a state that still requires human intervention.
+  Translation adjudication produced candidates but still requires a later human approval step.
 - `translation_failed`
   All translation variants failed, the transcript was preserved, and a recoverable translation failure artifact was published.
 
@@ -286,6 +296,14 @@ A successful translation run publishes:
 - `traces/<run_id>.jsonl`
 - memory batch, consolidation, and prompt-evolution refs when available
 
+A human-approved review also publishes:
+
+- `approvals/translation.json`
+- `learning/transcript-approval.json`
+- republished `published/transcript.json`
+- republished `published/translation.json`
+- republished exports and downstream delivery payloads
+
 A translation-failed run publishes:
 
 - `published/transcript.json`
@@ -301,7 +319,7 @@ The most important workflow guarantees are covered by tests:
 - degraded transcription with partial provider failure
 - single surviving translation variant
 - translation failure with transcript preservation
-- transcript-stage escalation that skips translation
+- transcript disagreement that still continues into translation generation
 - medium disagreement conflict investigation
 - high-risk translation escalation
 - timeout-to-human-review regression behavior

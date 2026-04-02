@@ -81,11 +81,21 @@ def test_reference_evaluation_path_publishes_asset_artifacts_and_keeps_canonical
     )
 
     run_job(
-        RunJobRequest(source=str(source), job_id="job-prev-1", asset_id="asset-1"),
+        RunJobRequest(
+            source=str(source),
+            job_id="job-prev-1",
+            asset_id="asset-1",
+            target_language="fr",
+        ),
         settings=settings,
     )
     run_job(
-        RunJobRequest(source=str(source), job_id="job-prev-2", asset_id="asset-1"),
+        RunJobRequest(
+            source=str(source),
+            job_id="job-prev-2",
+            asset_id="asset-1",
+            target_language="fr",
+        ),
         settings=settings,
     )
     result = run_job(
@@ -93,6 +103,7 @@ def test_reference_evaluation_path_publishes_asset_artifacts_and_keeps_canonical
             source=str(source),
             job_id="job-eval",
             asset_id="asset-1",
+            target_language="fr",
             reference_transcript_source=str(reference_path),
             reference_mode="evaluate_and_regenerate",
         ),

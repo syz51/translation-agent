@@ -152,8 +152,11 @@ It verifies:
 
 ```bash
 uv run translation-agent run-job input.wav --job-id demo
+uv run translation-agent run-job input.wav --job-id demo --review auto
 uv run translation-agent run-job input.wav --job-id demo --json
 uv run translation-agent run-job input.wav --job-id demo-ja --target-language ja --json
+uv run translation-agent review-job <run-id> --json
+uv run translation-agent approve-review <run-id> --candidate-id <candidate-id> --json
 ```
 
 The public result payload contains:
@@ -171,13 +174,23 @@ The public result payload contains:
 - `failure_ref`
 - `failure_summary`
 - `failure_reasons`
+- `review_required_stage`
+- `approval_ref`
+- `approved_candidate_id`
+- `approved_source_transcript_candidate_id`
+- `resume_commands`
 
 Final statuses currently emitted by the API are:
 
 - `completed`
 - `completed_with_degraded_transcription`
+- `completed_after_human_review`
 - `human_review_required`
 - `translation_failed`
+
+Human review is translation-only in the current CLI. Transcript disagreement no longer blocks the
+runtime path; instead, translation generation fans out across all surviving transcript candidates,
+and a later approved translation implicitly selects the canonical transcript candidate.
 
 ### `convert-json-to-srt`
 
@@ -229,6 +242,8 @@ tenants/<tenant>/projects/<project>/languages/<src>-to-<dst>/jobs/<job_id>/
   candidates/translations/*.json
   reviews/transcript/*.json
   reviews/translation/*.json
+  approvals/translation.json
+  learning/transcript-approval.json
   decisions/transcript.json
   decisions/translation.json
   investigations/*.json

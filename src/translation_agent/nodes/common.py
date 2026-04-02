@@ -123,8 +123,17 @@ def translation_candidate_key(job: JobContext, candidate_id: str) -> str:
     return job_path(job, "candidates", "translations", f"{candidate_id}.json")
 
 
-def raw_translation_candidate_key(job: JobContext, prompt_variant_id: str) -> str:
-    return job_path(job, "raw", "translation-candidates", f"{prompt_variant_id}.json")
+def raw_translation_candidate_key(
+    job: JobContext,
+    prompt_variant_id: str,
+    source_transcript_candidate_id: str,
+) -> str:
+    return job_path(
+        job,
+        "raw",
+        "translation-candidates",
+        f"{prompt_variant_id}-{source_transcript_candidate_id}.json",
+    )
 
 
 def staged_transcript_candidate_key(job: JobContext, candidate_id: str) -> str:
@@ -191,6 +200,18 @@ def translation_failure_key(job: JobContext) -> str:
     return job_path(job, "published", "translation-failed.json")
 
 
+def approval_record_key(job: JobContext) -> str:
+    return job_path(job, "approvals", "translation.json")
+
+
+def transcript_approval_learning_key(job: JobContext) -> str:
+    return job_path(job, "learning", "transcript-approval.json")
+
+
+def review_preview_key(job: JobContext, candidate_id: str, suffix: str) -> str:
+    return job_path(job, "review", "previews", f"{candidate_id}{suffix}")
+
+
 def select_transcript_candidates(
     runtime: WorkflowRuntime,
     *,
@@ -247,8 +268,12 @@ def transcript_sort_key(candidate: TranscriptCandidate) -> tuple[int, str]:
     return (int(candidate.metadata.get("provider_rank", 100)), candidate.candidate_id)
 
 
-def translation_sort_key(candidate: TranslationCandidate) -> tuple[str, str]:
-    return (candidate.prompt_variant_id, candidate.candidate_id)
+def translation_sort_key(candidate: TranslationCandidate) -> tuple[str, str, str]:
+    return (
+        candidate.source_transcript_candidate_id or "",
+        candidate.prompt_variant_id,
+        candidate.candidate_id,
+    )
 
 
 def normalized_transcript(candidate: TranscriptCandidate) -> TranscriptCandidate:

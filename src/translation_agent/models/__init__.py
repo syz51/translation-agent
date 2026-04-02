@@ -1,5 +1,10 @@
 """Canonical models package."""
 
+from .approval import (
+    HumanApprovalRecord,
+    TranscriptApprovalLearningEvent,
+    TranscriptProviderQualityStats,
+)
 from .artifacts import AudioArtifact, PublishContext, PublishedArtifacts
 from .evaluation import (
     AssetRecord,
@@ -64,6 +69,7 @@ __all__ = [
     "FinalTranscriptDecision",
     "FinalTranslationDecision",
     "HistoricalRunLink",
+    "HumanApprovalRecord",
     "JobContext",
     "MemoryBundle",
     "MemoryConsolidation",
@@ -94,9 +100,11 @@ __all__ = [
     "Segment",
     "StructuredEvidence",
     "SuggestedFix",
+    "TranscriptApprovalLearningEvent",
     "TranscriptAlignmentReport",
     "TranscriptMismatchSpan",
     "TranscriptCandidate",
+    "TranscriptProviderQualityStats",
     "TranslationScore",
     "TranslationCandidate",
 ]

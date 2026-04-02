@@ -4,6 +4,7 @@ import json
 from argparse import Namespace
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -12,6 +13,7 @@ from translation_agent.api import (
     RunJobResult,
     _failure_details,
     _final_status,
+    review_job,
     run_job,
 )
 from translation_agent.cli import main
@@ -25,13 +27,12 @@ from translation_agent.config import (
 )
 from translation_agent.graph import GraphState
 from translation_agent.graph.state import RoutingFact
-from translation_agent.models import JobContext, Segment, TranslationCandidate
+from translation_agent.models import JobContext, Segment, TranscriptCandidate, TranslationCandidate
 from translation_agent.storage import (
     LocalBlobStore,
     PostgresRunStore,
     SQLiteOperationalStore,
     job_path,
-    job_scope_token,
 )
 
 
@@ -905,11 +906,10 @@ def test_run_job_persists_long_term_memory_across_separate_runs(
         ).read_text(encoding="utf-8")
     )
 
-    expected_fragment = (
-        "translation adjudication trusted "
-        f"tl-variant-a-job-memory-a-{job_scope_token(_job_context(job_id='job-memory-a'))}"
+    assert any(
+        entry["content"].startswith("translation adjudication trusted tl-variant-a-job-memory-a-")
+        for entry in memory_bundle["semantic_memory"]
     )
-    assert any(expected_fragment in entry["content"] for entry in memory_bundle["semantic_memory"])
 
 
 @pytest.mark.unit
@@ -956,11 +956,12 @@ def test_run_job_human_review_required_leaves_default_output_path_unset(
         RunJobRequest(
             source="input.mp4",
             job_id="job-human-review",
-            metadata={"scenario": "transcript_escalation"},
+            metadata={"scenario": "translation_conflict_timeout"},
         )
     )
 
     assert result.status == "human_review_required"
+    assert result.review_required_stage == "translation"
     assert result.source_language == "en"
     assert result.target_language == "zh"
     assert result.default_output_path is None
@@ -1130,6 +1131,186 @@ def test_cli_run_job_json(migrated_postgres_dsn: str, monkeypatch, tmp_path: Pat
 
     assert record is not None
     assert len(node_executions) == 13
+
+
+@pytest.mark.unit
+def test_cli_run_job_review_auto_non_tty_prints_resume_instructions(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        "translation_agent.cli.run_job",
+        lambda request, settings: RunJobResult(
+            run_id="run-review-auto",
+            job_id="job-review-auto",
+            status="human_review_required",
+            source=request.source,
+            source_language="en",
+            target_language="zh",
+            blob_root=Path("/tmp/blob-root"),
+            trace_path=Path("/tmp/trace.jsonl"),
+            state_backend="sqlite",
+            state_db_target="/tmp/state.sqlite3",
+            review_required_stage="translation",
+            resume_commands=(
+                "uv run translation-agent review-job run-review-auto",
+                "uv run translation-agent approve-review run-review-auto "
+                "--candidate-id <candidate-id>",
+            ),
+        ),
+    )
+
+    exit_code = main(["run-job", "input.wav", "--job-id", "job-review-auto", "--review", "auto"])
+
+    output = capsys.readouterr().out
+    assert exit_code == 0
+    assert "review_required_stage: translation" in output
+    assert "uv run translation-agent review-job run-review-auto" in output
+    assert "uv run translation-agent approve-review run-review-auto" in output
+
+
+@pytest.mark.unit
+def test_review_job_json_exposes_candidates_and_provenance(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("TA_DATA_DIR", str(tmp_path / "runtime"))
+    monkeypatch.delenv("TA_STATE_DB_DSN", raising=False)
+
+    result = run_job(
+        RunJobRequest(
+            source="input.mp4",
+            job_id="job-review-json",
+            metadata={"scenario": "translation_conflict_timeout"},
+        )
+    )
+
+    exit_code = main(["review-job", result.run_id, "--json"])
+
+    payload = json.loads(capsys.readouterr().out)
+    candidate = payload["candidates"][0]
+    assert exit_code == 0
+    assert payload["review_required_stage"] == "translation"
+    assert payload["candidate_count"] >= 1
+    assert candidate["source_transcript_candidate_id"]
+    assert candidate["source_transcript"]["provider_id"] in {
+        "assemblyai",
+        "speechmatics",
+        "deepgram",
+    }
+    assert Path(candidate["translation_preview_json_path"]).exists()
+    assert Path(candidate["translation_preview_srt_path"]).exists()
+    assert payload["transcript_review_summary"]["decision_ref"].endswith(
+        "/decisions/transcript.json"
+    )
+
+
+@pytest.mark.unit
+def test_approve_review_json_republishes_outputs_and_updates_provider_stats(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("TA_DATA_DIR", str(tmp_path / "runtime"))
+    monkeypatch.delenv("TA_STATE_DB_DSN", raising=False)
+
+    first = run_job(
+        RunJobRequest(
+            source="input.mp4",
+            job_id="job-review-approve-a",
+            metadata={"scenario": "translation_conflict_timeout"},
+        )
+    )
+    first_payload = review_job(first.run_id)
+    first_candidates = cast(list[dict[str, object]], first_payload["candidates"])
+    first_candidate = first_candidates[0]
+
+    exit_code = main(
+        [
+            "approve-review",
+            first.run_id,
+            "--candidate-id",
+            cast(str, first_candidate["candidate_id"]),
+            "--approved-by",
+            "tester",
+            "--note",
+            "ship",
+            "--json",
+        ]
+    )
+
+    approved_payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert approved_payload["status"] == "completed_after_human_review"
+
+    second = run_job(
+        RunJobRequest(
+            source="input.mp4",
+            job_id="job-review-approve-b",
+            metadata={"scenario": "translation_conflict_timeout"},
+        )
+    )
+    second_payload = review_job(second.run_id)
+    second_candidates = cast(list[dict[str, object]], second_payload["candidates"])
+    matching_candidate = next(
+        candidate
+        for candidate in second_candidates
+        if cast(dict[str, object], candidate["source_transcript"])["provider_id"]
+        == cast(dict[str, object], first_candidate["source_transcript"])["provider_id"]
+    )
+    second_result = main(
+        [
+            "approve-review",
+            second.run_id,
+            "--candidate-id",
+            cast(str, matching_candidate["candidate_id"]),
+            "--approved-by",
+            "tester",
+            "--json",
+        ]
+    )
+    assert second_result == 0
+    capsys.readouterr()
+
+    blob_store = LocalBlobStore(tmp_path / "runtime" / "blobs")
+    job = _job_context("job-review-approve-a")
+    approval_path = Path(job_path(job, "approvals", "translation.json"))
+    learning_path = Path(job_path(job, "learning", "transcript-approval.json"))
+    transcript_path = Path(job_path(job, "published", "transcript.json"))
+    translation_path = Path(job_path(job, "published", "translation.json"))
+
+    assert blob_store.exists(str(approval_path))
+    assert blob_store.exists(str(learning_path))
+    assert blob_store.exists(str(transcript_path))
+    assert blob_store.exists(str(translation_path))
+
+    approved_translation = TranslationCandidate.model_validate_json(
+        blob_store.read_bytes(str(translation_path))
+    )
+    approved_transcript = TranscriptCandidate.model_validate_json(
+        blob_store.read_bytes(str(transcript_path))
+    )
+    assert approved_translation.source_transcript_candidate_id == approved_transcript.candidate_id
+
+    with SQLiteOperationalStore(tmp_path / "runtime" / "state.sqlite3") as store:
+        first_record = store.get_run(first.run_id)
+        stats = store.get_transcript_provider_quality_stats(
+            provider_id=cast(
+                str,
+                cast(dict[str, object], first_candidate["source_transcript"])["provider_id"],
+            ),
+            source_language="en",
+            target_language="zh",
+        )
+
+    assert first_record is not None
+    assert first_record.status == "completed_after_human_review"
+    assert first_record.output_data["approval_ref"] == str(approval_path)
+    assert stats is not None
+    assert stats.total_approved_outcomes == 2
+    assert stats.total_review_escalations == 2
+    assert stats.recent_approved_outcomes_30d == 2
 
 
 @pytest.mark.unit

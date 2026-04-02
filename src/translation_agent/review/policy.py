@@ -99,10 +99,15 @@ def assess_review_disagreement(
     candidate_ids: tuple[str, ...],
     fallback_candidate_id: str | None,
     content_risk_class: str = "standard",
+    ranking_priors: dict[str, float] | None = None,
 ) -> DisagreementAssessment:
     """Choose the adjudication path from structured reviewer outputs."""
 
-    preferred_candidate_id = _preferred_candidate_id(reviews, fallback_candidate_id)
+    preferred_candidate_id = _preferred_candidate_id(
+        reviews,
+        fallback_candidate_id,
+        ranking_priors=ranking_priors,
+    )
     if preferred_candidate_id not in set(candidate_ids):
         preferred_candidate_id = fallback_candidate_id
 
@@ -183,6 +188,7 @@ def adjudicate_reviews(
         candidate_ids=context.candidate_ids,
         fallback_candidate_id=fallback_candidate_id,
         content_risk_class=context.content_risk_class,
+        ranking_priors=context.ranking_priors,
     )
     candidate_count = len(candidate_list)
     single_candidate_escalation = candidate_count == 1 and context.stage == "transcript"
@@ -250,8 +256,13 @@ def content_risk_class_for_scenario(scenario: str) -> str:
 def _preferred_candidate_id(
     reviews: tuple[ReviewBundle, ...],
     fallback_candidate_id: str | None,
+    *,
+    ranking_priors: dict[str, float] | None = None,
 ) -> str | None:
     scores: dict[str, float] = defaultdict(float)
+    if ranking_priors:
+        for candidate_id, boost in ranking_priors.items():
+            scores[candidate_id] += max(0.0, min(float(boost), 0.35))
     for review in reviews:
         review_confidence = _review_confidence(review)
         for preference in _review_preferences(review):

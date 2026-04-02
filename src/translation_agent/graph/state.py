@@ -52,4 +52,8 @@ class GraphState(ContractModel):
     pending_memory_source_stage: str | None = None
     escalation_pending: bool = False
     human_review_required: bool = False
+    review_required_stage: str | None = None
+    approval_ref: str | None = None
+    approved_candidate_id: str | None = None
+    approved_source_transcript_candidate_id: str | None = None
     translation_failed: bool = False

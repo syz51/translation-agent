@@ -128,6 +128,7 @@ def _normalize_run_job_payload(payload: dict[str, object]) -> dict[str, object]:
     normalized["trace_path"] = "<trace_path>"
     normalized["default_output_path"] = "<default_output_path>"
     normalized["state_db_target"] = "<state_db_target>"
+    normalized["resume_commands"] = []
     return normalized
 
 

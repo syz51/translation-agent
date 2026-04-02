@@ -18,6 +18,7 @@ from translation_agent.models import (
     MemoryWriteBatch,
     PromptEvolutionProposal,
     TranscriptCandidate,
+    TranscriptProviderQualityStats,
     TranslationCandidate,
 )
 from translation_agent.models.review import ReviewStage
@@ -68,6 +69,24 @@ _POSTGRES_STAGE_UPSERT_SQL = {
 _POSTGRES_STAGE_SELECT_SQL = {
     "investigations": "SELECT payload_json FROM investigations WHERE job_id = %s AND stage = %s"
 }
+_POSTGRES_PROVIDER_STATS_UPSERT_SQL = """
+    INSERT INTO transcript_provider_quality_stats (
+        provider_id,
+        source_language,
+        target_language,
+        stats_json,
+        created_at,
+        updated_at
+    ) VALUES (%s, %s, %s, %s, %s, %s)
+    ON CONFLICT (provider_id, source_language, target_language) DO UPDATE SET
+        stats_json = EXCLUDED.stats_json,
+        updated_at = EXCLUDED.updated_at
+"""
+_POSTGRES_PROVIDER_STATS_SELECT_SQL = """
+    SELECT stats_json
+    FROM transcript_provider_quality_stats
+    WHERE provider_id = %s AND source_language = %s AND target_language = %s
+"""
 _SQLITE_CANDIDATE_UPSERT_SQL = {
     "transcript_candidates": """
         INSERT INTO transcript_candidates (
@@ -120,6 +139,24 @@ _SQLITE_STAGE_UPSERT_SQL = {
 _SQLITE_STAGE_SELECT_SQL = {
     "investigations": "SELECT payload_json FROM investigations WHERE job_id = ? AND stage = ?"
 }
+_SQLITE_PROVIDER_STATS_UPSERT_SQL = """
+    INSERT INTO transcript_provider_quality_stats (
+        provider_id,
+        source_language,
+        target_language,
+        stats_json,
+        created_at,
+        updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(provider_id, source_language, target_language) DO UPDATE SET
+        stats_json = excluded.stats_json,
+        updated_at = excluded.updated_at
+"""
+_SQLITE_PROVIDER_STATS_SELECT_SQL = """
+    SELECT stats_json
+    FROM transcript_provider_quality_stats
+    WHERE provider_id = ? AND source_language = ? AND target_language = ?
+"""
 _SQLITE_LIST_SQL = {
     "transcript_candidates": (
         "SELECT candidate_json FROM transcript_candidates "
@@ -180,7 +217,7 @@ class OperationalStore(DecisionStore, MemoryBatchStore, Protocol):
 
     def close(self) -> None: ...
 
-    def __enter__(self): ...
+    def __enter__(self) -> OperationalStore: ...
 
     def __exit__(self, exc_type, exc, tb) -> None: ...
 
@@ -275,6 +312,18 @@ class OperationalStore(DecisionStore, MemoryBatchStore, Protocol):
         scope_key: str | None = None,
         media_key: str | None = None,
     ) -> list[PromptEvolutionProposal]: ...
+
+    def save_transcript_provider_quality_stats(
+        self, stats: TranscriptProviderQualityStats
+    ) -> None: ...
+
+    def get_transcript_provider_quality_stats(
+        self,
+        *,
+        provider_id: str,
+        source_language: str,
+        target_language: str,
+    ) -> TranscriptProviderQualityStats | None: ...
 
 
 class PostgresOperationalStore(PostgresRunStore):
@@ -608,6 +657,36 @@ class PostgresOperationalStore(PostgresRunStore):
             PromptEvolutionProposal.model_validate(_decode_db_json(row["proposal_json"]))
             for row in rows
         ]
+
+    def save_transcript_provider_quality_stats(self, stats: TranscriptProviderQualityStats) -> None:
+        now = _utc_now()
+        with self._conn.transaction():
+            self._conn.execute(
+                _POSTGRES_PROVIDER_STATS_UPSERT_SQL,
+                (
+                    stats.provider_id,
+                    stats.source_language,
+                    stats.target_language,
+                    _encode_json(stats.model_dump(mode="json")),
+                    now,
+                    now,
+                ),
+            )
+
+    def get_transcript_provider_quality_stats(
+        self,
+        *,
+        provider_id: str,
+        source_language: str,
+        target_language: str,
+    ) -> TranscriptProviderQualityStats | None:
+        row = self._conn.execute(
+            _POSTGRES_PROVIDER_STATS_SELECT_SQL,
+            (provider_id, source_language, target_language),
+        ).fetchone()
+        if row is None:
+            return None
+        return TranscriptProviderQualityStats.model_validate(_decode_db_json(row["stats_json"]))
 
     def resolve_asset(
         self,
@@ -1338,6 +1417,36 @@ class SQLiteOperationalStore(AbstractContextManager["SQLiteOperationalStore"]):
             for row in rows
         ]
 
+    def save_transcript_provider_quality_stats(self, stats: TranscriptProviderQualityStats) -> None:
+        now = _utc_now()
+        with self._conn:
+            self._conn.execute(
+                _SQLITE_PROVIDER_STATS_UPSERT_SQL,
+                (
+                    stats.provider_id,
+                    stats.source_language,
+                    stats.target_language,
+                    _encode_sqlite_json(stats.model_dump(mode="json")),
+                    now,
+                    now,
+                ),
+            )
+
+    def get_transcript_provider_quality_stats(
+        self,
+        *,
+        provider_id: str,
+        source_language: str,
+        target_language: str,
+    ) -> TranscriptProviderQualityStats | None:
+        row = self._conn.execute(
+            _SQLITE_PROVIDER_STATS_SELECT_SQL,
+            (provider_id, source_language, target_language),
+        ).fetchone()
+        if row is None:
+            return None
+        return TranscriptProviderQualityStats.model_validate(_decode_sqlite_json(row["stats_json"]))
+
     def _bootstrap_schema(self) -> None:
         self._conn.executescript(
             """
@@ -1480,6 +1589,16 @@ class SQLiteOperationalStore(AbstractContextManager["SQLiteOperationalStore"]):
                 base_prompt_version,
                 scope_kind,
                 scope_key
+            );
+
+            CREATE TABLE IF NOT EXISTS transcript_provider_quality_stats (
+                provider_id TEXT NOT NULL,
+                source_language TEXT NOT NULL,
+                target_language TEXT NOT NULL,
+                stats_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (provider_id, source_language, target_language)
             );
             """
         )

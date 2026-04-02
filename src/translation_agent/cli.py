@@ -4,11 +4,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from dataclasses import asdict
+from pathlib import Path
+from typing import Any
 
 from translation_agent.api import (
     RunJobRequest,
+    approve_review,
     convert_translation_json_to_srt,
+    review_job,
     run_job,
 )
 from translation_agent.config import load_settings, sanitize_db_target, validate_environment
@@ -46,7 +51,29 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_parser.add_argument("--source-language")
     run_parser.add_argument("--target-language")
+    run_parser.add_argument(
+        "--review",
+        choices=["auto", "always", "never"],
+        default="auto",
+    )
     run_parser.add_argument("--json", action="store_true", dest="as_json")
+
+    review_parser = subparsers.add_parser(
+        "review-job",
+        help="Inspect a pending translation review for an existing run",
+    )
+    review_parser.add_argument("run_id")
+    review_parser.add_argument("--json", action="store_true", dest="as_json")
+
+    approve_parser = subparsers.add_parser(
+        "approve-review",
+        help="Approve a pending translation review candidate",
+    )
+    approve_parser.add_argument("run_id")
+    approve_parser.add_argument("--candidate-id", required=True)
+    approve_parser.add_argument("--approved-by")
+    approve_parser.add_argument("--note")
+    approve_parser.add_argument("--json", action="store_true", dest="as_json")
     return parser
 
 
@@ -130,13 +157,11 @@ def main(argv: list[str] | None = None) -> int:
                 reference_transcript_source=args.reference_transcript_source,
                 reference_transcript_format=args.reference_transcript_format,
                 reference_mode=args.reference_mode,
+                review_mode=args.review,
             ),
             settings=settings,
         )
-        payload = {
-            key: str(value) if hasattr(value, "__fspath__") else value
-            for key, value in asdict(result).items()
-        }
+        payload = _json_ready(asdict(result))
         if args.as_json:
             print(json.dumps(payload))
         else:
@@ -152,7 +177,157 @@ def main(argv: list[str] | None = None) -> int:
                 print(result.failure_summary)
             for reason in result.failure_reasons:
                 print(reason)
+            if result.review_required_stage == "translation":
+                if _should_enter_interactive_review(mode=args.review):
+                    return _interactive_review_flow(result.run_id, settings=settings)
+                if args.review == "always" and not _has_tty():
+                    print("interactive review requires a real TTY")
+                    return 2
+                print("review_required_stage: translation")
+                for command in result.resume_commands:
+                    print(command)
+        return 0
+
+    if args.command == "review-job":
+        settings = load_settings()
+        payload = review_job(args.run_id, settings=settings)
+        if args.as_json:
+            print(json.dumps(_json_ready(payload)))
+            return 0
+        return _interactive_review_flow(args.run_id, settings=settings, initial_payload=payload)
+
+    if args.command == "approve-review":
+        settings = load_settings()
+        payload = approve_review(
+            args.run_id,
+            candidate_id=args.candidate_id,
+            approved_by=args.approved_by,
+            note=args.note,
+            settings=settings,
+        )
+        if args.as_json:
+            print(json.dumps(_json_ready(payload)))
+        else:
+            print(payload["run_id"])
+            print(payload["status"])
+            print(f"approved_candidate_id: {payload['approved_candidate_id']}")
+            print(
+                "approved_source_transcript_candidate_id: "
+                f"{payload['approved_source_transcript_candidate_id']}"
+            )
+            print(f"approval_ref: {payload['approval_ref']}")
+            print(f"default_output_path: {payload['default_output_path']}")
         return 0
 
     parser.error(f"unsupported command: {args.command}")
     return 2
+
+
+def _interactive_review_flow(
+    run_id: str,
+    *,
+    settings,
+    initial_payload: dict[str, Any] | None = None,
+) -> int:
+    payload = initial_payload or review_job(run_id, settings=settings)
+    print(payload["run_id"])
+    print(payload["status"])
+    if payload.get("summary"):
+        print(payload["summary"])
+    candidates = payload.get("candidates", [])
+    if not isinstance(candidates, list) or not candidates:
+        if payload.get("review_available") is False:
+            print("no pending translation review")
+        return 0
+
+    while True:
+        _print_candidate_list(candidates)
+        raw_command = input("review command ([number], a <number>, q): ").strip()
+        if raw_command.lower() in {"q", "quit", "exit"}:
+            return 0
+        if raw_command.isdigit():
+            index = int(raw_command) - 1
+            if 0 <= index < len(candidates):
+                _print_candidate_details(candidates[index], payload)
+            continue
+        if raw_command.lower().startswith("a "):
+            index_text = raw_command[2:].strip()
+            if not index_text.isdigit():
+                print("approval target must be a candidate number")
+                continue
+            index = int(index_text) - 1
+            if not (0 <= index < len(candidates)):
+                print("candidate number out of range")
+                continue
+            candidate = candidates[index]
+            approved_by = input("approved_by (blank uses current user): ").strip() or None
+            note = input("note (optional): ").strip() or None
+            approved = approve_review(
+                run_id,
+                candidate_id=str(candidate["candidate_id"]),
+                approved_by=approved_by,
+                note=note,
+                settings=settings,
+            )
+            print(approved["status"])
+            print(f"approval_ref: {approved['approval_ref']}")
+            print(f"default_output_path: {approved['default_output_path']}")
+            return 0
+        print("unknown command")
+
+
+def _print_candidate_list(candidates: list[dict[str, Any]]) -> None:
+    for candidate in candidates:
+        source = candidate.get("source_transcript", {})
+        provider = source.get("provider_id") if isinstance(source, dict) else None
+        print(
+            f"{candidate['rank']}. {candidate['candidate_id']} "
+            f"[{candidate['prompt_variant_id']}] "
+            f"transcript={candidate['source_transcript_candidate_id']} "
+            f"provider={provider or 'unknown'}"
+        )
+
+
+def _print_candidate_details(candidate: dict[str, Any], payload: dict[str, Any]) -> None:
+    print(candidate["candidate_id"])
+    print(f"prompt_variant_id: {candidate['prompt_variant_id']}")
+    print(f"prompt_version: {candidate['prompt_version']}")
+    print(f"model_id: {candidate['model_id']}")
+    print(f"translation_preview_json_path: {candidate['translation_preview_json_path']}")
+    print(f"translation_preview_srt_path: {candidate['translation_preview_srt_path']}")
+    source = candidate.get("source_transcript", {})
+    if isinstance(source, dict):
+        print(f"source_transcript_candidate_id: {source.get('candidate_id')}")
+        print(f"source_transcript_provider_id: {source.get('provider_id')}")
+        if source.get("transcript_preview_json_path"):
+            print(f"transcript_preview_json_path: {source['transcript_preview_json_path']}")
+        if source.get("transcript_preview_txt_path"):
+            print(f"transcript_preview_txt_path: {source['transcript_preview_txt_path']}")
+    review_summary = payload.get("transcript_review_summary", {})
+    if isinstance(review_summary, dict):
+        print(f"transcript_decision_ref: {review_summary.get('decision_ref')}")
+        print(f"transcript_investigation_ref: {review_summary.get('investigation_ref')}")
+
+
+def _should_enter_interactive_review(*, mode: str) -> bool:
+    if mode == "never":
+        return False
+    if mode == "always":
+        return _has_tty()
+    return _has_tty()
+
+
+def _has_tty() -> bool:
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def _json_ready(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, tuple):
+        return [_json_ready(item) for item in value]
+    if isinstance(value, list):
+        return [_json_ready(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _json_ready(item) for key, item in value.items()}
+    return value

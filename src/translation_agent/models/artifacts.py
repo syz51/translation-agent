@@ -43,6 +43,8 @@ class PublishedArtifacts(ContractModel):
     final_transcript_ref: str | None = None
     final_translation_ref: str | None = None
     recoverable_translation_failure_ref: str | None = None
+    approval_refs: tuple[str, ...] = ()
+    learning_refs: tuple[str, ...] = ()
     reference_transcript_refs: tuple[str, ...] = ()
     evaluation_report_refs: tuple[str, ...] = ()
     regenerated_draft_refs: tuple[str, ...] = ()

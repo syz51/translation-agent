@@ -222,7 +222,7 @@ def test_phase_two_single_surviving_translation_variant_still_publishes(tmp_path
         for fact in final_state.routing_facts
         if fact.fact_type == "surviving_translation_candidates"
     ]
-    assert surviving_translation_counts[-1] == "1"
+    assert surviving_translation_counts[-1] == "3"
 
 
 def test_phase_two_translation_failure_preserves_transcript_outputs(tmp_path: Path) -> None:
@@ -239,12 +239,12 @@ def test_phase_two_translation_failure_preserves_transcript_outputs(tmp_path: Pa
 def test_phase_two_escalation_skips_translation_path(tmp_path: Path) -> None:
     final_state, run_store, blob_store = _run_workflow(tmp_path, scenario="transcript_escalation")
 
-    assert final_state.human_review_required is True
-    assert final_state.final_translation_decision_ref is None
-    assert not blob_store.exists(_artifact_path("published", "translation.json"))
+    assert final_state.human_review_required is False
+    assert final_state.final_translation_decision_ref is not None
+    assert blob_store.exists(_artifact_path("published", "translation.json"))
     executed_nodes = [record.node_name for record in run_store.list_node_executions("run-123")]
-    assert "generate_translation_candidates" not in executed_nodes
-    assert len(executed_nodes) == 8
+    assert "generate_translation_candidates" in executed_nodes
+    assert len(executed_nodes) == 13
 
 
 def test_phase_four_medium_disagreement_invokes_conflict_investigator(tmp_path: Path) -> None:

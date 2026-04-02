@@ -78,6 +78,7 @@ def publish_outputs(state: GraphState, runtime: WorkflowRuntime) -> tuple[Publis
     memory_batch_refs = _refs_for_fact(state, "memory_batch_staged")
     memory_consolidation_refs = _refs_for_fact(state, "memory_batch_consolidated")
     prompt_evolution_refs = _refs_for_fact(state, "translation_prompt_evolution")
+    learning_refs = _refs_for_fact(state, "learning_artifact")
     reference_transcript_refs = _artifact_refs(state.reference_transcript_ref)
     evaluation_report_refs = _artifact_refs(state.evaluation_report_ref)
     regenerated_draft_refs = _artifact_refs(state.regenerated_translation_draft_ref)
@@ -138,6 +139,7 @@ def publish_outputs(state: GraphState, runtime: WorkflowRuntime) -> tuple[Publis
             memory_batch_refs=memory_batch_refs,
             memory_consolidation_refs=memory_consolidation_refs,
             prompt_evolution_refs=prompt_evolution_refs,
+            learning_refs=learning_refs,
             reference_transcript_refs=reference_transcript_refs,
             evaluation_report_refs=evaluation_report_refs,
             regenerated_draft_refs=regenerated_draft_refs,
@@ -151,6 +153,8 @@ def publish_outputs(state: GraphState, runtime: WorkflowRuntime) -> tuple[Publis
         final_transcript_ref=transcript_ref,
         final_translation_ref=translation_ref,
         recoverable_translation_failure_ref=translation_failure_ref,
+        approval_refs=_artifact_refs(state.approval_ref),
+        learning_refs=learning_refs,
         scorecard_refs=(scorecard_ref,),
         trace_refs=trace_refs,
         export_refs=export_refs,
@@ -221,6 +225,7 @@ def _scorecard_payload(
     memory_batch_refs: tuple[str, ...],
     memory_consolidation_refs: tuple[str, ...],
     prompt_evolution_refs: tuple[str, ...],
+    learning_refs: tuple[str, ...],
     reference_transcript_refs: tuple[str, ...],
     evaluation_report_refs: tuple[str, ...],
     regenerated_draft_refs: tuple[str, ...],
@@ -232,6 +237,10 @@ def _scorecard_payload(
         "run_id": state.run_id,
         "job_id": state.job.job_id,
         "human_review_required": state.human_review_required,
+        "review_required_stage": state.review_required_stage,
+        "approval_ref": state.approval_ref,
+        "approved_candidate_id": state.approved_candidate_id,
+        "approved_source_transcript_candidate_id": state.approved_source_transcript_candidate_id,
         "translation_failed": state.translation_failed,
         "transcript_ref": transcript_ref,
         "translation_ref": translation_ref,
@@ -242,6 +251,7 @@ def _scorecard_payload(
         "memory_batch_refs": list(memory_batch_refs),
         "memory_consolidation_refs": list(memory_consolidation_refs),
         "prompt_evolution_refs": list(prompt_evolution_refs),
+        "learning_refs": list(learning_refs),
         "reference_transcript_refs": list(reference_transcript_refs),
         "evaluation_report_refs": list(evaluation_report_refs),
         "regenerated_draft_refs": list(regenerated_draft_refs),
@@ -272,6 +282,10 @@ def _export_payload(
         "job_id": state.job.job_id,
         "source_language": state.job.source_language,
         "target_language": state.job.target_language,
+        "review_required_stage": state.review_required_stage,
+        "approval_ref": state.approval_ref,
+        "approved_candidate_id": state.approved_candidate_id,
+        "approved_source_transcript_candidate_id": state.approved_source_transcript_candidate_id,
         "transcript_ref": transcript_ref,
         "translation_ref": translation_ref,
         "translation_failure_ref": translation_failure_ref,
@@ -312,7 +326,8 @@ def _translation_failure_reasons(state: GraphState) -> list[str]:
     for fact in state.routing_facts:
         if fact.fact_type != "translation_variant_failed" or fact.source_ref is None:
             continue
-        reason = f"{fact.value}: {fact.source_ref}"
+        variant_id = fact.value.split(":", 1)[0]
+        reason = f"{variant_id}: {fact.source_ref}"
         if reason in seen_reasons:
             continue
         seen_reasons.add(reason)
@@ -321,6 +336,8 @@ def _translation_failure_reasons(state: GraphState) -> list[str]:
 
 
 def _delivery_status(state: GraphState) -> str:
+    if state.approval_ref is not None:
+        return "completed_after_human_review"
     if state.human_review_required:
         return "human_review_required"
     if state.translation_failed:

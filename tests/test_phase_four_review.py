@@ -321,6 +321,24 @@ Why:
         )
 
 
+def test_adjudication_uses_provider_quality_prior_as_bounded_tie_breaker() -> None:
+    candidates = (
+        _transcript_candidate("candidate-a", "Hello world from provider A."),
+        _transcript_candidate("candidate-b", "Hello world from provider B."),
+    )
+
+    outcome = adjudicate_reviews(
+        candidates=candidates,
+        reviews=(),
+        context=_adjudication_context(stage="transcript").model_copy(
+            update={"ranking_priors": {"candidate-b": 0.2}}
+        ),
+    )
+
+    assert outcome.decision_mode == "automatic_finalize"
+    assert outcome.winner_candidate_id == "candidate-b"
+
+
 def test_adjudicate_reviews_routes_medium_conflict_to_investigation() -> None:
     candidates = (
         _translation_candidate(
@@ -568,12 +586,13 @@ def test_phase_four_workflow_routes_transcript_escalation_to_human_review(
         blob_store.read_bytes(_artifact_path("decisions", "transcript.json"))
     )
 
-    assert final_state.human_review_required is True
-    assert final_state.final_translation_decision_ref is None
+    assert final_state.human_review_required is False
+    assert final_state.final_translation_decision_ref is not None
     assert decision.decision_mode == "human_review"
+    assert decision.human_review_required is False
     assert decision.investigation_ref == _artifact_path("investigations", "transcript.json")
     assert blob_store.exists(_artifact_path("investigations", "transcript.json"))
     executed_nodes = [
         record.node_name for record in run_store.list_node_executions("run-phase-four")
     ]
-    assert "generate_translation_candidates" not in executed_nodes
+    assert "generate_translation_candidates" in executed_nodes
