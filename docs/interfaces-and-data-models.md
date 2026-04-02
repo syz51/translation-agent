@@ -436,9 +436,27 @@ The review payload includes:
 - `review_required_stage`
 - `summary`
 - ranked translation candidates
+- additive `review_diffs` cards ordered for terminal review
 - source transcript provenance per candidate
 - transcript disagreement and investigation summary
 - preview paths for rendered translation and transcript artifacts
+
+Each `review_diffs[*]` card includes:
+
+- `diff_id`
+- `source_span_id`
+- `time_range`
+- `dimension`
+- `severity`
+- `blocking_hard_contradiction`
+- `evidence_text`
+- `normalized_value`
+- `reviewer_roles`
+- `source_excerpt`
+- `left_candidate`
+- `right_candidate`
+
+Interactive `review-job` renders one diff card at a time in the terminal, shows the shared source excerpt above the candidate pair, keeps approval at the whole-candidate level, and delegates the final selection to `approve-review`.
 
 ### `approve-review --json`
 

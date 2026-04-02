@@ -27,7 +27,16 @@ from translation_agent.config import (
 )
 from translation_agent.graph import GraphState
 from translation_agent.graph.state import RoutingFact
-from translation_agent.models import JobContext, Segment, TranscriptCandidate, TranslationCandidate
+from translation_agent.models import (
+    CandidatePreference,
+    JobContext,
+    ReviewBundle,
+    Segment,
+    StructuredEvidence,
+    TranscriptCandidate,
+    TranslationCandidate,
+)
+from translation_agent.review_flow import _build_contradiction_summary
 from translation_agent.storage import (
     LocalBlobStore,
     PostgresRunStore,
@@ -1170,7 +1179,7 @@ def test_cli_run_job_review_auto_non_tty_prints_resume_instructions(
 
 
 @pytest.mark.unit
-def test_review_job_json_exposes_candidates_and_provenance(
+def test_review_job_json_exposes_candidates_and_review_diffs(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -1208,6 +1217,14 @@ def test_review_job_json_exposes_candidates_and_provenance(
     assert contradiction["evidence_text"]
     assert contradiction["time_range"]
     assert payload["human_review_summary"]["contradiction_count"] >= 1
+    assert payload["review_diffs"]
+    review_diff = payload["review_diffs"][0]
+    assert review_diff["diff_id"]
+    assert review_diff["source_excerpt"]
+    assert review_diff["left_candidate"]["candidate_id"]
+    assert review_diff["right_candidate"]["candidate_id"]
+    assert review_diff["left_candidate"]["target_excerpt"]
+    assert review_diff["right_candidate"]["target_excerpt"]
     assert Path(candidate["translation_preview_json_path"]).exists()
     assert Path(candidate["translation_preview_srt_path"]).exists()
     assert payload["transcript_review_summary"]["decision_ref"].endswith(
@@ -1216,7 +1233,7 @@ def test_review_job_json_exposes_candidates_and_provenance(
 
 
 @pytest.mark.unit
-def test_review_job_interactive_shows_contradictions(
+def test_review_job_interactive_shows_one_diff_card_at_a_time(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -1232,13 +1249,18 @@ def test_review_job_interactive_shows_contradictions(
         )
     )
     payload = review_job(result.run_id)
-    candidates = cast(list[dict[str, object]], payload["candidates"])
-    candidate_index = next(
-        index
-        for index, candidate in enumerate(candidates, start=1)
-        if cast(int, candidate["contradiction_count"]) >= 1
-    )
-    commands = iter([str(candidate_index), "q"])
+    review_diff = cast(dict[str, object], cast(list[object], payload["review_diffs"])[0])
+    payload["review_diffs"] = [
+        review_diff,
+        {
+            **review_diff,
+            "diff_id": "synthetic-diff-2",
+            "source_span_id": "span:999:1999",
+            "time_range": "00:00.999-00:01.999",
+        },
+    ]
+    monkeypatch.setattr("translation_agent.cli.review_job", lambda run_id, settings=None: payload)
+    commands = iter(["q"])
     monkeypatch.setattr("builtins.input", lambda _: next(commands))
 
     exit_code = main(["review-job", result.run_id])
@@ -1246,10 +1268,214 @@ def test_review_job_interactive_shows_contradictions(
     output = capsys.readouterr().out
     assert exit_code == 0
     assert "review_summary: contradictions=" in output
-    assert "candidate_reviewer_preferences:" in output
-    assert "contradictions:" in output
-    assert "note:" in output
-    assert "reviewers=" in output
+    assert "candidate_scoreboard:" in output
+    assert "diff 1/2" in output
+    assert "diff 2/2" not in output
+    assert "source:" in output
+    assert "source_excerpt:" in output
+    assert "LEFT candidate" in output
+    assert "RIGHT candidate" in output
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("command", "side_key"),
+    [("a l", "left_candidate"), ("a r", "right_candidate")],
+)
+def test_review_job_interactive_approves_diff_side(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    command: str,
+    side_key: str,
+) -> None:
+    monkeypatch.setenv("TA_DATA_DIR", str(tmp_path / "runtime"))
+    monkeypatch.delenv("TA_STATE_DB_DSN", raising=False)
+
+    result = run_job(
+        RunJobRequest(
+            source="input.mp4",
+            job_id=f"job-review-interactive-{side_key}",
+            metadata={"scenario": "translation_conflict_timeout"},
+        )
+    )
+    payload = review_job(result.run_id)
+    review_diff = cast(dict[str, object], cast(list[object], payload["review_diffs"])[0])
+    expected_candidate_id = cast(
+        str,
+        cast(dict[str, object], review_diff[side_key])["candidate_id"],
+    )
+    captured: dict[str, str | None] = {}
+
+    def _approve_review(
+        run_id: str,
+        *,
+        candidate_id: str,
+        approved_by: str | None,
+        note: str | None,
+        settings,
+    ) -> dict[str, object]:
+        captured["run_id"] = run_id
+        captured["candidate_id"] = candidate_id
+        captured["approved_by"] = approved_by
+        captured["note"] = note
+        return {
+            "status": "completed_after_human_review",
+            "approval_ref": "approvals/translation.json",
+            "default_output_path": "/tmp/output.srt",
+        }
+
+    monkeypatch.setattr("translation_agent.cli.review_job", lambda run_id, settings=None: payload)
+    monkeypatch.setattr("translation_agent.cli.approve_review", _approve_review)
+    commands = iter([command, "", ""])
+    monkeypatch.setattr("builtins.input", lambda _: next(commands))
+
+    exit_code = main(["review-job", result.run_id])
+
+    output = capsys.readouterr().out
+    assert exit_code == 0
+    assert captured["run_id"] == result.run_id
+    assert captured["candidate_id"] == expected_candidate_id
+    assert captured["approved_by"] is None
+    assert captured["note"] is None
+    assert "completed_after_human_review" in output
+    assert "approval_ref: approvals/translation.json" in output
+
+
+@pytest.mark.unit
+def test_review_diff_builder_prefers_preferred_candidate_for_multi_candidate_group() -> None:
+    candidates = [
+        TranslationCandidate(
+            candidate_id="candidate-a",
+            job_id="job-review-diffs",
+            source_transcript_candidate_id="transcript-a",
+            model_id="gpt-5.4",
+            prompt_variant_id="prompt-a",
+            prompt_version="translation-v1",
+            language="zh",
+            segments=(
+                Segment(
+                    segment_id="seg-1",
+                    start_ms=0,
+                    end_ms=1_000,
+                    source_text="Source line.",
+                    target_text="Alpha rendering.",
+                ),
+            ),
+            full_text="Alpha rendering.",
+            normalization_version="translation-candidate/v1",
+        ),
+        TranslationCandidate(
+            candidate_id="candidate-b",
+            job_id="job-review-diffs",
+            source_transcript_candidate_id="transcript-b",
+            model_id="gpt-5.4",
+            prompt_variant_id="prompt-b",
+            prompt_version="translation-v1",
+            language="zh",
+            segments=(
+                Segment(
+                    segment_id="seg-1",
+                    start_ms=0,
+                    end_ms=1_000,
+                    source_text="Source line.",
+                    target_text="Beta rendering.",
+                ),
+            ),
+            full_text="Beta rendering.",
+            normalization_version="translation-candidate/v1",
+        ),
+        TranslationCandidate(
+            candidate_id="candidate-c",
+            job_id="job-review-diffs",
+            source_transcript_candidate_id="transcript-c",
+            model_id="gpt-5.4",
+            prompt_variant_id="prompt-c",
+            prompt_version="translation-v1",
+            language="zh",
+            segments=(
+                Segment(
+                    segment_id="seg-1",
+                    start_ms=0,
+                    end_ms=1_000,
+                    source_text="Source line.",
+                    target_text="Gamma rendering.",
+                ),
+            ),
+            full_text="Gamma rendering.",
+            normalization_version="translation-candidate/v1",
+        ),
+    ]
+    reviews = (
+        ReviewBundle(
+            review_id="review-1",
+            job_id="job-review-diffs",
+            stage="translation",
+            reviewer_role="faithfulness_reviewer",
+            candidate_preferences=(
+                CandidatePreference(candidate_id="candidate-b", rank=1),
+                CandidatePreference(candidate_id="candidate-a", rank=2),
+                CandidatePreference(candidate_id="candidate-c", rank=3),
+            ),
+            confidence=0.82,
+            structured_evidence=(
+                StructuredEvidence(
+                    source_span_id="span:0:1000",
+                    candidate_id="candidate-a",
+                    dimension="meaning",
+                    polarity="refutes",
+                    normalized_value="conflict",
+                    severity="major",
+                    evidence_text="Competing meaning detected.",
+                ),
+                StructuredEvidence(
+                    source_span_id="span:0:1000",
+                    candidate_id="candidate-b",
+                    dimension="meaning",
+                    polarity="refutes",
+                    normalized_value="conflict",
+                    severity="major",
+                    evidence_text="Competing meaning detected.",
+                ),
+                StructuredEvidence(
+                    source_span_id="span:0:1000",
+                    candidate_id="candidate-c",
+                    dimension="meaning",
+                    polarity="refutes",
+                    normalized_value="conflict",
+                    severity="critical",
+                    evidence_text="Competing meaning detected.",
+                ),
+            ),
+        ),
+    )
+
+    summary = _build_contradiction_summary(
+        translation_candidates=candidates,
+        reviews=reviews,
+        preferred_candidate_id="candidate-b",
+        candidate_rank_map={
+            "candidate-a": 1,
+            "candidate-b": 2,
+            "candidate-c": 3,
+        },
+    )
+
+    review_diffs = summary["review_diffs"]
+    assert [diff["left_candidate"]["candidate_id"] for diff in review_diffs] == [
+        "candidate-b",
+        "candidate-b",
+    ]
+    assert [diff["right_candidate"]["candidate_id"] for diff in review_diffs] == [
+        "candidate-a",
+        "candidate-c",
+    ]
+    assert [diff["right_candidate"]["rank"] for diff in review_diffs] == [1, 3]
+    assert all(diff["source_excerpt"] == "Source line." for diff in review_diffs)
+    assert [diff["right_candidate"]["target_excerpt"] for diff in review_diffs] == [
+        "Alpha rendering.",
+        "Gamma rendering.",
+    ]
 
 
 @pytest.mark.unit

@@ -159,6 +159,11 @@ uv run translation-agent review-job <run-id> --json
 uv run translation-agent approve-review <run-id> --candidate-id <candidate-id> --json
 ```
 
+`review-job` now has two operator surfaces:
+
+- `--json` returns the existing candidate payload plus additive `review_diffs` cards for pairwise review
+- interactive mode opens a one-diff-at-a-time terminal viewer with left/right candidate approval shortcuts
+
 The public result payload contains:
 
 - `run_id`

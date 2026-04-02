@@ -50,6 +50,7 @@ from translation_agent.storage import LocalBlobStore, OperationalStore, job_path
 from translation_agent.subtitles import render_translation_srt
 
 _HARD_CONTRADICTION_DIMENSIONS = {"meaning", "entity", "number_date_unit", "coverage"}
+_NO_OVERLAPPING_EXCERPT = "[no overlapping excerpt]"
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,6 +202,11 @@ def build_review_payload(
     contradiction_summary = _build_contradiction_summary(
         translation_candidates=translation_candidates,
         reviews=translation_reviews,
+        preferred_candidate_id=preferred_candidate_id,
+        candidate_rank_map={
+            candidate.candidate_id: rank
+            for rank, candidate in enumerate(ranked_candidates, start=1)
+        },
     )
     candidate_summaries = contradiction_summary["candidate_summaries"]
     for payload in candidate_payloads:
@@ -248,6 +254,7 @@ def build_review_payload(
             "machine_review_refs": machine_review_refs,
         },
         "human_review_summary": contradiction_summary["summary"],
+        "review_diffs": contradiction_summary["review_diffs"],
         "approval": approval,
         "resume_commands": [
             f"uv run translation-agent review-job {run_id}",
@@ -590,8 +597,14 @@ def _build_contradiction_summary(
     *,
     translation_candidates: list[TranslationCandidate],
     reviews: tuple[ReviewBundle, ...],
+    preferred_candidate_id: str | None = None,
+    candidate_rank_map: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     candidate_map = {candidate.candidate_id: candidate for candidate in translation_candidates}
+    effective_rank_map = candidate_rank_map or {
+        candidate.candidate_id: index
+        for index, candidate in enumerate(translation_candidates, start=1)
+    }
     candidate_summaries: dict[str, dict[str, Any]] = {
         candidate.candidate_id: {
             "candidate_id": candidate.candidate_id,
@@ -606,6 +619,7 @@ def _build_contradiction_summary(
         tuple[str, str | None, str, str, str | None],
         dict[str, Any],
     ] = {}
+    review_diff_groups: dict[tuple[str | None, str, str], dict[str, Any]] = {}
     reviewer_preferences: list[dict[str, Any]] = []
 
     for review in reviews:
@@ -646,6 +660,13 @@ def _build_contradiction_summary(
                 review=review,
                 evidence=evidence,
             )
+            _record_review_diff_group(
+                review_diff_groups=review_diff_groups,
+                candidate=candidate,
+                candidate_rank=effective_rank_map.get(candidate.candidate_id, 10**9),
+                review=review,
+                evidence=evidence,
+            )
 
     for candidate_summary in candidate_summaries.values():
         contradictions = cast(list[dict[str, Any]], candidate_summary["contradictions"])
@@ -661,6 +682,12 @@ def _build_contradiction_summary(
             1 for item in contradictions if cast(bool, item["blocking_hard_contradiction"])
         )
 
+    review_diffs = _build_review_diffs(
+        review_diff_groups=review_diff_groups,
+        preferred_candidate_id=preferred_candidate_id,
+        translation_candidates=translation_candidates,
+        candidate_rank_map=effective_rank_map,
+    )
     contradiction_count = sum(
         cast(int, candidate_summary["contradiction_count"])
         for candidate_summary in candidate_summaries.values()
@@ -676,6 +703,7 @@ def _build_contradiction_summary(
             "reviewer_preferences": reviewer_preferences,
         },
         "candidate_summaries": candidate_summaries,
+        "review_diffs": review_diffs,
     }
 
 
@@ -722,6 +750,229 @@ def _record_contradiction(
     existing["severity"] = _max_severity(cast(str, existing["severity"]), evidence.severity)
 
 
+def _record_review_diff_group(
+    *,
+    review_diff_groups: dict[tuple[str | None, str, str], dict[str, Any]],
+    candidate: TranslationCandidate,
+    candidate_rank: int,
+    review: ReviewBundle,
+    evidence: StructuredEvidence,
+) -> None:
+    group_value = evidence.normalized_value or evidence.evidence_text
+    key = (evidence.source_span_id, evidence.dimension, group_value)
+    source_excerpt, target_excerpt = _segment_excerpts_for_span(
+        candidate.segments,
+        evidence.source_span_id,
+    )
+    existing = review_diff_groups.get(key)
+    if existing is None:
+        existing = {
+            "source_span_id": evidence.source_span_id,
+            "time_range": _format_span_range(evidence.source_span_id),
+            "dimension": evidence.dimension,
+            "severity": evidence.severity,
+            "blocking_hard_contradiction": evidence.dimension in _HARD_CONTRADICTION_DIMENSIONS,
+            "evidence_text": evidence.evidence_text,
+            "_evidence_sort_key": (candidate_rank, review.reviewer_role, evidence.evidence_text),
+            "normalized_value": evidence.normalized_value,
+            "reviewer_roles": [review.reviewer_role],
+            "candidates": {},
+        }
+        review_diff_groups[key] = existing
+    else:
+        existing["severity"] = _max_severity(cast(str, existing["severity"]), evidence.severity)
+        sort_key = (candidate_rank, review.reviewer_role, evidence.evidence_text)
+        if cast(tuple[int, str, str], existing["_evidence_sort_key"]) > sort_key:
+            existing["evidence_text"] = evidence.evidence_text
+            existing["_evidence_sort_key"] = sort_key
+        if existing.get("normalized_value") is None and evidence.normalized_value is not None:
+            existing["normalized_value"] = evidence.normalized_value
+
+    reviewer_roles = cast(list[str], existing["reviewer_roles"])
+    if review.reviewer_role not in reviewer_roles:
+        reviewer_roles.append(review.reviewer_role)
+
+    candidate_entries = cast(dict[str, dict[str, Any]], existing["candidates"])
+    candidate_entry = candidate_entries.get(candidate.candidate_id)
+    if candidate_entry is None:
+        candidate_entries[candidate.candidate_id] = {
+            "candidate_id": candidate.candidate_id,
+            "rank": candidate_rank,
+            "prompt_variant_id": candidate.prompt_variant_id,
+            "model_id": candidate.model_id,
+            "source_transcript_candidate_id": candidate.source_transcript_candidate_id,
+            "source_excerpt": source_excerpt,
+            "target_excerpt": target_excerpt,
+        }
+        return
+
+    if candidate_entry.get("source_excerpt") is None and source_excerpt is not None:
+        candidate_entry["source_excerpt"] = source_excerpt
+    if candidate_entry.get("target_excerpt") is None and target_excerpt is not None:
+        candidate_entry["target_excerpt"] = target_excerpt
+
+
+def _build_review_diffs(
+    *,
+    review_diff_groups: dict[tuple[str | None, str, str], dict[str, Any]],
+    preferred_candidate_id: str | None,
+    translation_candidates: list[TranslationCandidate],
+    candidate_rank_map: dict[str, int],
+) -> list[dict[str, Any]]:
+    review_diffs: list[dict[str, Any]] = []
+    for group in review_diff_groups.values():
+        group_candidates = sorted(
+            (
+                _review_diff_candidate_payload(
+                    candidate,
+                    source_span_id=cast(str | None, group["source_span_id"]),
+                    candidate_rank=candidate_rank_map.get(candidate.candidate_id, 10**9),
+                )
+                for candidate in translation_candidates
+            ),
+            key=lambda item: (cast(int, item["rank"]), cast(str, item["candidate_id"])),
+        )
+        if len(group_candidates) < 2:
+            continue
+        anchor = next(
+            (
+                item
+                for item in group_candidates
+                if cast(str, item["candidate_id"]) == preferred_candidate_id
+            ),
+            group_candidates[0],
+        )
+        alternates = [
+            item
+            for item in group_candidates
+            if cast(str, item["candidate_id"]) != cast(str, anchor["candidate_id"])
+        ]
+        anchor_excerpt = _comparison_excerpt(cast(str | None, anchor.get("target_excerpt")))
+        emitted = False
+        for other in alternates:
+            other_excerpt = _comparison_excerpt(cast(str | None, other.get("target_excerpt")))
+            if other_excerpt is None or other_excerpt == anchor_excerpt:
+                continue
+            review_diffs.append(
+                _review_diff_card(
+                    group=group,
+                    left_candidate=anchor,
+                    right_candidate=other,
+                )
+            )
+            emitted = True
+        if emitted or not alternates:
+            continue
+        review_diffs.append(
+            _review_diff_card(
+                group=group,
+                left_candidate=anchor,
+                right_candidate=alternates[0],
+                force_right_placeholder=True,
+            )
+        )
+
+    review_diffs.sort(
+        key=lambda item: (
+            0 if cast(bool, item["blocking_hard_contradiction"]) else 1,
+            _span_sort_key(cast(str | None, item["source_span_id"])),
+            _severity_sort_key(cast(str, item["severity"])),
+            cast(int, cast(dict[str, Any], item["right_candidate"])["rank"]),
+            cast(str, item["diff_id"]),
+        )
+    )
+    return review_diffs
+
+
+def _review_diff_candidate_payload(
+    candidate: TranslationCandidate,
+    *,
+    source_span_id: str | None,
+    candidate_rank: int,
+) -> dict[str, Any]:
+    source_excerpt, target_excerpt = _segment_excerpts_for_span(candidate.segments, source_span_id)
+    return {
+        "candidate_id": candidate.candidate_id,
+        "rank": candidate_rank,
+        "prompt_variant_id": candidate.prompt_variant_id,
+        "model_id": candidate.model_id,
+        "source_transcript_candidate_id": candidate.source_transcript_candidate_id,
+        "source_excerpt": source_excerpt,
+        "target_excerpt": target_excerpt,
+    }
+
+
+def _review_diff_card(
+    *,
+    group: dict[str, Any],
+    left_candidate: dict[str, Any],
+    right_candidate: dict[str, Any],
+    force_right_placeholder: bool = False,
+) -> dict[str, Any]:
+    right_excerpt = (
+        _NO_OVERLAPPING_EXCERPT
+        if force_right_placeholder
+        else _display_excerpt(cast(str | None, right_candidate.get("target_excerpt")))
+    )
+    source_excerpt = (
+        cast(str | None, left_candidate.get("source_excerpt"))
+        or cast(str | None, right_candidate.get("source_excerpt"))
+        or _NO_OVERLAPPING_EXCERPT
+    )
+    return {
+        "diff_id": _review_diff_id(
+            source_span_id=cast(str | None, group["source_span_id"]),
+            dimension=cast(str, group["dimension"]),
+            left_candidate_id=cast(str, left_candidate["candidate_id"]),
+            right_candidate_id=cast(str, right_candidate["candidate_id"]),
+        ),
+        "source_span_id": group["source_span_id"],
+        "time_range": group["time_range"],
+        "dimension": group["dimension"],
+        "severity": group["severity"],
+        "blocking_hard_contradiction": group["blocking_hard_contradiction"],
+        "evidence_text": group["evidence_text"],
+        "normalized_value": group["normalized_value"],
+        "reviewer_roles": sorted(cast(list[str], group["reviewer_roles"])),
+        "source_excerpt": source_excerpt,
+        "left_candidate": {
+            "candidate_id": left_candidate["candidate_id"],
+            "rank": left_candidate["rank"],
+            "prompt_variant_id": left_candidate["prompt_variant_id"],
+            "model_id": left_candidate["model_id"],
+            "source_transcript_candidate_id": left_candidate["source_transcript_candidate_id"],
+            "target_excerpt": _display_excerpt(
+                cast(str | None, left_candidate.get("target_excerpt"))
+            ),
+        },
+        "right_candidate": {
+            "candidate_id": right_candidate["candidate_id"],
+            "rank": right_candidate["rank"],
+            "prompt_variant_id": right_candidate["prompt_variant_id"],
+            "model_id": right_candidate["model_id"],
+            "source_transcript_candidate_id": right_candidate["source_transcript_candidate_id"],
+            "target_excerpt": right_excerpt,
+        },
+    }
+
+
+def _review_diff_id(
+    *,
+    source_span_id: str | None,
+    dimension: str,
+    left_candidate_id: str,
+    right_candidate_id: str,
+) -> str:
+    return "::".join(
+        (
+            source_span_id or "no-span",
+            dimension,
+            left_candidate_id,
+            right_candidate_id,
+        )
+    )
+
+
 def _segment_excerpts_for_span(
     segments: tuple[Segment, ...],
     source_span_id: str | None,
@@ -753,6 +1004,17 @@ def _truncate_excerpt(text: str | None, limit: int = 220) -> str | None:
     if text is None or len(text) <= limit:
         return text
     return text[: limit - 3].rstrip() + "..."
+
+
+def _comparison_excerpt(text: str | None) -> str | None:
+    if text is None:
+        return None
+    normalized = " ".join(text.split()).strip()
+    return normalized or None
+
+
+def _display_excerpt(text: str | None) -> str:
+    return text or _NO_OVERLAPPING_EXCERPT
 
 
 def _parse_span_id(source_span_id: str | None) -> tuple[int | None, int | None]:
