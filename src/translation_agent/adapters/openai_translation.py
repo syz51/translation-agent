@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 from translation_agent.adapters.common import (
@@ -23,6 +24,33 @@ from translation_agent.models import (
 )
 from translation_agent.storage import BlobStore, job_path, job_scope_token
 
+DEFAULT_MAX_CHUNK_CHARACTERS = 5_000
+DEFAULT_MAX_CHUNK_SEGMENTS = 100
+DEFAULT_CONTEXT_SEGMENT_WINDOW = 2
+
+
+@dataclass(frozen=True, slots=True)
+class _TranslationChunk:
+    chunk_key: str
+    chunk_index: int
+    segments: tuple[Segment, ...]
+    context_before: tuple[str, ...] = ()
+    context_after: tuple[str, ...] = ()
+
+    @property
+    def full_text(self) -> str:
+        return " ".join(
+            text.strip()
+            for segment in self.segments
+            if isinstance((text := segment.source_text), str) and text.strip()
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _ChunkTranslationResult:
+    full_text: str
+    segments: tuple[Segment, ...]
+
 
 class OpenAITranslationAdapter:
     """Direct OpenAI Responses API adapter for translation candidate generation."""
@@ -41,6 +69,9 @@ class OpenAITranslationAdapter:
         retry_policy: RetryPolicy | None = None,
         transport: HttpTransport | None = None,
         sleep: Callable[[float], None] | None = None,
+        max_chunk_characters: int = DEFAULT_MAX_CHUNK_CHARACTERS,
+        max_chunk_segments: int = DEFAULT_MAX_CHUNK_SEGMENTS,
+        context_segment_window: int = DEFAULT_CONTEXT_SEGMENT_WINDOW,
     ) -> None:
         self.model_id = model_id
         self._api_key = api_key
@@ -51,6 +82,9 @@ class OpenAITranslationAdapter:
         self._retry_policy = retry_policy or RetryPolicy()
         self._transport = transport or StdlibHttpTransport()
         self._sleep = sleep or (lambda seconds: __import__("time").sleep(seconds))
+        self._max_chunk_characters = max(1, max_chunk_characters)
+        self._max_chunk_segments = max(1, max_chunk_segments)
+        self._context_segment_window = max(0, context_segment_window)
 
     def generate_translation(
         self,
@@ -59,12 +93,28 @@ class OpenAITranslationAdapter:
         request_context: RequestContext,
     ) -> TranslationCandidate:
         resolved_prompt = _resolved_prompt_payload(request_context)
-        raw_payload = perform_with_retries(
-            lambda: self._generate_once(final_transcript, prompt_variant_id, request_context),
-            provider_id="openai",
-            retry_policy=self._retry_policy,
-            sleep=self._sleep,
+        chunks = _chunk_transcript(
+            final_transcript,
+            max_chunk_characters=self._max_chunk_characters,
+            max_chunk_segments=self._max_chunk_segments,
+            context_segment_window=self._context_segment_window,
         )
+        raw_chunk_payloads: list[dict[str, Any]] = []
+        translated_segments: list[Segment] = []
+        chunk_full_texts: list[str] = []
+        response_ids: list[str] = []
+        for chunk in chunks:
+            chunk_attempts, chunk_segments, chunk_texts, chunk_response_ids = (
+                self._translate_chunk_with_fallback(
+                    chunk,
+                    prompt_variant_id=prompt_variant_id,
+                    request_context=request_context,
+                )
+            )
+            raw_chunk_payloads.extend(chunk_attempts)
+            translated_segments.extend(chunk_segments)
+            chunk_full_texts.extend(chunk_texts)
+            response_ids.extend(chunk_response_ids)
         raw_response_ref = job_path(
             request_context.job,
             "raw",
@@ -73,12 +123,41 @@ class OpenAITranslationAdapter:
         )
         self._blob_store.put_bytes(
             raw_response_ref,
-            (json.dumps(raw_payload, indent=2, sort_keys=True) + "\n").encode("utf-8"),
+            (
+                json.dumps(
+                    {
+                        "model": self.model_id,
+                        "prompt_variant_id": prompt_variant_id,
+                        "prompt_version": str(
+                            resolved_prompt.get("effective_prompt_version", self._prompt_version)
+                        ),
+                        "chunking": {
+                            "chunk_count": len(chunk_full_texts),
+                            "planned_chunk_count": len(chunks),
+                            "executed_request_count": len(
+                                [
+                                    payload
+                                    for payload in raw_chunk_payloads
+                                    if payload.get("status") == "translated"
+                                ]
+                            ),
+                            "max_chunk_characters": self._max_chunk_characters,
+                            "max_chunk_segments": self._max_chunk_segments,
+                            "context_segment_window": self._context_segment_window,
+                        },
+                        "chunks": raw_chunk_payloads,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n"
+            ).encode("utf-8"),
         )
-        translation_payload = _extract_translation_payload(raw_payload)
-        return _candidate_from_translation_payload(
-            translation_payload,
-            response_payload=raw_payload,
+        return _candidate_from_chunk_results(
+            translated_segments=tuple(translated_segments),
+            full_text=" ".join(text for text in chunk_full_texts if text).strip(),
+            chunk_count=len(chunk_full_texts),
+            response_ids=tuple(response_ids),
             final_transcript=final_transcript,
             request_context=request_context,
             language=request_context.job.target_language,
@@ -92,7 +171,7 @@ class OpenAITranslationAdapter:
 
     def _generate_once(
         self,
-        final_transcript: TranscriptCandidate,
+        chunk: _TranslationChunk,
         prompt_variant_id: str,
         request_context: RequestContext,
     ) -> dict[str, Any]:
@@ -105,6 +184,7 @@ class OpenAITranslationAdapter:
                         {
                             "type": "input_text",
                             "text": _system_prompt(
+                                source_language=request_context.job.source_language,
                                 target_language=request_context.job.target_language,
                                 prompt_variant_id=prompt_variant_id,
                                 resolved_prompt=request_context.metadata.get(
@@ -119,11 +199,19 @@ class OpenAITranslationAdapter:
                     "content": [
                         {
                             "type": "input_text",
-                            "text": _user_prompt(final_transcript),
+                            "text": _user_prompt(chunk),
                         }
                     ],
                 },
             ],
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "translation_chunk",
+                    "strict": True,
+                    "schema": _translation_schema(),
+                }
+            },
         }
         response = self._transport.request(
             HttpRequest(
@@ -149,6 +237,71 @@ class OpenAITranslationAdapter:
                 retryable=False,
             )
         return payload
+
+    def _translate_chunk_with_fallback(
+        self,
+        chunk: _TranslationChunk,
+        *,
+        prompt_variant_id: str,
+        request_context: RequestContext,
+    ) -> tuple[list[dict[str, Any]], tuple[Segment, ...], list[str], list[str]]:
+        try:
+            raw_payload = perform_with_retries(
+                lambda: self._generate_once(chunk, prompt_variant_id, request_context),
+                provider_id="openai",
+                retry_policy=self._retry_policy,
+                sleep=self._sleep,
+            )
+        except AdapterError as exc:
+            if _should_split_chunk(chunk, exc):
+                left_chunk, right_chunk = _split_chunk(
+                    chunk,
+                    context_segment_window=self._context_segment_window,
+                )
+                left_attempts, left_segments, left_texts, left_response_ids = (
+                    self._translate_chunk_with_fallback(
+                        left_chunk,
+                        prompt_variant_id=prompt_variant_id,
+                        request_context=request_context,
+                    )
+                )
+                right_attempts, right_segments, right_texts, right_response_ids = (
+                    self._translate_chunk_with_fallback(
+                        right_chunk,
+                        prompt_variant_id=prompt_variant_id,
+                        request_context=request_context,
+                    )
+                )
+                fallback_record = _chunk_attempt_record(
+                    chunk,
+                    status="split_after_retryable_failure",
+                    error=exc,
+                    fallback_children=(left_chunk.chunk_key, right_chunk.chunk_key),
+                )
+                return (
+                    [fallback_record, *left_attempts, *right_attempts],
+                    (*left_segments, *right_segments),
+                    [*left_texts, *right_texts],
+                    [*left_response_ids, *right_response_ids],
+                )
+            raise
+
+        translation_payload = _extract_translation_payload(raw_payload)
+        chunk_result = _chunk_translation_from_payload(translation_payload, chunk=chunk)
+        response_id = _provider_request_id(raw_payload)
+        response_ids = [response_id] if response_id is not None else []
+        return (
+            [
+                _chunk_attempt_record(
+                    chunk,
+                    status="translated",
+                    response=raw_payload,
+                )
+            ],
+            chunk_result.segments,
+            [chunk_result.full_text],
+            response_ids,
+        )
 
 
 def _classify_openai_http_error(response) -> AdapterError | None:
@@ -184,6 +337,7 @@ def _openai_error_payload(body: bytes) -> dict[str, Any]:
 
 def _system_prompt(
     *,
+    source_language: str,
     target_language: str,
     prompt_variant_id: str,
     resolved_prompt: object | None = None,
@@ -194,9 +348,13 @@ def _system_prompt(
         directive = "Prefer literal fidelity and stable terminology."
     instructions = _resolved_prompt_instructions(resolved_prompt)
     prompt = (
-        "Translate the transcript into "
-        f"{target_language}. Return JSON only with keys full_text and segments. "
-        "Each segment must contain segment_id and target_text. "
+        "Translate the provided transcript chunk from "
+        f"{source_language} into {target_language}. Return JSON only with keys "
+        "full_text and segments. Each segment must contain segment_id and "
+        "target_text. Translate only the segments in chunk.segments. Use "
+        "context_before and context_after only for disambiguation; do not translate "
+        "or mention them. The response must include every chunk segment_id exactly "
+        "once and no extra segment_ids. "
         f"{directive}"
     )
     if instructions:
@@ -220,21 +378,257 @@ def _resolved_prompt_payload(request_context: RequestContext) -> dict[str, Any]:
     return {}
 
 
-def _user_prompt(final_transcript: TranscriptCandidate) -> str:
+def _user_prompt(chunk: _TranslationChunk) -> str:
     payload = {
-        "full_text": final_transcript.full_text,
-        "segments": [
-            {
-                "segment_id": segment.segment_id,
-                "start_ms": segment.start_ms,
-                "end_ms": segment.end_ms,
-                "speaker": segment.speaker,
-                "source_text": segment.source_text,
-            }
-            for segment in final_transcript.segments
-        ],
+        "chunk": {
+            "chunk_index": chunk.chunk_index,
+            "full_text": chunk.full_text,
+            "segments": [
+                {
+                    "segment_id": segment.segment_id,
+                    "start_ms": segment.start_ms,
+                    "end_ms": segment.end_ms,
+                    "speaker": segment.speaker,
+                    "source_text": segment.source_text,
+                }
+                for segment in chunk.segments
+            ],
+        },
+        "context_before": list(chunk.context_before),
+        "context_after": list(chunk.context_after),
     }
     return json.dumps(payload, ensure_ascii=True)
+
+
+def _translation_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "full_text": {"type": "string"},
+            "segments": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "segment_id": {"type": "string"},
+                        "target_text": {"type": "string"},
+                    },
+                    "required": ["segment_id", "target_text"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "required": ["full_text", "segments"],
+        "additionalProperties": False,
+    }
+
+
+def _chunk_transcript(
+    final_transcript: TranscriptCandidate,
+    *,
+    max_chunk_characters: int,
+    max_chunk_segments: int,
+    context_segment_window: int,
+) -> tuple[_TranslationChunk, ...]:
+    if not final_transcript.segments:
+        return (_TranslationChunk(chunk_key="chunk-0", chunk_index=0, segments=()),)
+
+    groups: list[tuple[Segment, ...]] = []
+    current_group: list[Segment] = []
+    current_characters = 0
+    for segment in final_transcript.segments:
+        segment_text = (segment.source_text or "").strip()
+        projected_characters = current_characters + len(segment_text)
+        if current_group and (
+            len(current_group) >= max_chunk_segments or projected_characters > max_chunk_characters
+        ):
+            groups.append(tuple(current_group))
+            current_group = []
+            current_characters = 0
+        current_group.append(segment)
+        current_characters += len(segment_text)
+    if current_group:
+        groups.append(tuple(current_group))
+
+    chunked: list[_TranslationChunk] = []
+    start_index = 0
+    for chunk_index, group in enumerate(groups):
+        end_index = start_index + len(group)
+        chunked.append(
+            _TranslationChunk(
+                chunk_key=f"chunk-{chunk_index}",
+                chunk_index=chunk_index,
+                segments=group,
+                context_before=_context_texts(
+                    final_transcript.segments,
+                    max(start_index - context_segment_window, 0),
+                    start_index,
+                ),
+                context_after=_context_texts(
+                    final_transcript.segments,
+                    end_index,
+                    min(end_index + context_segment_window, len(final_transcript.segments)),
+                ),
+            )
+        )
+        start_index = end_index
+    return tuple(chunked)
+
+
+def _should_split_chunk(chunk: _TranslationChunk, error: AdapterError) -> bool:
+    return error.retryable and len(chunk.segments) > 1
+
+
+def _split_chunk(
+    chunk: _TranslationChunk,
+    *,
+    context_segment_window: int,
+) -> tuple[_TranslationChunk, _TranslationChunk]:
+    midpoint = max(1, len(chunk.segments) // 2)
+    left_segments = chunk.segments[:midpoint]
+    right_segments = chunk.segments[midpoint:]
+    if not left_segments or not right_segments:
+        raise AdapterError(
+            provider_id="openai",
+            message="cannot split translation chunk further",
+            category="chunking_error",
+            retryable=False,
+        )
+    left_context_after = tuple(
+        segment.source_text.strip()
+        for segment in right_segments[:context_segment_window]
+        if isinstance(segment.source_text, str) and segment.source_text.strip()
+    )
+    right_context_before = tuple(
+        segment.source_text.strip()
+        for segment in left_segments[-context_segment_window:]
+        if isinstance(segment.source_text, str) and segment.source_text.strip()
+    )
+    return (
+        _TranslationChunk(
+            chunk_key=f"{chunk.chunk_key}.a",
+            chunk_index=chunk.chunk_index,
+            segments=left_segments,
+            context_before=chunk.context_before,
+            context_after=left_context_after,
+        ),
+        _TranslationChunk(
+            chunk_key=f"{chunk.chunk_key}.b",
+            chunk_index=chunk.chunk_index,
+            segments=right_segments,
+            context_before=right_context_before,
+            context_after=chunk.context_after,
+        ),
+    )
+
+
+def _context_texts(
+    segments: tuple[Segment, ...],
+    start_index: int,
+    end_index: int,
+) -> tuple[str, ...]:
+    return tuple(
+        text
+        for segment in segments[start_index:end_index]
+        if isinstance((text := segment.source_text), str) and text.strip()
+    )
+
+
+def _chunk_translation_from_payload(
+    payload: dict[str, Any],
+    *,
+    chunk: _TranslationChunk,
+) -> _ChunkTranslationResult:
+    full_text = payload.get("full_text")
+    if not isinstance(full_text, str) or not full_text.strip():
+        raise AdapterError(
+            provider_id="openai",
+            message="translation payload was missing full_text",
+            category="malformed_response",
+            retryable=False,
+        )
+    return _ChunkTranslationResult(
+        full_text=full_text.strip(),
+        segments=_merge_segments(chunk.segments, payload.get("segments")),
+    )
+
+
+def _candidate_from_chunk_results(
+    *,
+    translated_segments: tuple[Segment, ...],
+    full_text: str,
+    chunk_count: int,
+    response_ids: tuple[str, ...],
+    final_transcript: TranscriptCandidate,
+    request_context: RequestContext,
+    language: str,
+    prompt_variant_id: str,
+    prompt_version: str,
+    model_id: str,
+    raw_response_ref: str,
+) -> TranslationCandidate:
+    provider_request_id = response_ids[0] if response_ids else None
+    provider_metadata: dict[str, Any] = {
+        "provider_id": "openai",
+        "provider_request_id": provider_request_id,
+        "response_id": provider_request_id,
+    }
+    if response_ids:
+        provider_metadata["response_ids"] = list(response_ids)
+    return TranslationCandidate(
+        candidate_id=(
+            f"tl-{prompt_variant_id}-{request_context.job.job_id}-"
+            f"{job_scope_token(request_context.job)}"
+        ),
+        job_id=request_context.job.job_id,
+        source_transcript_candidate_id=final_transcript.candidate_id,
+        model_id=model_id,
+        prompt_variant_id=prompt_variant_id,
+        prompt_version=prompt_version,
+        language=language,
+        segments=translated_segments,
+        full_text=full_text.strip(),
+        raw_response_ref=raw_response_ref,
+        normalization_version="raw-openai-v1",
+        metadata={
+            "provider": provider_metadata,
+            "prompt": {
+                "variant_id": prompt_variant_id,
+                "version": prompt_version,
+            },
+            "prompt_resolver": _resolved_prompt_payload(request_context),
+            "chunking": {
+                "chunk_count": chunk_count,
+                "response_count": len(response_ids),
+            },
+        },
+    )
+
+
+def _chunk_attempt_record(
+    chunk: _TranslationChunk,
+    *,
+    status: str,
+    response: dict[str, Any] | None = None,
+    error: AdapterError | None = None,
+    fallback_children: tuple[str, str] | None = None,
+) -> dict[str, Any]:
+    record: dict[str, Any] = {
+        "chunk_key": chunk.chunk_key,
+        "chunk_index": chunk.chunk_index,
+        "status": status,
+        "segment_ids": [segment.segment_id for segment in chunk.segments],
+        "source_text": chunk.full_text,
+        "context_before": list(chunk.context_before),
+        "context_after": list(chunk.context_after),
+    }
+    if response is not None:
+        record["response"] = response
+    if error is not None:
+        record["error"] = error.as_metadata()
+    if fallback_children is not None:
+        record["fallback_children"] = list(fallback_children)
+    return record
 
 
 def _extract_translation_payload(response_payload: dict[str, Any]) -> dict[str, Any]:

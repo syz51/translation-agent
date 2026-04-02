@@ -15,6 +15,7 @@ from translation_agent.api import (
     RunJobRequest,
     approve_review,
     convert_translation_json_to_srt,
+    resume_translation,
     review_job,
     run_job,
 )
@@ -66,14 +67,26 @@ def build_parser() -> argparse.ArgumentParser:
 
     review_parser = subparsers.add_parser(
         "review-job",
-        help="Inspect a pending translation review for an existing run",
+        help="Inspect a pending translation review and optionally finalize a winner",
     )
     review_parser.add_argument("run_id")
     review_parser.add_argument("--json", action="store_true", dest="as_json")
 
+    resume_parser = subparsers.add_parser(
+        "resume-translation",
+        help="Resume translation from persisted transcript candidates of a prior run",
+    )
+    resume_parser.add_argument("run_id")
+    resume_parser.add_argument(
+        "--review",
+        choices=["auto", "always", "never"],
+        default="auto",
+    )
+    resume_parser.add_argument("--json", action="store_true", dest="as_json")
+
     approve_parser = subparsers.add_parser(
         "approve-review",
-        help="Approve a pending translation review candidate",
+        help="Finalize a pending translation review with one winning candidate",
     )
     approve_parser.add_argument("run_id")
     approve_parser.add_argument("--candidate-id", required=True)
@@ -202,6 +215,36 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         return _interactive_review_flow(args.run_id, settings=settings, initial_payload=payload)
 
+    if args.command == "resume-translation":
+        settings = load_settings()
+        result = resume_translation(args.run_id, review_mode=args.review, settings=settings)
+        payload = _json_ready(asdict(result))
+        if args.as_json:
+            print(json.dumps(payload))
+        else:
+            print(result.run_id)
+            print(result.status)
+            print(f"source_language: {result.source_language}")
+            print(f"target_language: {result.target_language}")
+            print(f"{result.state_backend}: {result.state_db_target}")
+            print(result.trace_path)
+            if result.default_output_path is not None:
+                print(f"default_output_path: {result.default_output_path}")
+            if result.failure_summary:
+                print(result.failure_summary)
+            for reason in result.failure_reasons:
+                print(reason)
+            if result.review_required_stage == "translation":
+                if _should_enter_interactive_review(mode=args.review):
+                    return _interactive_review_flow(result.run_id, settings=settings)
+                if args.review == "always" and not _has_tty():
+                    print("interactive review requires a real TTY")
+                    return 2
+                print("review_required_stage: translation")
+                for command in result.resume_commands:
+                    print(command)
+        return 0
+
     if args.command == "approve-review":
         settings = load_settings()
         payload = approve_review(
@@ -260,8 +303,8 @@ def _interactive_review_flow(
         _print_candidate_list(candidates, review_diffs)
         _print_review_diff(diff, diff_index=diff_index, diff_count=len(review_diffs))
         raw_command = input(
-            "review command (n=next, p=previous, l=scoreboard, a l=approve left, "
-            "a r=approve right, q=quit): "
+            "review command (n=next, p=previous, l=scoreboard, f l=finalize with left, "
+            "f r=finalize with right, q=quit): "
         )
         raw_command = raw_command.strip()
         if raw_command.lower() in {"q", "quit", "exit"}:
@@ -281,11 +324,20 @@ def _interactive_review_flow(
         if raw_command.lower() == "l":
             _print_candidate_list(candidates, review_diffs)
             continue
-        if raw_command.lower() in {"a l", "a r"}:
-            side_key = "left_candidate" if raw_command.lower().endswith("l") else "right_candidate"
+        normalized_command = raw_command.lower()
+        if normalized_command in {"f l", "f r", "a l", "a r"}:
+            side_key = "left_candidate" if normalized_command.endswith("l") else "right_candidate"
             side = diff.get(side_key)
             if not isinstance(side, dict) or not side.get("candidate_id"):
                 print("approval target is unavailable for this diff")
+                continue
+            print(
+                "final approval selects this candidate for the whole review; "
+                "it does not advance to the next diff"
+            )
+            confirm = input("finalize review with this candidate? [y/N]: ").strip().lower()
+            if confirm not in {"y", "yes"}:
+                print("approval cancelled")
                 continue
             approved_by = input("approved_by (blank uses current user): ").strip() or None
             note = input("note (optional): ").strip() or None
@@ -375,7 +427,7 @@ def _print_review_diff(
     if not isinstance(left_candidate, dict) or not isinstance(right_candidate, dict):
         return
     _print_candidate_panes(left_candidate, right_candidate)
-    print("commands: n=next p=previous l=scoreboard a l=approve left a r=approve right q=quit")
+    print("commands: n=next p=previous l=scoreboard f l=finalize left f r=finalize right q=quit")
 
 
 def _print_candidate_panes(

@@ -456,7 +456,7 @@ Each `review_diffs[*]` card includes:
 - `left_candidate`
 - `right_candidate`
 
-Interactive `review-job` renders one diff card at a time in the terminal, shows the shared source excerpt above the candidate pair, keeps approval at the whole-candidate level, and delegates the final selection to `approve-review`.
+Interactive `review-job` renders one diff card at a time in the terminal, shows the shared source excerpt above the candidate pair, keeps approval at the whole-candidate level, and requires an explicit finalization confirmation before delegating the final selection to `approve-review`.
 
 ### `approve-review --json`
 

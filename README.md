@@ -162,7 +162,10 @@ uv run translation-agent approve-review <run-id> --candidate-id <candidate-id> -
 `review-job` now has two operator surfaces:
 
 - `--json` returns the existing candidate payload plus additive `review_diffs` cards for pairwise review
-- interactive mode opens a one-diff-at-a-time terminal viewer with left/right candidate approval shortcuts
+- interactive mode opens a one-diff-at-a-time terminal viewer with left/right finalization shortcuts
+
+In interactive mode, choosing left or right finalizes the whole review with that candidate. It does
+not mark only the current diff as accepted and continue to the next conflict.
 
 The public result payload contains:
 

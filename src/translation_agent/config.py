@@ -56,6 +56,8 @@ class Settings(BaseSettings):
     allow_langgraph_py314_warning: bool = False
     ffmpeg_binary: str = "ffmpeg"
     provider_timeout_seconds: float = 30.0
+    translation_timeout_seconds: float = 90.0
+    assemblyai_timeout_seconds: float = 300.0
     adapter_retry_attempts: int = Field(default=3, ge=1, le=5)
     adapter_initial_backoff_seconds: float = Field(default=0.25, gt=0, le=5)
     adapter_max_backoff_seconds: float = Field(default=2.0, gt=0, le=30)
@@ -74,6 +76,9 @@ class Settings(BaseSettings):
     default_target_language: str = "zh"
     translation_model_id: str = "gpt-5.4-mini"
     translation_prompt_version: str = "phase-3-v1"
+    translation_max_chunk_characters: int = Field(default=5_000, ge=250, le=50_000)
+    translation_max_chunk_segments: int = Field(default=100, ge=1, le=1_000)
+    translation_context_segment_window: int = Field(default=2, ge=0, le=16)
 
     def model_post_init(self, __context: object) -> None:
         blob_dir_overridden = "blob_dir" in self.model_fields_set

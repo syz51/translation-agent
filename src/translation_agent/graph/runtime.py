@@ -522,8 +522,11 @@ def build_phase_three_runtime(
         model_id=settings.translation_model_id,
         prompt_version=settings.translation_prompt_version,
         base_url=settings.openai_base_url,
-        timeout_seconds=settings.provider_timeout_seconds,
+        timeout_seconds=settings.translation_timeout_seconds,
         retry_policy=retry_policy,
+        max_chunk_characters=settings.translation_max_chunk_characters,
+        max_chunk_segments=settings.translation_max_chunk_segments,
+        context_segment_window=settings.translation_context_segment_window,
     )
 
     memory_store = BlobBackedLongTermMemoryStore(blob_store)
@@ -582,7 +585,7 @@ def _build_real_transcription_adapters(
                     blob_store=blob_store,
                     api_key=_required_setting(settings.assemblyai_api_key, "TA_ASSEMBLYAI_API_KEY"),
                     base_url=settings.assemblyai_base_url,
-                    timeout_seconds=settings.provider_timeout_seconds,
+                    timeout_seconds=settings.assemblyai_timeout_seconds,
                     retry_policy=retry_policy,
                 )
             )

@@ -9,6 +9,7 @@ from typing import Any, cast
 
 import pytest
 
+import translation_agent.graph.runtime as runtime_module
 from translation_agent.adapters import (
     AdapterError,
     AssemblyAITranscriptionAdapter,
@@ -2183,3 +2184,63 @@ def test_phase_three_runtime_raises_when_selected_single_provider_fails(
 
     with pytest.raises(RuntimeError, match="all transcription providers failed"):
         run_workflow(initial_state, runtime)
+
+    failed_execution = next(
+        record
+        for record in run_store.list_node_executions("run-assembly-failure")
+        if record.node_name == "fanout_transcription"
+    )
+    assert failed_execution.error == {
+        "message": "all transcription providers failed",
+        "category": "transcription_failed",
+        "reason": "all_transcription_providers_failed",
+        "provider_errors": [
+            {
+                "provider_id": "assemblyai",
+                "message": "simulated AssemblyAI failure",
+            }
+        ],
+    }
+
+
+def test_build_real_transcription_adapters_uses_assemblyai_specific_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    captured_timeouts: dict[str, float] = {}
+
+    class StubAdapter:
+        def __init__(self, provider_id: str, *, timeout_seconds: float) -> None:
+            self.provider_id = provider_id
+            captured_timeouts[provider_id] = timeout_seconds
+
+    monkeypatch.setattr(
+        runtime_module,
+        "AssemblyAITranscriptionAdapter",
+        lambda **kwargs: StubAdapter("assemblyai", timeout_seconds=kwargs["timeout_seconds"]),
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "SpeechmaticsTranscriptionAdapter",
+        lambda **kwargs: StubAdapter("speechmatics", timeout_seconds=kwargs["timeout_seconds"]),
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "DeepgramTranscriptionAdapter",
+        lambda **kwargs: StubAdapter("deepgram", timeout_seconds=kwargs["timeout_seconds"]),
+    )
+
+    runtime_module._build_real_transcription_adapters(
+        settings=_real_settings(
+            provider_timeout_seconds=30.0,
+            assemblyai_timeout_seconds=300.0,
+        ),
+        blob_store=LocalBlobStore(tmp_path / "blobs"),
+        retry_policy=_retry_policy(),
+    )
+
+    assert captured_timeouts == {
+        "assemblyai": 300.0,
+        "speechmatics": 30.0,
+        "deepgram": 30.0,
+    }

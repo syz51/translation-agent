@@ -4,6 +4,7 @@ import json
 from argparse import Namespace
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
@@ -13,6 +14,7 @@ from translation_agent.api import (
     RunJobResult,
     _failure_details,
     _final_status,
+    resume_translation,
     review_job,
     run_job,
 )
@@ -25,6 +27,7 @@ from translation_agent.config import (
     validate_environment,
     validate_runtime_compatibility,
 )
+from translation_agent.errors import TranscriptionProvidersFailedError
 from translation_agent.graph import GraphState
 from translation_agent.graph.state import RoutingFact
 from translation_agent.models import (
@@ -42,6 +45,7 @@ from translation_agent.storage import (
     PostgresRunStore,
     SQLiteOperationalStore,
     job_path,
+    operational_job_key,
 )
 
 
@@ -138,6 +142,7 @@ def _configure_real_mode_env(
 def test_load_settings_reads_environment(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setenv("TA_DATA_DIR", str(tmp_path / "runtime"))
     monkeypatch.setenv("TA_DEFAULT_TARGET_LANGUAGE", "ja")
+    monkeypatch.setenv("TA_ASSEMBLYAI_TIMEOUT_SECONDS", "300")
     monkeypatch.setenv(
         "TA_STATE_DB_DSN",
         "postgresql://user:secret@db.example.com:5432/translation_agent?sslmode=require",
@@ -149,6 +154,7 @@ def test_load_settings_reads_environment(monkeypatch, tmp_path: Path) -> None:
     assert settings.blob_dir == settings.data_dir / "blobs"
     assert settings.trace_dir == settings.data_dir / "traces"
     assert settings.default_target_language == "ja"
+    assert settings.assemblyai_timeout_seconds == 300.0
     assert settings.state_db_dsn == (
         "postgresql://user:secret@db.example.com:5432/translation_agent?sslmode=require"
     )
@@ -954,6 +960,56 @@ def test_run_job_returns_translation_failure_details(
 
 
 @pytest.mark.unit
+def test_run_job_persists_transcription_provider_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("TA_DATA_DIR", str(tmp_path / "runtime"))
+    monkeypatch.delenv("TA_STATE_DB_DSN", raising=False)
+
+    source_path = tmp_path / "input.mp4"
+    source_path.write_bytes(b"video")
+    settings = load_settings()
+
+    def fake_build_runtime(**kwargs: object) -> object:
+        return SimpleNamespace(run_store=kwargs["run_store"], scenario="happy")
+
+    def fail_run_workflow(*_: object) -> object:
+        raise TranscriptionProvidersFailedError(
+            {
+                "assemblyai": "network failure: The write operation timed out",
+                "speechmatics": "http 401",
+            }
+        )
+
+    monkeypatch.setattr("translation_agent.api.build_runtime", fake_build_runtime)
+    monkeypatch.setattr("translation_agent.api.run_workflow", fail_run_workflow)
+
+    with pytest.raises(RuntimeError, match="all transcription providers failed"):
+        run_job(RunJobRequest(source=str(source_path)), settings=settings)
+
+    with SQLiteOperationalStore(settings.state_db_path) as store:
+        persisted_run = store.list_runs()[0]
+
+    assert persisted_run.status == "failed"
+    assert persisted_run.error == {
+        "message": "all transcription providers failed",
+        "category": "transcription_failed",
+        "reason": "all_transcription_providers_failed",
+        "provider_errors": [
+            {
+                "provider_id": "assemblyai",
+                "message": "network failure: The write operation timed out",
+            },
+            {
+                "provider_id": "speechmatics",
+                "message": "http 401",
+            },
+        ],
+    }
+
+
+@pytest.mark.unit
 def test_run_job_human_review_required_leaves_default_output_path_unset(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1029,6 +1085,83 @@ def test_run_job_persists_structured_translation_failure_error(
         "variant-a: simulated translation failure for variant-a",
         "variant-b: simulated translation failure for variant-b",
     ]
+
+
+@pytest.mark.unit
+def test_resume_translation_from_failed_run_skips_transcription(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("TA_DATA_DIR", str(tmp_path / "runtime"))
+    monkeypatch.delenv("TA_STATE_DB_DSN", raising=False)
+
+    source = run_job(
+        RunJobRequest(
+            source="input.mp4",
+            job_id="job-resume-failed",
+            metadata={"scenario": "translation_failed"},
+        )
+    )
+
+    resumed = resume_translation(source.run_id)
+
+    with SQLiteOperationalStore(tmp_path / "runtime" / "state.sqlite3") as store:
+        resumed_record = store.get_run(resumed.run_id)
+        node_names = [record.node_name for record in store.list_node_executions(resumed.run_id)]
+        resumed_transcripts = store.list_transcript_candidates(
+            resumed.job_id,
+            storage_job_id=operational_job_key(_job_context(resumed.job_id)),
+        )
+
+    assert resumed.status == "translation_failed"
+    assert resumed.run_id != source.run_id
+    assert resumed.job_id != source.job_id
+    assert resumed_record is not None
+    assert resumed_record.input_data["resumed_from_run_id"] == source.run_id
+    assert node_names == [
+        "generate_translation_candidates",
+        "normalize_translations",
+        "review_translations",
+        "adjudicate_translation",
+        "background_memory_pipeline",
+        "finalize_outputs",
+    ]
+    assert len(resumed_transcripts) == 3
+    assert all(candidate.job_id == resumed.job_id for candidate in resumed_transcripts)
+    assert all(source.job_id in candidate.candidate_id for candidate in resumed_transcripts)
+    assert all(resumed.job_id not in candidate.candidate_id for candidate in resumed_transcripts)
+    assert resumed.failure_ref == str(
+        job_path(_job_context(resumed.job_id), "published", "translation-failed.json")
+    )
+
+
+@pytest.mark.unit
+def test_resume_translation_from_partial_variant_run_completes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("TA_DATA_DIR", str(tmp_path / "runtime"))
+    monkeypatch.delenv("TA_STATE_DB_DSN", raising=False)
+
+    source = run_job(
+        RunJobRequest(
+            source="input.mp4",
+            job_id="job-resume-partial",
+            metadata={"scenario": "translation_single_variant"},
+        )
+    )
+
+    resumed = resume_translation(source.run_id)
+
+    with SQLiteOperationalStore(tmp_path / "runtime" / "state.sqlite3") as store:
+        node_names = [record.node_name for record in store.list_node_executions(resumed.run_id)]
+
+    assert resumed.status == "completed"
+    assert resumed.failure_ref is None
+    assert resumed.default_output_path is not None
+    assert "fanout_transcription" not in node_names
+    assert "extract_audio" not in node_names
+    assert node_names[0] == "generate_translation_candidates"
 
 
 @pytest.mark.unit
@@ -1176,6 +1309,42 @@ def test_cli_run_job_review_auto_non_tty_prints_resume_instructions(
     assert "review_required_stage: translation" in output
     assert "uv run translation-agent review-job run-review-auto" in output
     assert "uv run translation-agent approve-review run-review-auto" in output
+
+
+@pytest.mark.unit
+def test_cli_resume_translation_review_auto_non_tty_prints_resume_instructions(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        "translation_agent.cli.resume_translation",
+        lambda run_id, review_mode, settings: RunJobResult(
+            run_id="run-resume-auto",
+            job_id="job-resume-auto",
+            status="human_review_required",
+            source="input.wav",
+            source_language="en",
+            target_language="zh",
+            blob_root=Path("/tmp/blob-root"),
+            trace_path=Path("/tmp/trace.jsonl"),
+            state_backend="sqlite",
+            state_db_target="/tmp/state.sqlite3",
+            review_required_stage="translation",
+            resume_commands=(
+                "uv run translation-agent review-job run-resume-auto",
+                "uv run translation-agent approve-review run-resume-auto "
+                "--candidate-id <candidate-id>",
+            ),
+        ),
+    )
+
+    exit_code = main(["resume-translation", "run-source", "--review", "auto"])
+
+    output = capsys.readouterr().out
+    assert exit_code == 0
+    assert "review_required_stage: translation" in output
+    assert "uv run translation-agent review-job run-resume-auto" in output
+    assert "uv run translation-agent approve-review run-resume-auto" in output
 
 
 @pytest.mark.unit
@@ -1327,7 +1496,7 @@ def test_review_job_interactive_approves_diff_side(
 
     monkeypatch.setattr("translation_agent.cli.review_job", lambda run_id, settings=None: payload)
     monkeypatch.setattr("translation_agent.cli.approve_review", _approve_review)
-    commands = iter([command, "", ""])
+    commands = iter([command, "y", "", ""])
     monkeypatch.setattr("builtins.input", lambda _: next(commands))
 
     exit_code = main(["review-job", result.run_id])
@@ -1338,8 +1507,55 @@ def test_review_job_interactive_approves_diff_side(
     assert captured["candidate_id"] == expected_candidate_id
     assert captured["approved_by"] is None
     assert captured["note"] is None
+    assert "final approval selects this candidate for the whole review" in output
     assert "completed_after_human_review" in output
     assert "approval_ref: approvals/translation.json" in output
+
+
+@pytest.mark.unit
+def test_review_job_interactive_cancelled_approval_returns_to_review(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("TA_DATA_DIR", str(tmp_path / "runtime"))
+    monkeypatch.delenv("TA_STATE_DB_DSN", raising=False)
+
+    result = run_job(
+        RunJobRequest(
+            source="input.mp4",
+            job_id="job-review-interactive-cancel",
+            metadata={"scenario": "translation_conflict_timeout"},
+        )
+    )
+    payload = review_job(result.run_id)
+    approve_calls = 0
+
+    def _approve_review(
+        run_id: str,
+        *,
+        candidate_id: str,
+        approved_by: str | None,
+        note: str | None,
+        settings,
+    ) -> dict[str, object]:
+        nonlocal approve_calls
+        approve_calls += 1
+        return {}
+
+    monkeypatch.setattr("translation_agent.cli.review_job", lambda run_id, settings=None: payload)
+    monkeypatch.setattr("translation_agent.cli.approve_review", _approve_review)
+    commands = iter(["f l", "n", "n", "q"])
+    monkeypatch.setattr("builtins.input", lambda _: next(commands))
+
+    exit_code = main(["review-job", result.run_id])
+
+    output = capsys.readouterr().out
+    assert exit_code == 0
+    assert approve_calls == 0
+    assert "approval cancelled" in output
+    assert "diff 1/" in output
+    assert "diff 2/" in output
 
 
 @pytest.mark.unit

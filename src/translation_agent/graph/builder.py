@@ -8,6 +8,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
+from translation_agent.errors import exception_error_payload
 from translation_agent.graph._langgraph_compat import END, START, StateGraph
 from translation_agent.graph.routing import route_after_memory_pipeline
 from translation_agent.graph.runtime import WorkflowRuntime
@@ -34,6 +35,7 @@ def build_workflow_graph(runtime: WorkflowRuntime):
     """Compile the deterministic Phase 2 workflow graph."""
 
     builder = StateGraph(GraphState)
+    _add_translation_nodes(builder, runtime)
     builder.add_node("ingest", _instrumented_node("ingest", runtime, ingest_job))
     builder.add_node("extract_audio", _instrumented_node("extract_audio", runtime, extract_audio))
     builder.add_node(
@@ -52,6 +54,66 @@ def build_workflow_graph(runtime: WorkflowRuntime):
         "adjudicate_transcript",
         _instrumented_node("adjudicate_transcript", runtime, adjudicate_transcript),
     )
+
+    builder.add_edge(START, "ingest")
+    builder.add_edge("ingest", "extract_audio")
+    builder.add_edge("extract_audio", "fanout_transcription")
+    builder.add_edge("fanout_transcription", "normalize_transcripts")
+    builder.add_edge("normalize_transcripts", "review_transcripts")
+    builder.add_edge("review_transcripts", "adjudicate_transcript")
+    builder.add_edge("adjudicate_transcript", "background_memory_pipeline")
+    _add_translation_edges(builder)
+    return builder.compile(name="translation_agent_phase_two")
+
+
+def build_translation_resume_graph(runtime: WorkflowRuntime):
+    """Compile the translation-only resume graph starting from persisted transcripts."""
+
+    builder = StateGraph(GraphState)
+    _add_translation_nodes(builder, runtime)
+    builder.add_edge(START, "generate_translation_candidates")
+    _add_translation_edges(builder)
+    return builder.compile(name="translation_agent_translation_resume")
+
+
+def run_workflow(initial_state: GraphState, runtime: WorkflowRuntime) -> GraphState:
+    """Execute the compiled workflow and validate the final state."""
+
+    compiled = build_workflow_graph(runtime)
+    return _run_compiled_workflow(compiled, initial_state, runtime)
+
+
+def run_translation_resume_workflow(
+    initial_state: GraphState, runtime: WorkflowRuntime
+) -> GraphState:
+    """Execute the translation-only resume workflow and validate the final state."""
+
+    compiled = build_translation_resume_graph(runtime)
+    return _run_compiled_workflow(compiled, initial_state, runtime)
+
+
+def _run_compiled_workflow(
+    compiled,
+    initial_state: GraphState,
+    runtime: WorkflowRuntime,
+) -> GraphState:
+    result = compiled.invoke(initial_state)
+    final_state = GraphState.model_validate(result)
+    try:
+        final_state = drain_background_memory(final_state, runtime)
+    except Exception as exc:
+        runtime.trace_sink.record(
+            TraceEvent(
+                run_id=final_state.run_id,
+                name="memory_pipeline.failed",
+                attributes={"error": str(exc)},
+            )
+        )
+    _sync_trace_artifact(final_state, runtime)
+    return final_state
+
+
+def _add_translation_nodes(builder: StateGraph, runtime: WorkflowRuntime) -> None:
     builder.add_node(
         "generate_translation_candidates",
         _instrumented_node(
@@ -85,13 +147,8 @@ def build_workflow_graph(runtime: WorkflowRuntime):
         _instrumented_node("finalize_outputs", runtime, finalize_outputs),
     )
 
-    builder.add_edge(START, "ingest")
-    builder.add_edge("ingest", "extract_audio")
-    builder.add_edge("extract_audio", "fanout_transcription")
-    builder.add_edge("fanout_transcription", "normalize_transcripts")
-    builder.add_edge("normalize_transcripts", "review_transcripts")
-    builder.add_edge("review_transcripts", "adjudicate_transcript")
-    builder.add_edge("adjudicate_transcript", "background_memory_pipeline")
+
+def _add_translation_edges(builder: StateGraph) -> None:
     builder.add_conditional_edges(
         "background_memory_pipeline",
         route_after_memory_pipeline,
@@ -105,27 +162,6 @@ def build_workflow_graph(runtime: WorkflowRuntime):
     builder.add_edge("review_translations", "adjudicate_translation")
     builder.add_edge("adjudicate_translation", "background_memory_pipeline")
     builder.add_edge("finalize_outputs", END)
-    return builder.compile(name="translation_agent_phase_two")
-
-
-def run_workflow(initial_state: GraphState, runtime: WorkflowRuntime) -> GraphState:
-    """Execute the compiled workflow and validate the final state."""
-
-    compiled = build_workflow_graph(runtime)
-    result = compiled.invoke(initial_state)
-    final_state = GraphState.model_validate(result)
-    try:
-        final_state = drain_background_memory(final_state, runtime)
-    except Exception as exc:
-        runtime.trace_sink.record(
-            TraceEvent(
-                run_id=final_state.run_id,
-                name="memory_pipeline.failed",
-                attributes={"error": str(exc)},
-            )
-        )
-    _sync_trace_artifact(final_state, runtime)
-    return final_state
 
 
 def sync_trace_artifact(state: GraphState, runtime: WorkflowRuntime) -> None:
@@ -152,10 +188,11 @@ def _instrumented_node(name: str, runtime: WorkflowRuntime, node_fn: NodeFn):
         try:
             output = node_fn(state, runtime)
         except Exception as exc:
+            error_payload = exception_error_payload(exc)
             runtime.run_store.update_node_execution(
                 execution.execution_id,
                 status="failed",
-                error={"message": str(exc)},
+                error=error_payload,
             )
             runtime.trace_sink.record(
                 TraceEvent(
@@ -164,7 +201,8 @@ def _instrumented_node(name: str, runtime: WorkflowRuntime, node_fn: NodeFn):
                     attributes={
                         "node_name": name,
                         "execution_id": execution.execution_id,
-                        "error": str(exc),
+                        "error": error_payload["message"],
+                        "error_payload": error_payload,
                     },
                 )
             )

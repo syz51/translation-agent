@@ -5,6 +5,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 
 from translation_agent.adapters import RawPayloadTranscriptionAdapter
+from translation_agent.errors import TranscriptionProvidersFailedError
 from translation_agent.graph.runtime import WorkflowRuntime
 from translation_agent.graph.state import GraphState, RoutingFact
 from translation_agent.models import AudioArtifact
@@ -26,6 +27,7 @@ def fanout_transcription(state: GraphState, runtime: WorkflowRuntime) -> dict[st
     request_context = build_request_context(state, runtime)
     payload_refs: list[str] = []
     staged_refs: list[str] = []
+    provider_errors: dict[str, str] = {}
     routing_facts = list(state.routing_facts)
 
     with ThreadPoolExecutor(max_workers=max(1, len(runtime.transcription_adapters))) as executor:
@@ -41,6 +43,7 @@ def fanout_transcription(state: GraphState, runtime: WorkflowRuntime) -> dict[st
             try:
                 candidate, raw_payload = future.result()
             except Exception as exc:
+                provider_errors[adapter.provider_id] = str(exc)
                 routing_facts.append(
                     RoutingFact(
                         stage="fanout_transcription",
@@ -83,7 +86,7 @@ def fanout_transcription(state: GraphState, runtime: WorkflowRuntime) -> dict[st
             )
 
     if not staged_refs:
-        raise RuntimeError("all transcription providers failed")
+        raise TranscriptionProvidersFailedError(provider_errors)
 
     return {
         "current_stage": "fanout_transcription",
