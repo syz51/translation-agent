@@ -52,6 +52,7 @@ class RunJobResult:
     source: str
     blob_root: Path
     trace_path: Path
+    default_output_path: Path | None = None
     state_backend: str = "sqlite"
     state_db_target: str = ""
     failure_ref: str | None = None
@@ -280,6 +281,7 @@ def run_job(request: RunJobRequest, settings: Settings | None = None) -> RunJobR
         state_backend=validation.state_backend,
         state_db_target=validation.state_db_target,
         trace_path=trace_path,
+        default_output_path=_default_output_path(blob_dir, final_state),
         failure_ref=failure_ref,
         failure_summary=failure_summary,
         failure_reasons=failure_reasons,
@@ -363,6 +365,16 @@ def _normalized_optional_identifier(value: str | None) -> str | None:
         return None
     normalized = value.strip()
     return normalized or None
+
+
+def _default_output_path(blob_root: Path, state: GraphState) -> Path | None:
+    if state.translation_failed or state.human_review_required:
+        return None
+    default_output_ref = job_path(state.job, "exports", "translation.srt")
+    default_output_path = blob_root / default_output_ref
+    if not default_output_path.exists():
+        return None
+    return default_output_path.resolve()
 
 
 def _final_status(state: GraphState) -> str:

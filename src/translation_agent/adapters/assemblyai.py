@@ -15,6 +15,7 @@ from translation_agent.adapters.common import (
     normalize_whitespace,
     perform_with_retries,
     poll_until_complete,
+    require_usable_timed_segments,
 )
 from translation_agent.models import AudioArtifact, RequestContext, Segment, TranscriptCandidate
 from translation_agent.storage import BlobStore, job_path, job_scope_token
@@ -153,18 +154,7 @@ def _candidate_from_payload(
     transcript_id = _require_string(payload, "id", provider_id="assemblyai")
     text = normalize_whitespace(str(payload.get("text", "")))
     utterances = payload.get("utterances")
-    segments = _segments_from_utterances(utterances)
-    if not segments:
-        segments = (
-            Segment(
-                segment_id=f"seg-assemblyai-{transcript_id}-1",
-                start_ms=0,
-                end_ms=max(int(payload.get("audio_duration", 0) or 0), 0),
-                speaker=None,
-                source_text=text,
-                annotations={"provider": "assemblyai"},
-            ),
-        )
+    segments = require_usable_timed_segments("assemblyai", _segments_from_utterances(utterances))
     speaker_map = {
         segment.speaker: segment.speaker for segment in segments if segment.speaker is not None
     }

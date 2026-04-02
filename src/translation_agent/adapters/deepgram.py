@@ -17,6 +17,7 @@ from translation_agent.adapters.common import (
     classify_http_error,
     normalize_whitespace,
     perform_with_retries,
+    require_usable_timed_segments,
 )
 from translation_agent.models import AudioArtifact, RequestContext, Segment, TranscriptCandidate
 from translation_agent.storage import BlobStore, job_path, job_scope_token
@@ -129,32 +130,24 @@ def _candidate_from_payload(
     request_id = metadata.get("request_id") if isinstance(metadata, dict) else None
     transcript_text = _extract_transcript_text(payload)
     utterances = _extract_utterances(payload)
-    segments = tuple(
-        Segment(
-            segment_id=f"seg-deepgram-{index}",
-            start_ms=_seconds_to_ms(utterance.get("start")),
-            end_ms=_seconds_to_ms(utterance.get("end")),
-            speaker=_speaker_name(utterance.get("speaker")),
-            source_text=normalize_whitespace(str(utterance.get("transcript", ""))),
-            annotations={
-                "provider": "deepgram",
-                "confidence": utterance.get("confidence"),
-            },
-        )
-        for index, utterance in enumerate(utterances, start=1)
-        if isinstance(utterance, dict)
-    )
-    if not segments:
-        segments = (
+    segments = require_usable_timed_segments(
+        "deepgram",
+        tuple(
             Segment(
-                segment_id="seg-deepgram-1",
-                start_ms=0,
-                end_ms=0,
-                speaker=None,
-                source_text=transcript_text,
-                annotations={"provider": "deepgram"},
-            ),
-        )
+                segment_id=f"seg-deepgram-{index}",
+                start_ms=_seconds_to_ms(utterance.get("start")),
+                end_ms=_seconds_to_ms(utterance.get("end")),
+                speaker=_speaker_name(utterance.get("speaker")),
+                source_text=normalize_whitespace(str(utterance.get("transcript", ""))),
+                annotations={
+                    "provider": "deepgram",
+                    "confidence": utterance.get("confidence"),
+                },
+            )
+            for index, utterance in enumerate(utterances, start=1)
+            if isinstance(utterance, dict)
+        ),
+    )
     return TranscriptCandidate(
         candidate_id=(
             f"tr-deepgram-{request_context.job.job_id}-{job_scope_token(request_context.job)}"

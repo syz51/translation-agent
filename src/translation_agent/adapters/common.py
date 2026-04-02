@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 from uuid import uuid4
 
+from translation_agent.models import Segment
+
 
 @dataclass(frozen=True, slots=True)
 class RetryPolicy:
@@ -90,6 +92,26 @@ class AdapterError(RuntimeError):
             "status_code": self.status_code,
             "message": str(self),
         }
+
+
+def require_usable_timed_segments(
+    provider_id: str,
+    segments: tuple[Segment, ...],
+) -> tuple[Segment, ...]:
+    usable_segments = tuple(
+        segment
+        for segment in segments
+        if segment.end_ms > segment.start_ms
+        and bool(normalize_whitespace(segment.source_text or ""))
+    )
+    if usable_segments:
+        return usable_segments
+    raise AdapterError(
+        provider_id=provider_id,
+        message="timed transcript segments missing; cannot produce default SRT output",
+        category="malformed_response",
+        retryable=False,
+    )
 
 
 class StdlibHttpTransport:

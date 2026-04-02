@@ -18,6 +18,7 @@ from translation_agent.adapters.common import (
     normalize_whitespace,
     perform_with_retries,
     poll_until_complete,
+    require_usable_timed_segments,
 )
 from translation_agent.models import AudioArtifact, RequestContext, Segment, TranscriptCandidate
 from translation_agent.storage import BlobStore, job_path, job_scope_token
@@ -163,29 +164,25 @@ def _candidate_from_payload(
     language: str,
     raw_payload_ref: str,
 ) -> TranscriptCandidate:
-    segments = tuple(
-        Segment(
-            segment_id=f"seg-speechmatics-{index}",
-            start_ms=_seconds_to_ms(result.get("start_time")),
-            end_ms=_seconds_to_ms(result.get("end_time")),
-            speaker=_speaker_name(result.get("speaker")),
-            source_text=normalize_whitespace(_content_from_result(result)),
-            annotations={
-                "provider": "speechmatics",
-                "type": result.get("type"),
-                "confidence": _alternative_confidence(result),
-            },
-        )
-        for index, result in enumerate(_speech_segments(payload), start=1)
+    segments = require_usable_timed_segments(
+        "speechmatics",
+        tuple(
+            Segment(
+                segment_id=f"seg-speechmatics-{index}",
+                start_ms=_seconds_to_ms(result.get("start_time")),
+                end_ms=_seconds_to_ms(result.get("end_time")),
+                speaker=_speaker_name(result.get("speaker")),
+                source_text=normalize_whitespace(_content_from_result(result)),
+                annotations={
+                    "provider": "speechmatics",
+                    "type": result.get("type"),
+                    "confidence": _alternative_confidence(result),
+                },
+            )
+            for index, result in enumerate(_speech_segments(payload), start=1)
+        ),
     )
     transcript_text = " ".join(segment.source_text or "" for segment in segments).strip()
-    if not segments:
-        raise AdapterError(
-            provider_id="speechmatics",
-            message="Speechmatics transcript did not contain any transcript segments",
-            category="malformed_response",
-            retryable=False,
-        )
     return TranscriptCandidate(
         candidate_id=(
             f"tr-speechmatics-{request_context.job.job_id}-{job_scope_token(request_context.job)}"

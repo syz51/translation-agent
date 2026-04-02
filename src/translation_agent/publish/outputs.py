@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+import pysubs2
+
 from translation_agent.graph.runtime import WorkflowRuntime
 from translation_agent.graph.state import GraphState
 from translation_agent.models import (
@@ -89,20 +91,17 @@ def publish_outputs(state: GraphState, runtime: WorkflowRuntime) -> tuple[Publis
         )
     )
 
-    export_text_ref = job_path(state.job, "exports", "translation.txt")
+    export_srt_ref = job_path(state.job, "exports", "translation.srt")
     export_json_ref = job_path(state.job, "exports", "translation.json")
     downstream_ref = job_path(state.job, "deliveries", "translation.json")
 
-    _write_text(
-        runtime,
-        export_text_ref,
-        _render_export_text(
-            state=state,
-            transcript=transcript,
-            translation=translation,
-            translation_failed=state.translation_failed,
-        ),
-    )
+    export_refs: tuple[str, ...]
+    if translation is not None and not state.human_review_required:
+        _write_srt(runtime, export_srt_ref, _render_export_srt(translation))
+        export_refs = (export_srt_ref, export_json_ref)
+    else:
+        runtime.blob_store.delete(export_srt_ref)
+        export_refs = (export_json_ref,)
     export_payload = _export_payload(
         state=state,
         transcript=transcript,
@@ -135,7 +134,7 @@ def publish_outputs(state: GraphState, runtime: WorkflowRuntime) -> tuple[Publis
             translation_ref=translation_ref,
             translation_failure_ref=translation_failure_ref,
             trace_refs=trace_refs,
-            export_refs=(export_text_ref, export_json_ref),
+            export_refs=export_refs,
             downstream_refs=(downstream_ref,),
             memory_batch_refs=memory_batch_refs,
             memory_consolidation_refs=memory_consolidation_refs,
@@ -155,7 +154,7 @@ def publish_outputs(state: GraphState, runtime: WorkflowRuntime) -> tuple[Publis
         recoverable_translation_failure_ref=translation_failure_ref,
         scorecard_refs=(scorecard_ref,),
         trace_refs=trace_refs,
-        export_refs=(export_text_ref, export_json_ref),
+        export_refs=export_refs,
         downstream_delivery_refs=(downstream_ref,),
         memory_batch_refs=memory_batch_refs,
         memory_consolidation_refs=memory_consolidation_refs,
@@ -284,30 +283,18 @@ def _export_payload(
     }
 
 
-def _render_export_text(
-    *,
-    state: GraphState,
-    transcript: TranscriptCandidate | None,
-    translation: TranslationCandidate | None,
-    translation_failed: bool,
-) -> str:
-    transcript_text = transcript.full_text if transcript is not None else "[missing transcript]"
-    translation_text = (
-        translation.full_text
-        if translation is not None
-        else "[translation unavailable; recoverable failure]"
-        if translation_failed
-        else "[translation omitted pending human review]"
-    )
-    return (
-        f"Job: {state.job.job_id}\n"
-        f"Source language: {state.job.source_language}\n"
-        f"Target language: {state.job.target_language}\n\n"
-        "Transcript\n"
-        f"{transcript_text}\n\n"
-        "Translation\n"
-        f"{translation_text}\n"
-    )
+def _render_export_srt(translation: TranslationCandidate) -> str:
+    subtitles = pysubs2.SSAFile()
+    subtitles.events = [
+        pysubs2.SSAEvent(
+            start=segment.start_ms,
+            end=segment.end_ms,
+            text=target_text,
+        )
+        for segment in translation.segments
+        if (target_text := (segment.target_text or "").strip())
+    ]
+    return subtitles.to_string("srt")
 
 
 def _decision[ModelT: FinalTranscriptDecision | FinalTranslationDecision](
@@ -363,5 +350,5 @@ def _write_json(runtime: WorkflowRuntime, key: str, payload: dict[str, Any]) -> 
     )
 
 
-def _write_text(runtime: WorkflowRuntime, key: str, payload: str) -> None:
+def _write_srt(runtime: WorkflowRuntime, key: str, payload: str) -> None:
     runtime.blob_store.put_bytes(key, payload.encode("utf-8"))

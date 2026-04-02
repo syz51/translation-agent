@@ -465,11 +465,41 @@ def test_cli_run_job_plain_output_reports_run_status_and_trace(
     exit_code = main(["run-job", "input.wav", "--job-id", "job-plain"])
 
     lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
+    default_output_path = (
+        tmp_path
+        / "runtime"
+        / "blobs"
+        / job_path(_job_context("job-plain"), "exports", "translation.srt")
+    ).resolve()
     assert exit_code == 0
-    assert len(lines) == 4
+    assert len(lines) == 5
     assert lines[1] == "completed"
     assert lines[2] == f"sqlite: {(tmp_path / 'runtime' / 'state.sqlite3').resolve()}"
     assert Path(lines[3]).exists()
+    assert lines[4] == f"default_output_path: {default_output_path}"
+
+
+@pytest.mark.unit
+def test_cli_run_job_json_includes_default_output_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("TA_DATA_DIR", str(tmp_path / "runtime"))
+    monkeypatch.delenv("TA_STATE_DB_DSN", raising=False)
+
+    exit_code = main(["run-job", "input.wav", "--job-id", "job-json", "--json"])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert payload["default_output_path"] == str(
+        (
+            tmp_path
+            / "runtime"
+            / "blobs"
+            / job_path(_job_context("job-json"), "exports", "translation.srt")
+        ).resolve()
+    )
 
 
 @pytest.mark.unit
@@ -554,9 +584,15 @@ def test_run_job_bootstraps_local_artifacts_and_postgres_record(
     assert result.status == "completed"
     assert result.blob_root.exists()
     assert result.trace_path.exists()
+    assert (
+        result.default_output_path
+        == (result.blob_root / _artifact_path("exports", "translation.srt")).resolve()
+    )
+    assert result.default_output_path is not None
     assert (result.blob_root / "jobs" / f"{result.run_id}-request.json").exists()
     assert (result.blob_root / _artifact_path("published", "transcript.json")).exists()
     assert (result.blob_root / _artifact_path("published", "translation.json")).exists()
+    assert result.default_output_path.exists()
     assert result.state_backend == "postgres"
     assert result.state_db_target == sanitize_db_target(migrated_postgres_dsn)
     assert result.failure_ref is None
@@ -601,8 +637,14 @@ def test_run_job_defaults_to_local_sqlite_runtime(
     assert result.failure_reasons == ()
     assert (tmp_path / "runtime" / "state.sqlite3").exists()
     local_job = _job_context(job_id="job-local")
+    assert (
+        result.default_output_path
+        == (result.blob_root / Path(job_path(local_job, "exports", "translation.srt"))).resolve()
+    )
     assert (result.blob_root / Path(job_path(local_job, "published", "transcript.json"))).exists()
     assert (result.blob_root / Path(job_path(local_job, "published", "translation.json"))).exists()
+    assert result.default_output_path is not None
+    assert result.default_output_path.exists()
 
 
 @pytest.mark.unit
@@ -713,6 +755,7 @@ def test_run_job_returns_translation_failure_details(
     )
 
     assert result.status == "translation_failed"
+    assert result.default_output_path is None
     assert result.failure_ref == str(
         job_path(_job_context("job-translation-failed"), "published", "translation-failed.json")
     )
@@ -723,6 +766,26 @@ def test_run_job_returns_translation_failure_details(
         "variant-a: simulated translation failure for variant-a",
         "variant-b: simulated translation failure for variant-b",
     )
+
+
+@pytest.mark.unit
+def test_run_job_human_review_required_leaves_default_output_path_unset(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("TA_DATA_DIR", str(tmp_path / "runtime"))
+    monkeypatch.delenv("TA_STATE_DB_DSN", raising=False)
+
+    result = run_job(
+        RunJobRequest(
+            source="input.mp4",
+            job_id="job-human-review",
+            metadata={"scenario": "transcript_escalation"},
+        )
+    )
+
+    assert result.status == "human_review_required"
+    assert result.default_output_path is None
 
 
 @pytest.mark.unit

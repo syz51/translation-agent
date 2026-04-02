@@ -471,7 +471,7 @@ def test_assemblyai_adapter_retries_and_normalizes_utterances(tmp_path: Path) ->
     assert len(transport.requests) == 4
 
 
-def test_assemblyai_adapter_handles_partial_metadata(tmp_path: Path) -> None:
+def test_assemblyai_adapter_rejects_missing_timed_segments(tmp_path: Path) -> None:
     blob_store = LocalBlobStore(tmp_path / "blobs")
     audio_artifact = _audio_artifact()
     blob_store.put_bytes(audio_artifact.blob_ref, b"audio-bytes")
@@ -496,10 +496,11 @@ def test_assemblyai_adapter_handles_partial_metadata(tmp_path: Path) -> None:
         sleep=lambda _: None,
     )
 
-    candidate = adapter.transcribe(audio_artifact, _request_context())
-
-    assert candidate.segments[0].source_text == "Hello world"
-    assert candidate.speaker_map == {}
+    with pytest.raises(
+        AdapterError,
+        match="timed transcript segments missing; cannot produce default SRT output",
+    ):
+        adapter.transcribe(audio_artifact, _request_context())
 
 
 def test_assemblyai_adapter_rejects_malformed_payload(tmp_path: Path) -> None:
@@ -619,9 +620,11 @@ def test_assemblyai_adapter_retries_timeout(tmp_path: Path) -> None:
         sleep=lambda _: None,
     )
 
-    candidate = adapter.transcribe(audio_artifact, _request_context())
-
-    assert candidate.full_text == "Hello"
+    with pytest.raises(
+        AdapterError,
+        match="timed transcript segments missing; cannot produce default SRT output",
+    ):
+        adapter.transcribe(audio_artifact, _request_context())
 
 
 @pytest.mark.contract
@@ -830,7 +833,7 @@ def test_deepgram_adapter_retries_and_normalizes_utterances(tmp_path: Path) -> N
     assert blob_store.exists(candidate.raw_payload_ref or "")
 
 
-def test_deepgram_adapter_handles_partial_metadata(tmp_path: Path) -> None:
+def test_deepgram_adapter_rejects_missing_timed_segments(tmp_path: Path) -> None:
     blob_store = LocalBlobStore(tmp_path / "blobs")
     audio_artifact = _audio_artifact()
     blob_store.put_bytes(audio_artifact.blob_ref, b"audio-bytes")
@@ -862,10 +865,11 @@ def test_deepgram_adapter_handles_partial_metadata(tmp_path: Path) -> None:
         sleep=lambda _: None,
     )
 
-    candidate = adapter.transcribe(audio_artifact, _request_context())
-
-    assert candidate.segments[0].source_text == "Hello world"
-    assert candidate.segments[0].speaker is None
+    with pytest.raises(
+        AdapterError,
+        match="timed transcript segments missing; cannot produce default SRT output",
+    ):
+        adapter.transcribe(audio_artifact, _request_context())
 
 
 def test_deepgram_adapter_times_out_on_retryable_timeout(tmp_path: Path) -> None:
@@ -943,9 +947,11 @@ def test_deepgram_adapter_retries_timeout(tmp_path: Path) -> None:
         sleep=lambda _: None,
     )
 
-    candidate = adapter.transcribe(audio_artifact, _request_context())
-
-    assert candidate.full_text == "Hello world"
+    with pytest.raises(
+        AdapterError,
+        match="timed transcript segments missing; cannot produce default SRT output",
+    ):
+        adapter.transcribe(audio_artifact, _request_context())
 
 
 def test_deepgram_adapter_rejects_missing_channels(tmp_path: Path) -> None:
@@ -1338,7 +1344,10 @@ def test_openai_translation_merge_segments_ignores_invalid_entries() -> None:
 
 
 def test_speechmatics_helpers_cover_sparse_results_and_validation() -> None:
-    with pytest.raises(AdapterError, match="did not contain any transcript segments"):
+    with pytest.raises(
+        AdapterError,
+        match="timed transcript segments missing; cannot produce default SRT output",
+    ):
         speechmatics_module._candidate_from_payload(
             {
                 "results": [
@@ -1936,6 +1945,177 @@ def test_phase_three_runtime_completes_workflow_with_assemblyai_only_real_mode(
     assert decision.investigation_ref == _artifact_path("investigations", "transcript.json")
     assert blob_store.exists(_artifact_path("published", "transcript.json"))
     assert blob_store.exists(_artifact_path("published", "translation.json"))
+
+
+def test_phase_three_runtime_continues_when_one_provider_has_no_timed_segments(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        "translation_agent.graph.runtime.ensure_langgraph_runtime_supported",
+        lambda: None,
+    )
+    blob_store = LocalBlobStore(tmp_path / "blobs")
+    run_store = InMemoryRunStore()
+    run_store.create_run(run_id="run-partial-provider-failure", status="running")
+    source_ref = "jobs/run-partial-provider-failure-request.json"
+    source_path = tmp_path / "input.mp4"
+    source_path.write_bytes(b"video")
+    blob_store.put_bytes(source_ref, b"{}\n")
+
+    def fake_runner(command: Sequence[str], timeout_seconds: float) -> FfmpegCompletedProcess:
+        with wave.open(str(Path(command[-1])), "wb") as handle:
+            handle.setnchannels(1)
+            handle.setsampwidth(2)
+            handle.setframerate(16_000)
+            handle.writeframes(b"\x00\x00" * 16_000)
+        assert timeout_seconds == 120.0
+        return FfmpegCompletedProcess(returncode=0, stderr=b"ok")
+
+    assembly_transport = SequencedTransport(
+        [
+            _json_response({"upload_url": "https://upload.example/audio.wav"}),
+            _json_response({"id": "aai-job"}),
+            _json_response(
+                {
+                    "id": "aai-job",
+                    "status": "completed",
+                    "text": " Hello world ",
+                }
+            ),
+        ]
+    )
+    speechmatics_transport = SequencedTransport(
+        [
+            _json_response({"id": "sm-job"}),
+            _json_response({"id": "sm-job", "status": "done"}),
+            _json_response(
+                {
+                    "results": [
+                        {
+                            "type": "word",
+                            "alternatives": [{"content": "Hello", "confidence": 0.99}],
+                            "start_time": 0.0,
+                            "end_time": 0.4,
+                            "speaker": "1",
+                        },
+                        {
+                            "type": "word",
+                            "alternatives": [{"content": "world", "confidence": 0.98}],
+                            "start_time": 0.4,
+                            "end_time": 0.8,
+                            "speaker": "1",
+                        },
+                    ]
+                }
+            ),
+        ]
+    )
+    openai_transport = SequencedTransport(
+        [
+            _json_response(
+                {
+                    "output_text": json.dumps(
+                        {
+                            "full_text": "Bonjour le monde",
+                            "segments": [
+                                {
+                                    "segment_id": "seg-speechmatics-1",
+                                    "target_text": "Bonjour",
+                                },
+                                {
+                                    "segment_id": "seg-speechmatics-2",
+                                    "target_text": "le monde",
+                                },
+                            ],
+                        }
+                    )
+                }
+            ),
+            _json_response(
+                {
+                    "output_text": json.dumps(
+                        {
+                            "full_text": "Salut le monde",
+                            "segments": [
+                                {
+                                    "segment_id": "seg-speechmatics-1",
+                                    "target_text": "Salut",
+                                },
+                                {
+                                    "segment_id": "seg-speechmatics-2",
+                                    "target_text": "le monde",
+                                },
+                            ],
+                        }
+                    )
+                }
+            ),
+        ]
+    )
+    settings = _real_settings(
+        transcription_providers="assemblyai,speechmatics",
+        deepgram_api_key=None,
+    )
+    runtime = build_phase_three_runtime(
+        settings=settings,
+        blob_store=blob_store,
+        run_store=run_store,
+        trace_sink=NoOpTraceSink(),
+        source_artifact_ref=source_ref,
+        overrides=RealRuntimeOverrides(
+            audio_extractor=FFmpegAudioExtractionAdapter(
+                blob_store=blob_store,
+                command_runner=fake_runner,
+            ),
+            transcription_adapters=(
+                AssemblyAITranscriptionAdapter(
+                    api_key="assembly",
+                    blob_store=blob_store,
+                    transport=assembly_transport,
+                    retry_policy=_retry_policy(),
+                    sleep=lambda _: None,
+                ),
+                SpeechmaticsTranscriptionAdapter(
+                    api_key="speech",
+                    blob_store=blob_store,
+                    transport=speechmatics_transport,
+                    retry_policy=_retry_policy(),
+                    sleep=lambda _: None,
+                ),
+            ),
+            translation_adapter=OpenAITranslationAdapter(
+                api_key="openai",
+                blob_store=blob_store,
+                transport=openai_transport,
+                retry_policy=_retry_policy(),
+                sleep=lambda _: None,
+            ),
+        ),
+    )
+    initial_state = GraphState(
+        run_id="run-partial-provider-failure",
+        job=_job_context(),
+        current_stage="ingest",
+        source_video_ref=str(source_path),
+        source_artifact_ref=source_ref,
+    )
+
+    final_state = run_workflow(initial_state, runtime)
+
+    assert final_state.current_stage == "finalize_outputs"
+    assert final_state.translation_failed is False
+    assert final_state.final_transcript_candidate_id is not None
+    assert final_state.final_transcript_candidate_id.startswith("tr-speechmatics-")
+    assert any(
+        fact.fact_type == "transcription_provider_failed"
+        and fact.value == "assemblyai"
+        and fact.source_ref
+        == "timed transcript segments missing; cannot produce default SRT output"
+        for fact in final_state.routing_facts
+    )
+    assert blob_store.exists(_artifact_path("published", "translation.json"))
+    assert blob_store.exists(_artifact_path("exports", "translation.srt"))
 
 
 def test_phase_three_runtime_raises_when_selected_single_provider_fails(

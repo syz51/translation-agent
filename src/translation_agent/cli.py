@@ -113,6 +113,8 @@ def main(argv: list[str] | None = None) -> int:
             print(result.status)
             print(f"{result.state_backend}: {result.state_db_target}")
             print(result.trace_path)
+            if result.default_output_path is not None:
+                print(f"default_output_path: {result.default_output_path}")
             if result.failure_summary:
                 print(result.failure_summary)
             for reason in result.failure_reasons:

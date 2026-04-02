@@ -1,5 +1,6 @@
 {
   "blob_root": "<blob_root>",
+  "default_output_path": "<default_output_path>",
   "failure_reasons": [],
   "failure_ref": null,
   "failure_summary": null,

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pysubs2
 import pytest
 
 from translation_agent.graph import (
@@ -220,8 +221,9 @@ def test_phase_five_happy_path_publishes_audit_ready_outputs(tmp_path: Path) -> 
     prompt_id = f"prompt-evolution-{consolidation_id}"
 
     assert blob_store.exists(_artifact_path("published", "scorecard.json"))
-    assert blob_store.exists(_artifact_path("exports", "translation.txt"))
+    assert blob_store.exists(_artifact_path("exports", "translation.srt"))
     assert blob_store.exists(_artifact_path("exports", "translation.json"))
+    assert not blob_store.exists(_artifact_path("exports", "translation.txt"))
     assert blob_store.exists(_artifact_path("deliveries", "translation.json"))
     assert blob_store.exists(
         _artifact_path(
@@ -241,6 +243,10 @@ def test_phase_five_happy_path_publishes_audit_ready_outputs(tmp_path: Path) -> 
     scorecard = json.loads(
         blob_store.read_bytes(_artifact_path("published", "scorecard.json")).decode("utf-8")
     )
+    subtitles = pysubs2.SSAFile.from_string(
+        blob_store.read_bytes(_artifact_path("exports", "translation.srt")).decode("utf-8"),
+        format_="srt",
+    )
     prompt_proposal = json.loads(
         blob_store.read_bytes(
             _artifact_path(
@@ -253,8 +259,15 @@ def test_phase_five_happy_path_publishes_audit_ready_outputs(tmp_path: Path) -> 
 
     assert scorecard["translation_decision"]["disagreement_bucket"] == "low"
     assert scorecard["translation_decision"]["adjudication_scorecard"]["candidate_count"] == 2
+    assert scorecard["export_refs"] == [
+        _artifact_path("exports", "translation.srt"),
+        _artifact_path("exports", "translation.json"),
+    ]
     assert scorecard["memory_consolidation_refs"]
     assert scorecard["prompt_evolution_refs"]
+    assert len(subtitles.events) == 1
+    assert subtitles.events[0].text == "Bonjour tout le monde depuis le workflow."
+    assert "speaker-" not in subtitles.events[0].text
     assert prompt_proposal["target_model_id"] == runtime.translation_adapter.model_id
     assert prompt_proposal["auto_activate"] is False
     assert prompt_proposal["activation_mode"] == "approval_required"
