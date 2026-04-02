@@ -75,8 +75,8 @@ def publish_outputs(state: GraphState, runtime: WorkflowRuntime) -> tuple[Publis
         )
 
     trace_refs = _publish_trace_artifact(state, runtime)
-    memory_batch_refs = _refs_for_fact(state, "memory_batch_staged")
-    memory_consolidation_refs = _refs_for_fact(state, "memory_batch_consolidated")
+    memory_batch_refs = _ordered_memory_batch_refs(state, runtime)
+    memory_consolidation_refs = _ordered_memory_consolidation_refs(state, runtime)
     prompt_evolution_refs = _refs_for_fact(state, "translation_prompt_evolution")
     learning_refs = _refs_for_fact(state, "learning_artifact")
     reference_transcript_refs = _artifact_refs(state.reference_transcript_ref)
@@ -318,6 +318,28 @@ def _artifact_refs(ref: str | None) -> tuple[str, ...]:
     if ref is None:
         return ()
     return (ref,)
+
+
+def _ordered_memory_batch_refs(state, runtime) -> tuple[str, ...]:  # noqa: ANN001
+    candidate_refs = tuple(
+        job_path(state.job, "memory", "batches", f"{batch_id}.json")
+        for batch_id in state.memory_batch_ids
+    )
+    existing_refs = tuple(ref for ref in candidate_refs if runtime.blob_store.exists(ref))
+    if existing_refs:
+        return existing_refs
+    return _refs_for_fact(state, "memory_batch_staged")
+
+
+def _ordered_memory_consolidation_refs(state, runtime) -> tuple[str, ...]:  # noqa: ANN001
+    candidate_refs = tuple(
+        job_path(state.job, "memory", "consolidations", f"consolidation-{batch_id}.json")
+        for batch_id in state.memory_batch_ids
+    )
+    existing_refs = tuple(ref for ref in candidate_refs if runtime.blob_store.exists(ref))
+    if existing_refs:
+        return existing_refs
+    return _refs_for_fact(state, "memory_batch_consolidated")
 
 
 def _translation_failure_reasons(state: GraphState) -> list[str]:

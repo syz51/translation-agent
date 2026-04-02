@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -8,9 +9,18 @@ import pytest
 
 from translation_agent.api import RunJobRequest, run_job
 from translation_agent.config import Settings
+from translation_agent.graph import GraphState, build_phase_two_runtime
 from translation_agent.memory import ProposalBackedPromptResolver
-from translation_agent.models import JobContext, PromptChange, PromptEvolutionProposal
-from translation_agent.nodes.reference_evaluation import _parse_srt
+from translation_agent.models import (
+    EvaluatedRunReport,
+    HistoricalRunLink,
+    JobContext,
+    PromptChange,
+    PromptEvolutionProposal,
+    ReferenceTranscript,
+)
+from translation_agent.nodes.reference_evaluation import _load_historical_runs, _parse_srt
+from translation_agent.observability import NoOpTraceSink
 from translation_agent.storage import LocalBlobStore, SQLiteOperationalStore, asset_path, job_path
 
 pytestmark = pytest.mark.unit
@@ -227,3 +237,101 @@ def test_active_prompt_proposals_affect_prompt_resolution(tmp_path: Path) -> Non
         "assets/asset-id-asset-1/improvement-proposals/proposal-active.json",
     )
     assert resolved.resolution_mode == "active"
+
+
+def test_reference_evaluation_preserves_historical_link_order_under_parallel_loading(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_store = SQLiteOperationalStore(tmp_path / "state.sqlite3")
+    try:
+        blob_store = LocalBlobStore(tmp_path / "blobs")
+        source_ref = "jobs/run-reference-order-request.json"
+        blob_store.put_bytes(source_ref, b"{}\n")
+        runtime = build_phase_two_runtime(
+            blob_store=blob_store,
+            run_store=run_store,
+            trace_sink=NoOpTraceSink(),
+            source_artifact_ref=source_ref,
+            scenario="happy",
+        )
+        links = [
+            HistoricalRunLink(
+                run_id="run-b",
+                media_key="asset-id:asset-1",
+                job_id="job-b",
+                tenant_id="tenant-local",
+                project_id="project-local",
+                source_language="en",
+                target_language="fr",
+                created_at=datetime(2026, 4, 1, 0, 0, tzinfo=UTC),
+            ),
+            HistoricalRunLink(
+                run_id="run-a",
+                media_key="asset-id:asset-1",
+                job_id="job-a",
+                tenant_id="tenant-local",
+                project_id="project-local",
+                source_language="en",
+                target_language="fr",
+                created_at=datetime(2026, 4, 1, 1, 0, tzinfo=UTC),
+            ),
+        ]
+
+        first_started = threading.Event()
+        second_finished = threading.Event()
+
+        def fake_list_historical_run_links(media_key: str, *, exclude_run_id: str | None = None):  # noqa: ANN001
+            del media_key, exclude_run_id
+            return list(links)
+
+        def fake_evaluate(runtime, *, link, reference, trusted_transcript_ref):  # noqa: ANN001
+            del runtime, reference, trusted_transcript_ref
+            if link.run_id == "run-b":
+                first_started.set()
+                assert second_finished.wait(timeout=1)
+            else:
+                assert first_started.wait(timeout=1)
+                second_finished.set()
+            return EvaluatedRunReport(run=link, transcript=None, translation=None)
+
+        monkeypatch.setattr(run_store, "list_historical_run_links", fake_list_historical_run_links)
+        monkeypatch.setattr(
+            "translation_agent.nodes.reference_evaluation._evaluate_historical_run",
+            fake_evaluate,
+        )
+
+        reports = _load_historical_runs(
+            GraphState(
+                run_id="run-current",
+                job=_job("job-current"),
+                current_stage="reference_evaluation",
+                source_video_ref="input.mp4",
+                source_artifact_ref=source_ref,
+            ),
+            runtime,
+            reference=ReferenceTranscript(
+                reference_id="reference-current",
+                media_key="asset-id:asset-1",
+                asset_id="asset-1",
+                source="reference.srt",
+                format="srt",
+                segments=_parse_srt(
+                    "\n".join(
+                        [
+                            "1",
+                            "00:00:00,000 --> 00:00:01,000",
+                            "Hello",
+                            "",
+                        ]
+                    )
+                ),
+                full_text="Hello",
+                created_at=datetime(2026, 4, 1, 0, 0, tzinfo=UTC),
+            ),
+            trusted_transcript_ref="assets/asset-id-asset-1/references/transcript/latest.json",
+        )
+    finally:
+        run_store.close()
+
+    assert [report.run.run_id for report in reports] == ["run-b", "run-a"]

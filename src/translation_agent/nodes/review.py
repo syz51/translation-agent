@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from hashlib import sha256
 
 from translation_agent.graph.runtime import WorkflowRuntime
 from translation_agent.graph.state import GraphState, RoutingFact
 from translation_agent.models import (
+    MemoryBundle,
     ReviewBundle,
     TranscriptCandidate,
     TranslationCandidate,
@@ -25,6 +27,7 @@ from translation_agent.nodes.common import (
     translation_review_key,
     write_model_artifact,
 )
+from translation_agent.parallelism import ordered_parallel_map
 from translation_agent.review import (
     PARSER_VERSION,
     build_review_context,
@@ -34,6 +37,15 @@ from translation_agent.review import (
     review_bundle_from_draft,
     reviewer_roles_for_stage,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class _ReviewTask:
+    stage: ReviewStage
+    reviewer_role: str
+    candidates: tuple[TranscriptCandidate, ...] | tuple[TranslationCandidate, ...]
+    memory_bundle: MemoryBundle
+    final_transcript: TranscriptCandidate | None
 
 
 def review_transcripts(state: GraphState, runtime: WorkflowRuntime) -> dict[str, object]:
@@ -59,17 +71,19 @@ def review_transcripts(state: GraphState, runtime: WorkflowRuntime) -> dict[str,
         review_memory_bundle_key(state.job, TRANSCRIPT_REVIEW_STAGE),
         memory_bundle,
     )
-    review_ids = tuple(
-        _review_stage(
-            state=state,
-            runtime=runtime,
-            stage=TRANSCRIPT_REVIEW_STAGE,
-            reviewer_role=spec.reviewer_role,
-            candidates=candidates,
-            memory_bundle=memory_bundle,
-            final_transcript=None,
-        )
-        for spec in reviewer_roles_for_stage(TRANSCRIPT_REVIEW_STAGE)
+    review_ids = _generate_and_persist_reviews(
+        state=state,
+        runtime=runtime,
+        tasks=tuple(
+            _ReviewTask(
+                stage=TRANSCRIPT_REVIEW_STAGE,
+                reviewer_role=spec.reviewer_role,
+                candidates=tuple(candidates),
+                memory_bundle=memory_bundle,
+                final_transcript=None,
+            )
+            for spec in reviewer_roles_for_stage(TRANSCRIPT_REVIEW_STAGE)
+        ),
     )
     first_review_ref = transcript_review_key(state.job, review_ids[0])
     return {
@@ -129,17 +143,19 @@ def review_translations(state: GraphState, runtime: WorkflowRuntime) -> dict[str
         memory_bundle,
     )
     final_transcript = _load_final_transcript_candidate(state, runtime)
-    review_ids = tuple(
-        _review_stage(
-            state=state,
-            runtime=runtime,
-            stage=TRANSLATION_REVIEW_STAGE,
-            reviewer_role=spec.reviewer_role,
-            candidates=candidates,
-            memory_bundle=memory_bundle,
-            final_transcript=final_transcript,
-        )
-        for spec in reviewer_roles_for_stage(TRANSLATION_REVIEW_STAGE)
+    review_ids = _generate_and_persist_reviews(
+        state=state,
+        runtime=runtime,
+        tasks=tuple(
+            _ReviewTask(
+                stage=TRANSLATION_REVIEW_STAGE,
+                reviewer_role=spec.reviewer_role,
+                candidates=tuple(candidates),
+                memory_bundle=memory_bundle,
+                final_transcript=final_transcript,
+            )
+            for spec in reviewer_roles_for_stage(TRANSLATION_REVIEW_STAGE)
+        ),
     )
     first_review_ref = translation_review_key(state.job, review_ids[0])
     return {
@@ -163,23 +179,44 @@ def review_translations(state: GraphState, runtime: WorkflowRuntime) -> dict[str
     }
 
 
-def _review_stage(
+def _generate_and_persist_reviews(
     *,
     state: GraphState,
     runtime: WorkflowRuntime,
-    stage: ReviewStage,
-    reviewer_role: str,
-    candidates: list[TranscriptCandidate] | list[TranslationCandidate],
-    memory_bundle,
-    final_transcript: TranscriptCandidate | None,
-) -> str:
+    tasks: tuple[_ReviewTask, ...],
+) -> tuple[str, ...]:
+    gathered = ordered_parallel_map(
+        tasks,
+        max_workers=runtime.parallelism.review_max_workers,
+        worker=lambda task: _build_review_bundle(state=state, task=task),
+        sort_key=lambda input_index, _task: (input_index,),
+    )
+    review_ids: list[str] = []
+    for task, result in zip(tasks, gathered, strict=True):
+        if result.error is not None:
+            raise result.error
+        if result.value is None:  # pragma: no cover - defensive
+            raise RuntimeError(f"missing {task.stage} review result for {task.reviewer_role}")
+        review_ids.append(_persist_review(runtime, state.job, result.value))
+    return tuple(review_ids)
+
+
+def _build_review_bundle(
+    *,
+    state: GraphState,
+    task: _ReviewTask,
+) -> ReviewBundle:
+    stage = task.stage
+    reviewer_role = task.reviewer_role
+    candidates = task.candidates
+    final_transcript = task.final_transcript
     review_context = build_review_context(
         run_id=state.run_id,
         stage=stage,
         reviewer_role=reviewer_role,
         job=state.job,
         candidate_ids=tuple(candidate.candidate_id for candidate in candidates),
-        memory_bundle=memory_bundle,
+        memory_bundle=task.memory_bundle,
     )
     candidate_refs = tuple(
         transcript_candidate_key(state.job, candidate.candidate_id)
@@ -222,7 +259,7 @@ def _review_stage(
         raw_review_text=raw_review_text,
         draft=draft,
     ).model_copy(update={"parser_version": PARSER_VERSION})
-    return _persist_review(runtime, state.job, review)
+    return review
 
 
 def _load_final_transcript_candidate(
@@ -277,7 +314,7 @@ def _persist_review(runtime: WorkflowRuntime, job, review: ReviewBundle) -> str:
 def _raw_payload_refs(
     *,
     stage: ReviewStage,
-    candidates: list[TranscriptCandidate] | list[TranslationCandidate],
+    candidates: tuple[TranscriptCandidate, ...] | tuple[TranslationCandidate, ...],
 ) -> tuple[str, ...]:
     if stage == TRANSCRIPT_REVIEW_STAGE:
         return tuple(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -262,3 +263,100 @@ def test_openai_translation_adapter_splits_retryable_failed_chunks(
     assert stored_payload["chunking"]["executed_request_count"] == 2
     assert stored_payload["chunks"][0]["status"] == "split_after_retryable_failure"
     assert stored_payload["chunks"][0]["fallback_children"] == ["chunk-0.a", "chunk-0.b"]
+
+
+def test_openai_translation_adapter_preserves_chunk_order_under_parallel_completion(
+    tmp_path: Path,
+) -> None:
+    class CoordinatedTransport:
+        def __init__(self) -> None:
+            self.requests: list[HttpRequest] = []
+            self._chunk_zero_started = threading.Event()
+            self._chunk_one_finished = threading.Event()
+
+        def request(self, request: HttpRequest) -> HttpResponse:
+            self.requests.append(request)
+            assert request.body is not None
+            payload = json.loads(request.body.decode("utf-8"))
+            prompt = json.loads(payload["input"][1]["content"][0]["text"])
+            chunk_index = int(prompt["chunk"]["chunk_index"])
+            if chunk_index == 0:
+                self._chunk_zero_started.set()
+                assert self._chunk_one_finished.wait(timeout=1)
+                return _json_response(
+                    {
+                        "id": "resp-0",
+                        "output_text": json.dumps(
+                            {
+                                "full_text": "Bonjour alpha Bonjour beta",
+                                "segments": [
+                                    {"segment_id": "seg-1", "target_text": "Bonjour alpha"},
+                                    {"segment_id": "seg-2", "target_text": "Bonjour beta"},
+                                ],
+                            }
+                        ),
+                    }
+                )
+            assert self._chunk_zero_started.wait(timeout=1)
+            self._chunk_one_finished.set()
+            return _json_response(
+                {
+                    "id": "resp-1",
+                    "output_text": json.dumps(
+                        {
+                            "full_text": "Bonjour gamma Bonjour delta",
+                            "segments": [
+                                {"segment_id": "seg-3", "target_text": "Bonjour gamma"},
+                                {"segment_id": "seg-4", "target_text": "Bonjour delta"},
+                            ],
+                        }
+                    ),
+                }
+            )
+
+    blob_store = LocalBlobStore(tmp_path / "blobs")
+    transcript = _transcript_candidate().model_copy(
+        update={
+            "segments": (
+                *_transcript_candidate().segments,
+                Segment(
+                    segment_id="seg-4",
+                    start_ms=3_000,
+                    end_ms=4_000,
+                    speaker="speaker-2",
+                    source_text="Delta source",
+                ),
+            ),
+            "full_text": "Alpha source Beta source Gamma source Delta source",
+        }
+    )
+    transport = CoordinatedTransport()
+    adapter = OpenAITranslationAdapter(
+        api_key="test-key",  # pragma: allowlist secret
+        blob_store=blob_store,
+        transport=transport,
+        retry_policy=RetryPolicy(max_attempts=1),
+        sleep=lambda _: None,
+        max_chunk_workers=2,
+        max_chunk_characters=25,
+        max_chunk_segments=2,
+        context_segment_window=1,
+    )
+
+    candidate = adapter.generate_translation(transcript, "variant-a", _request_context())
+
+    assert [segment.segment_id for segment in candidate.segments] == [
+        "seg-1",
+        "seg-2",
+        "seg-3",
+        "seg-4",
+    ]
+    assert candidate.metadata["provider"]["response_ids"] == ["resp-0", "resp-1"]
+    stored_payload = json.loads(
+        blob_store.read_bytes(candidate.raw_response_ref or "").decode("utf-8")
+    )
+    assert [chunk["chunk_key"] for chunk in stored_payload["chunks"]] == ["chunk-0", "chunk-1"]
+    assert [chunk["segment_ids"] for chunk in stored_payload["chunks"]] == [
+        ["seg-1", "seg-2"],
+        ["seg-3", "seg-4"],
+    ]

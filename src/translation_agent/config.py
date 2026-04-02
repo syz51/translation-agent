@@ -76,6 +76,12 @@ class Settings(BaseSettings):
     default_target_language: str = "zh"
     translation_model_id: str = "gpt-5.4-mini"
     translation_prompt_version: str = "phase-3-v1"
+    transcription_max_workers: int | None = Field(default=None, ge=1, le=16)
+    translation_candidate_max_workers: int = Field(default=2, ge=1, le=16)
+    translation_chunk_max_workers: int = Field(default=4, ge=1, le=16)
+    review_max_workers: int = Field(default=2, ge=1, le=16)
+    reference_evaluation_max_workers: int = Field(default=4, ge=1, le=16)
+    memory_drain_max_workers: int = Field(default=2, ge=1, le=16)
     translation_max_chunk_characters: int = Field(default=5_000, ge=250, le=50_000)
     translation_max_chunk_segments: int = Field(default=100, ge=1, le=1_000)
     translation_context_segment_window: int = Field(default=2, ge=0, le=16)
@@ -98,6 +104,11 @@ class Settings(BaseSettings):
             self.trace_dir = self.trace_dir.expanduser().resolve()
         else:
             self.trace_dir = self.data_dir / "traces"
+        if self.transcription_max_workers is None:
+            self.transcription_max_workers = min(
+                _configured_transcription_provider_count(self.transcription_providers),
+                4,
+            )
 
 
 @dataclass(slots=True)
@@ -360,3 +371,9 @@ def _normalized_transcription_provider_tokens(
     else:
         raw_tokens = configured
     return tuple(token.strip().lower() for token in raw_tokens if token.strip())
+
+
+def _configured_transcription_provider_count(configured: str | tuple[str, ...] | None) -> int:
+    if configured is None:
+        return len(DEFAULT_TRANSCRIPTION_PROVIDERS)
+    return max(1, len(_normalized_transcription_provider_tokens(configured)))

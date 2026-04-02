@@ -2,18 +2,32 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from translation_agent.graph.runtime import WorkflowRuntime
 from translation_agent.graph.state import GraphState, RoutingFact
 from translation_agent.memory.recall import build_scope_key
-from translation_agent.models import MemoryWriteBatch
+from translation_agent.models import (
+    JobContext,
+    MemoryConsolidation,
+    MemoryWriteBatch,
+    PromptEvolutionProposal,
+)
 from translation_agent.nodes.common import (
     memory_batch_key,
     memory_consolidation_key,
     prompt_evolution_key,
     write_model_artifact,
 )
+from translation_agent.parallelism import ordered_parallel_map
 from translation_agent.publish.outputs import publish_outputs
 from translation_agent.storage import asset_path, job_scope_token, operational_job_key
+
+
+@dataclass(frozen=True, slots=True)
+class _MemoryDrainComputed:
+    consolidation: MemoryConsolidation
+    proposal: PromptEvolutionProposal | None
 
 
 def background_memory_pipeline(state: GraphState, runtime: WorkflowRuntime) -> dict[str, object]:
@@ -71,12 +85,34 @@ def drain_background_memory(state: GraphState, runtime: WorkflowRuntime) -> Grap
 
     storage_job_id = operational_job_key(state.job)
     routing_facts = list(state.routing_facts)
-    for batch_id in state.memory_batch_ids:
-        batch = runtime.memory_batch_store.get_batch(batch_id)
-        if batch is None or batch.consolidation_status == "consolidated":
-            continue
+    pending_batches = tuple(
+        batch
+        for batch_id in state.memory_batch_ids
+        if (batch := runtime.memory_batch_store.get_batch(batch_id)) is not None
+        and batch.consolidation_status != "consolidated"
+    )
+    if not pending_batches:
+        return state
+
+    max_workers = (
+        runtime.parallelism.memory_drain_max_workers
+        if _memory_drain_parallel_safe(runtime) and len(pending_batches) > 1
+        else 1
+    )
+    gathered = ordered_parallel_map(
+        pending_batches,
+        max_workers=max_workers,
+        worker=lambda batch: _compute_memory_drain(batch, runtime, job=state.job),
+        sort_key=lambda input_index, _batch: (input_index,),
+    )
+
+    for batch, result in zip(pending_batches, gathered, strict=True):
         try:
-            consolidation = runtime.memory_consolidation_backend.consolidate_batch(batch)
+            if result.error is not None:
+                raise result.error
+            if result.value is None:  # pragma: no cover - defensive
+                raise RuntimeError("missing memory drain result")
+
             updated_batch = batch.model_copy(update={"consolidation_status": "consolidated"})
             runtime.memory_batch_store.save_batch(updated_batch, storage_job_id=storage_job_id)
             write_model_artifact(
@@ -86,22 +122,19 @@ def drain_background_memory(state: GraphState, runtime: WorkflowRuntime) -> Grap
             )
             consolidation_ref = write_model_artifact(
                 runtime,
-                memory_consolidation_key(state.job, consolidation.consolidation_id),
-                consolidation,
+                memory_consolidation_key(state.job, result.value.consolidation.consolidation_id),
+                result.value.consolidation,
             )
             routing_facts.append(
                 RoutingFact(
                     stage="background_memory_pipeline",
                     fact_type="memory_batch_consolidated",
-                    value=consolidation.consolidation_id,
+                    value=result.value.consolidation.consolidation_id,
                     source_ref=consolidation_ref,
                 )
             )
-            proposal = runtime.prompt_evolution_backend.propose_prompt_evolution(
-                consolidation,
-                translation_model_id=_translation_model_id(updated_batch, runtime),
-                evidence_ref=consolidation_ref,
-            )
+
+            proposal = result.value.proposal
             if proposal is not None:
                 proposal_ref = prompt_evolution_key(state.job, proposal.proposal_id)
                 asset_proposal_ref = asset_path(
@@ -121,11 +154,7 @@ def drain_background_memory(state: GraphState, runtime: WorkflowRuntime) -> Grap
                         }
                     }
                 )
-                proposal_ref = write_model_artifact(
-                    runtime,
-                    proposal_ref,
-                    proposal,
-                )
+                proposal_ref = write_model_artifact(runtime, proposal_ref, proposal)
                 write_model_artifact(runtime, asset_proposal_ref, proposal)
                 save_proposal = getattr(runtime.run_store, "save_prompt_evolution_proposal", None)
                 if callable(save_proposal):
@@ -246,3 +275,34 @@ def _translation_model_id(batch: MemoryWriteBatch, runtime: WorkflowRuntime) -> 
     if batch.source_stage != "translation_adjudication":
         return None
     return batch.translation_model_winner or getattr(runtime.translation_adapter, "model_id", None)
+
+
+def _memory_drain_parallel_safe(runtime: WorkflowRuntime) -> bool:
+    consolidation_backend = runtime.memory_consolidation_backend
+    # Current deterministic consolidation writes through a shared store internally,
+    # so keep draining serial unless a backend explicitly opts into safe parallel compute.
+    supports_parallel_compute = bool(
+        getattr(consolidation_backend, "supports_parallel_compute", False)
+        or getattr(consolidation_backend, "supports_parallel_compute_only", False)
+    )
+    if hasattr(consolidation_backend, "_store"):
+        return False
+    return supports_parallel_compute
+
+
+def _compute_memory_drain(
+    batch: MemoryWriteBatch,
+    runtime: WorkflowRuntime,
+    *,
+    job: JobContext,
+) -> _MemoryDrainComputed:
+    consolidation = runtime.memory_consolidation_backend.consolidate_batch(batch)
+    proposal = runtime.prompt_evolution_backend.propose_prompt_evolution(
+        consolidation,
+        translation_model_id=_translation_model_id(batch, runtime),
+        evidence_ref=memory_consolidation_key(job, consolidation.consolidation_id),
+    )
+    return _MemoryDrainComputed(
+        consolidation=consolidation,
+        proposal=proposal,
+    )

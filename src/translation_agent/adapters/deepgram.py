@@ -54,6 +54,18 @@ class DeepgramTranscriptionAdapter:
         audio_artifact: AudioArtifact,
         request_context: RequestContext,
     ) -> TranscriptCandidate:
+        candidate, raw_payload = self.transcribe_with_payload(audio_artifact, request_context)
+        self._blob_store.put_bytes(
+            candidate.raw_payload_ref or "",
+            (json.dumps(raw_payload, indent=2, sort_keys=True) + "\n").encode("utf-8"),
+        )
+        return candidate
+
+    def transcribe_with_payload(
+        self,
+        audio_artifact: AudioArtifact,
+        request_context: RequestContext,
+    ) -> tuple[TranscriptCandidate, dict[str, Any]]:
         audio_bytes = self._blob_store.read_bytes(audio_artifact.blob_ref)
         payload = perform_with_retries(
             lambda: self._transcribe_once(audio_artifact, audio_bytes, request_context),
@@ -67,15 +79,14 @@ class DeepgramTranscriptionAdapter:
             "provider-payloads",
             f"{self.provider_id}.json",
         )
-        self._blob_store.put_bytes(
-            raw_payload_ref,
-            (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8"),
-        )
-        return _candidate_from_payload(
+        return (
+            _candidate_from_payload(
+                payload,
+                request_context=request_context,
+                language=request_context.job.source_language,
+                raw_payload_ref=raw_payload_ref,
+            ),
             payload,
-            request_context=request_context,
-            language=request_context.job.source_language,
-            raw_payload_ref=raw_payload_ref,
         )
 
     def _transcribe_once(

@@ -1,16 +1,34 @@
 from __future__ import annotations
 
-import time
+import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
-from translation_agent.graph import GraphState, build_phase_two_runtime, run_workflow
-from translation_agent.models import JobContext, Segment, TranscriptCandidate
+from translation_agent.graph import GraphState, RoutingFact, build_phase_two_runtime, run_workflow
+from translation_agent.models import (
+    JobContext,
+    RequestContext,
+    Segment,
+    TranscriptCandidate,
+    TranslationCandidate,
+)
+from translation_agent.nodes.translate import (
+    _translation_candidate_id,
+    generate_translation_candidates,
+)
 from translation_agent.observability import NoOpTraceSink
-from translation_agent.storage import LocalBlobStore, NodeExecutionRecord, RunRecord, job_path
+from translation_agent.storage import (
+    LocalBlobStore,
+    NodeExecutionRecord,
+    RunRecord,
+    SQLiteOperationalStore,
+    job_path,
+    operational_job_key,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -311,40 +329,49 @@ def test_phase_two_transcription_fanout_runs_in_parallel(tmp_path: Path) -> None
         scenario="happy",
     )
 
+    start_barrier = threading.Barrier(3, timeout=1.0)
+
     class SlowAdapter:
         def __init__(self, provider_id: str, rank: int) -> None:
             self.provider_id = provider_id
             self.rank = rank
 
         def transcribe(self, audio_artifact, request_context):  # noqa: ANN001
+            candidate, _ = self.transcribe_with_payload(audio_artifact, request_context)
+            return candidate
+
+        def transcribe_with_payload(self, audio_artifact, request_context):  # noqa: ANN001
             del audio_artifact
-            time.sleep(0.2)
-            return TranscriptCandidate(
-                candidate_id=f"tr-{self.provider_id}-{request_context.job.job_id}",
-                job_id=request_context.job.job_id,
-                provider_id=self.provider_id,
-                provider_request_id=f"req-{self.provider_id}",
-                language=request_context.job.source_language,
-                segments=(
-                    Segment(
-                        segment_id=f"seg-{self.provider_id}-1",
-                        start_ms=0,
-                        end_ms=1000,
-                        speaker="speaker-1",
-                        source_text=f"text-{self.provider_id}",
+            start_barrier.wait()
+            return (
+                TranscriptCandidate(
+                    candidate_id=f"tr-{self.provider_id}-{request_context.job.job_id}",
+                    job_id=request_context.job.job_id,
+                    provider_id=self.provider_id,
+                    provider_request_id=f"req-{self.provider_id}",
+                    language=request_context.job.source_language,
+                    segments=(
+                        Segment(
+                            segment_id=f"seg-{self.provider_id}-1",
+                            start_ms=0,
+                            end_ms=1000,
+                            speaker="speaker-1",
+                            source_text=f"text-{self.provider_id}",
+                        ),
                     ),
+                    full_text=f"text-{self.provider_id}",
+                    speaker_map={"speaker-1": "Host"},
+                    timing_resolution="segment",
+                    raw_payload_ref=job_path(
+                        request_context.job,
+                        "raw",
+                        "provider-payloads",
+                        f"{self.provider_id}.json",
+                    ),
+                    normalization_version="test",
+                    metadata={"provider_rank": self.rank},
                 ),
-                full_text=f"text-{self.provider_id}",
-                speaker_map={"speaker-1": "Host"},
-                timing_resolution="segment",
-                raw_payload_ref=job_path(
-                    request_context.job,
-                    "raw",
-                    "provider-payloads",
-                    f"{self.provider_id}.json",
-                ),
-                normalization_version="test",
-                metadata={"provider_rank": self.rank},
+                {"provider": self.provider_id, "text": f"text-{self.provider_id}"},
             )
 
     runtime.transcription_adapters = (
@@ -353,7 +380,6 @@ def test_phase_two_transcription_fanout_runs_in_parallel(tmp_path: Path) -> None
         SlowAdapter("deepgram", 2),
     )
 
-    started = time.monotonic()
     final_state = run_workflow(
         GraphState(
             run_id="run-123",
@@ -364,7 +390,217 @@ def test_phase_two_transcription_fanout_runs_in_parallel(tmp_path: Path) -> None
         ),
         runtime,
     )
-    elapsed = time.monotonic() - started
 
     assert final_state.current_stage == "finalize_outputs"
-    assert elapsed < 0.45
+
+
+def test_generate_translation_candidates_preserves_task_order_and_partial_failures(
+    tmp_path: Path,
+) -> None:
+    run_store = InMemoryRunStore()
+    run_store.create_run(run_id="run-translation-order", status="running")
+    blob_store = LocalBlobStore(tmp_path / "blobs")
+    source_ref = "jobs/run-translation-order-request.json"
+    blob_store.put_bytes(source_ref, b"{}\n")
+    runtime = build_phase_two_runtime(
+        blob_store=blob_store,
+        run_store=run_store,
+        trace_sink=NoOpTraceSink(),
+        source_artifact_ref=source_ref,
+        scenario="happy",
+    )
+    job = _job_context(job_id="job-translation-order")
+    storage_job_id = operational_job_key(job)
+    transcript_a = TranscriptCandidate(
+        candidate_id="tr-a",
+        job_id=job.job_id,
+        provider_id="assemblyai",
+        provider_request_id="req-a",
+        language=job.source_language,
+        segments=(
+            Segment(
+                segment_id="seg-a",
+                start_ms=0,
+                end_ms=1_000,
+                speaker="speaker-1",
+                source_text="Alpha",
+            ),
+        ),
+        full_text="Alpha",
+        speaker_map={"speaker-1": "Host"},
+        timing_resolution="segment",
+        raw_payload_ref="raw/tr-a.json",
+        normalization_version="test",
+        metadata={"provider_rank": 0},
+    )
+    transcript_b = transcript_a.model_copy(
+        update={
+            "candidate_id": "tr-b",
+            "provider_request_id": "req-b",
+            "full_text": "Beta",
+            "segments": (
+                Segment(
+                    segment_id="seg-b",
+                    start_ms=0,
+                    end_ms=1_000,
+                    speaker="speaker-1",
+                    source_text="Beta",
+                ),
+            ),
+            "raw_payload_ref": "raw/tr-b.json",
+            "metadata": {"provider_rank": 1},
+        }
+    )
+    runtime.decision_store.save_transcript_candidate(transcript_a, storage_job_id=storage_job_id)
+    runtime.decision_store.save_transcript_candidate(transcript_b, storage_job_id=storage_job_id)
+
+    class RawAdapter:
+        model_id = "gpt-5.4-mini"
+        _prompt_version = "phase-3-v1"
+
+        def __init__(self) -> None:
+            self._first_variant_started = threading.Event()
+            self._second_variant_released = threading.Event()
+
+        def generate_translation(
+            self,
+            final_transcript: TranscriptCandidate,
+            prompt_variant_id: str,
+            request_context: RequestContext,
+        ) -> TranslationCandidate:
+            candidate, _ = self.generate_translation_with_payload(
+                final_transcript,
+                prompt_variant_id,
+                request_context,
+            )
+            return candidate
+
+        def generate_translation_with_payload(
+            self,
+            transcript: TranscriptCandidate,
+            prompt_variant_id: str,
+            request_context: RequestContext,
+        ) -> tuple[TranslationCandidate, dict[str, object]]:
+            if transcript.candidate_id == "tr-a" and prompt_variant_id == "variant-a":
+                self._first_variant_started.set()
+                assert self._second_variant_released.wait(timeout=1)
+            if transcript.candidate_id == "tr-a" and prompt_variant_id == "variant-b":
+                assert self._first_variant_started.wait(timeout=1)
+                self._second_variant_released.set()
+            if transcript.candidate_id == "tr-b" and prompt_variant_id == "variant-a":
+                raise RuntimeError("boom-tr-b-variant-a")
+            target_text = f"{transcript.full_text}-{prompt_variant_id}"
+            candidate = TranslationCandidate(
+                candidate_id=f"raw-{transcript.candidate_id}-{prompt_variant_id}",
+                job_id=request_context.job.job_id,
+                source_transcript_candidate_id=transcript.candidate_id,
+                model_id=self.model_id,
+                prompt_variant_id=prompt_variant_id,
+                prompt_version="raw-prompt",
+                language=request_context.job.target_language,
+                segments=(transcript.segments[0].model_copy(update={"target_text": target_text}),),
+                full_text=target_text,
+                raw_response_ref=None,
+                normalization_version="raw-test",
+                metadata={},
+            )
+            return candidate, {"candidate": candidate.candidate_id}
+
+    runtime.translation_adapter = cast(Any, RawAdapter())
+    state = GraphState(
+        run_id="run-translation-order",
+        job=job,
+        current_stage="generate_translation_candidates",
+        source_video_ref="input.mp4",
+        source_artifact_ref=source_ref,
+        transcript_candidate_ids=("tr-a", "tr-b"),
+    )
+
+    output = generate_translation_candidates(state, runtime)
+
+    assert output["translation_failed"] is False
+    assert output["raw_translation_payload_refs"] == (
+        job_path(job, "raw", "translation-candidates", "variant-a-tr-a.json"),
+        job_path(job, "raw", "translation-candidates", "variant-b-tr-a.json"),
+        job_path(job, "raw", "translation-candidates", "variant-b-tr-b.json"),
+    )
+    assert output["raw_translation_candidate_refs"] == (
+        job_path(
+            job,
+            "staging",
+            "translations",
+            f"{_translation_candidate_id('variant-a', 'tr-a', job.job_id)}.json",
+        ),
+        job_path(
+            job,
+            "staging",
+            "translations",
+            f"{_translation_candidate_id('variant-b', 'tr-a', job.job_id)}.json",
+        ),
+        job_path(
+            job,
+            "staging",
+            "translations",
+            f"{_translation_candidate_id('variant-b', 'tr-b', job.job_id)}.json",
+        ),
+    )
+    routing_facts = cast(tuple[RoutingFact, ...], output["routing_facts"])
+    failed_facts = [
+        fact for fact in routing_facts if fact.fact_type == "translation_variant_failed"
+    ]
+    assert [(fact.value, fact.source_ref) for fact in failed_facts] == [
+        ("variant-a:tr-b", "boom-tr-b-variant-a"),
+    ]
+
+
+def test_sqlite_runtime_store_writes_stay_on_main_thread(tmp_path: Path) -> None:
+    main_thread_id = threading.get_ident()
+    store = SQLiteOperationalStore(tmp_path / "state.sqlite3")
+    write_threads: list[int] = []
+    try:
+        for method_name in (
+            "create_run",
+            "update_run",
+            "create_node_execution",
+            "update_node_execution",
+            "save_transcript_candidate",
+            "save_translation_candidate",
+            "save_transcript_decision",
+            "save_translation_decision",
+            "save_batch",
+        ):
+            original = getattr(store, method_name)
+
+            def wrapped(*args, __original=original, **kwargs):  # noqa: ANN002, ANN003
+                write_threads.append(threading.get_ident())
+                return __original(*args, **kwargs)
+
+            setattr(store, method_name, wrapped)
+
+        blob_store = LocalBlobStore(tmp_path / "blobs")
+        source_ref = "jobs/run-sqlite-request.json"
+        blob_store.put_bytes(source_ref, b"{}\n")
+        store.create_run(run_id="run-sqlite", status="running")
+        runtime = build_phase_two_runtime(
+            blob_store=blob_store,
+            run_store=store,
+            trace_sink=NoOpTraceSink(),
+            source_artifact_ref=source_ref,
+            scenario="happy",
+        )
+
+        run_workflow(
+            GraphState(
+                run_id="run-sqlite",
+                job=_job_context(job_id="job-sqlite"),
+                current_stage="ingest",
+                source_video_ref="input.mp4",
+                source_artifact_ref=source_ref,
+            ),
+            runtime,
+        )
+    finally:
+        store.close()
+
+    assert write_threads
+    assert set(write_threads) == {main_thread_id}

@@ -52,6 +52,15 @@ class AssemblyAITranscriptionAdapter:
         audio_artifact: AudioArtifact,
         request_context: RequestContext,
     ) -> TranscriptCandidate:
+        candidate, raw_payload = self.transcribe_with_payload(audio_artifact, request_context)
+        self._store_raw_payload(candidate.raw_payload_ref or "", raw_payload)
+        return candidate
+
+    def transcribe_with_payload(
+        self,
+        audio_artifact: AudioArtifact,
+        request_context: RequestContext,
+    ) -> tuple[TranscriptCandidate, dict[str, Any]]:
         audio_bytes = self._blob_store.read_bytes(audio_artifact.blob_ref)
         upload_payload = perform_with_retries(
             lambda: self._upload_audio(audio_bytes),
@@ -86,12 +95,14 @@ class AssemblyAITranscriptionAdapter:
             "provider-payloads",
             f"{self.provider_id}.json",
         )
-        self._store_raw_payload(raw_payload_ref, final_payload)
-        return _candidate_from_payload(
+        return (
+            _candidate_from_payload(
+                final_payload,
+                request_context=request_context,
+                language=request_context.job.source_language,
+                raw_payload_ref=raw_payload_ref,
+            ),
             final_payload,
-            request_context=request_context,
-            language=request_context.job.source_language,
-            raw_payload_ref=raw_payload_ref,
         )
 
     def _upload_audio(self, audio_bytes: bytes) -> dict[str, Any]:

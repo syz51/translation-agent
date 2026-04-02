@@ -44,6 +44,7 @@ from translation_agent.nodes.common import (
     select_translation_candidates,
     write_model_artifact,
 )
+from translation_agent.parallelism import ordered_parallel_map
 from translation_agent.storage import asset_path, operational_job_key
 
 _WORD_RE = re.compile(r"[A-Za-z0-9']+")
@@ -424,37 +425,63 @@ def _load_historical_runs(
     )
     if not callable(list_links):
         return []
-    reports: list[EvaluatedRunReport] = []
-    for link in list_links(
-        state.job.media_key,
-        exclude_run_id=state.run_id,
-    ):
-        transcript_report = None
-        if link.transcript_ref and runtime.blob_store.exists(link.transcript_ref):
-            transcript = read_model_artifact(runtime, link.transcript_ref, TranscriptCandidate)
-            transcript_report = _evaluate_transcript(
-                link=link,
-                reference=reference,
-                transcript=transcript,
-                trusted_transcript_ref=trusted_transcript_ref,
-            )
-        translation_report = None
-        if link.translation_ref and runtime.blob_store.exists(link.translation_ref):
-            translation = read_model_artifact(runtime, link.translation_ref, TranslationCandidate)
-            translation_report = _evaluate_translation(
-                link=link,
-                reference=reference,
-                translation=translation,
-                trusted_transcript_ref=trusted_transcript_ref,
-            )
-        reports.append(
-            EvaluatedRunReport(
-                run=link,
-                transcript=transcript_report,
-                translation=translation_report,
-            )
+    links = tuple(
+        list_links(
+            state.job.media_key,
+            exclude_run_id=state.run_id,
         )
+    )
+    gathered = ordered_parallel_map(
+        links,
+        max_workers=runtime.parallelism.reference_evaluation_max_workers,
+        worker=lambda link: _evaluate_historical_run(
+            runtime,
+            link=link,
+            reference=reference,
+            trusted_transcript_ref=trusted_transcript_ref,
+        ),
+        sort_key=lambda input_index, _link: (input_index,),
+    )
+    reports: list[EvaluatedRunReport] = []
+    for result in gathered:
+        if result.error is not None:
+            raise result.error
+        if result.value is None:  # pragma: no cover - defensive
+            raise RuntimeError("missing historical evaluation result")
+        reports.append(result.value)
     return reports
+
+
+def _evaluate_historical_run(
+    runtime: WorkflowRuntime,
+    *,
+    link: HistoricalRunLink,
+    reference: ReferenceTranscript,
+    trusted_transcript_ref: str,
+) -> EvaluatedRunReport:
+    transcript_report = None
+    if link.transcript_ref and runtime.blob_store.exists(link.transcript_ref):
+        transcript = read_model_artifact(runtime, link.transcript_ref, TranscriptCandidate)
+        transcript_report = _evaluate_transcript(
+            link=link,
+            reference=reference,
+            transcript=transcript,
+            trusted_transcript_ref=trusted_transcript_ref,
+        )
+    translation_report = None
+    if link.translation_ref and runtime.blob_store.exists(link.translation_ref):
+        translation = read_model_artifact(runtime, link.translation_ref, TranslationCandidate)
+        translation_report = _evaluate_translation(
+            link=link,
+            reference=reference,
+            translation=translation,
+            trusted_transcript_ref=trusted_transcript_ref,
+        )
+    return EvaluatedRunReport(
+        run=link,
+        transcript=transcript_report,
+        translation=translation_report,
+    )
 
 
 def _evaluate_transcript(

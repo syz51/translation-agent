@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -19,9 +21,15 @@ from translation_agent.models import (
     TranslationCandidate,
 )
 from translation_agent.models.review import ReviewStage
+from translation_agent.nodes.review import review_transcripts, review_translations
 from translation_agent.observability import NoOpTraceSink
-from translation_agent.review import adjudicate_reviews, parse_reviewer_output
+from translation_agent.review import (
+    adjudicate_reviews,
+    parse_reviewer_output,
+    reviewer_roles_for_stage,
+)
 from translation_agent.storage import LocalBlobStore, NodeExecutionRecord, RunRecord, job_path
+from translation_agent.storage.paths import operational_job_key
 
 pytestmark = pytest.mark.unit
 
@@ -308,6 +316,92 @@ Escalate?: yes
     assert parsed.issues[0].severity == "major"
     assert parsed.quoted_evidence[1].segment_id == "seg-b"
     assert parsed.suggested_fixes[0].candidate_id == "tl-variant-b"
+
+
+def test_parallel_review_generation_preserves_review_id_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_store = InMemoryRunStore()
+    run_store.create_run(run_id="run-review-order", status="running")
+    blob_store = LocalBlobStore(tmp_path / "blobs")
+    source_ref = "jobs/run-review-order-request.json"
+    blob_store.put_bytes(source_ref, b"{}\n")
+    runtime = build_phase_two_runtime(
+        blob_store=blob_store,
+        run_store=run_store,
+        trace_sink=NoOpTraceSink(),
+        source_artifact_ref=source_ref,
+        scenario="happy",
+    )
+    job = _job_context(job_id="job-review-order")
+    storage_job_id = operational_job_key(job)
+    transcript = _transcript_candidate("tr-final", "Hello world from provider A.")
+    translation_a = _translation_candidate("tl-a", "Bonjour du workflow.", "variant-a")
+    translation_b = _translation_candidate("tl-b", "Salut du workflow.", "variant-b")
+    runtime.decision_store.save_transcript_candidate(transcript, storage_job_id=storage_job_id)
+    runtime.decision_store.save_translation_candidate(translation_a, storage_job_id=storage_job_id)
+    runtime.decision_store.save_translation_candidate(translation_b, storage_job_id=storage_job_id)
+
+    first_role = reviewer_roles_for_stage("transcript")[0].reviewer_role
+    gate_started = threading.Event()
+    gate_release = threading.Event()
+
+    def delayed_render(review_context, candidates, prompt_text, final_transcript):  # noqa: ANN001
+        del candidates, prompt_text, final_transcript
+        if review_context.reviewer_role == first_role:
+            gate_started.set()
+            assert gate_release.wait(timeout=1)
+        else:
+            assert gate_started.wait(timeout=1)
+            gate_release.set()
+        return f"review:{review_context.stage}:{review_context.reviewer_role}"
+
+    monkeypatch.setattr("translation_agent.nodes.review.render_reviewer_output", delayed_render)
+
+    transcript_result = review_transcripts(
+        GraphState(
+            run_id="run-review-order",
+            job=job,
+            current_stage="review_transcripts",
+            source_video_ref="input.mp4",
+            source_artifact_ref=source_ref,
+            transcript_candidate_ids=("tr-final",),
+        ),
+        runtime,
+    )
+    translation_result = review_translations(
+        GraphState(
+            run_id="run-review-order",
+            job=job,
+            current_stage="review_translations",
+            source_video_ref="input.mp4",
+            source_artifact_ref=source_ref,
+            transcript_candidate_ids=("tr-final",),
+            translation_candidate_ids=("tl-a", "tl-b"),
+            final_transcript_candidate_id="tr-final",
+        ),
+        runtime,
+    )
+
+    transcript_roles = [
+        ReviewBundle.model_validate_json(
+            blob_store.read_bytes(job_path(job, "reviews", "transcript", f"{review_id}.json"))
+        ).reviewer_role
+        for review_id in cast(tuple[str, ...], transcript_result["transcript_review_ids"])
+    ]
+    translation_roles = [
+        ReviewBundle.model_validate_json(
+            blob_store.read_bytes(job_path(job, "reviews", "translation", f"{review_id}.json"))
+        ).reviewer_role
+        for review_id in cast(tuple[str, ...], translation_result["translation_review_ids"])
+    ]
+    assert transcript_roles == [
+        spec.reviewer_role for spec in reviewer_roles_for_stage("transcript")
+    ]
+    assert translation_roles == [
+        spec.reviewer_role for spec in reviewer_roles_for_stage("translation")
+    ]
 
 
 def test_parse_reviewer_output_rejects_missing_sections() -> None:

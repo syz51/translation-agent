@@ -24,6 +24,8 @@ class MemoryConsolidationBackend(Protocol):
 class DeterministicMemoryConsolidationBackend:
     """Reference consolidation backend with stable dedupe semantics."""
 
+    supports_parallel_compute_only = False
+
     def __init__(self, store: MemoryEntryStore) -> None:
         self._store = store
 

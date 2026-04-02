@@ -28,6 +28,7 @@ from translation_agent.models import (
     MemoryWrite,
     MemoryWriteBatch,
 )
+from translation_agent.nodes.memory_pipeline import drain_background_memory
 from translation_agent.observability import NoOpTraceSink
 from translation_agent.publish.outputs import publish_outputs
 from translation_agent.storage import (
@@ -36,6 +37,7 @@ from translation_agent.storage import (
     RunRecord,
     job_path,
     job_scope_token,
+    operational_job_key,
 )
 
 pytestmark = pytest.mark.unit
@@ -255,6 +257,33 @@ def test_phase_five_happy_path_publishes_audit_ready_outputs(tmp_path: Path) -> 
     )
 
 
+def test_phase_five_memory_drain_preserves_batch_order_in_routing_and_manifest(
+    tmp_path: Path,
+) -> None:
+    final_state, _, blob_store = _run_workflow(tmp_path, scenario="happy")
+
+    consolidated_ids = [
+        fact.value
+        for fact in final_state.routing_facts
+        if fact.fact_type == "memory_batch_consolidated"
+    ]
+    manifest = json.loads(
+        blob_store.read_bytes(_artifact_path("published", "artifacts.json")).decode("utf-8")
+    )
+
+    assert consolidated_ids == [
+        f"consolidation-{batch_id}" for batch_id in final_state.memory_batch_ids
+    ]
+    assert manifest["memory_batch_refs"] == [
+        _artifact_path("memory", "batches", f"{batch_id}.json")
+        for batch_id in final_state.memory_batch_ids
+    ]
+    assert manifest["memory_consolidation_refs"] == [
+        _artifact_path("memory", "consolidations", f"consolidation-{batch_id}.json")
+        for batch_id in final_state.memory_batch_ids
+    ]
+
+
 def test_phase_five_translation_failure_publishes_recoverable_manifest(tmp_path: Path) -> None:
     _, _, blob_store = _run_workflow(tmp_path, scenario="translation_failed")
 
@@ -338,6 +367,110 @@ def test_phase_five_background_memory_failures_do_not_block_finalization(tmp_pat
     assert final_state.current_stage == "finalize_outputs"
     failed_job = _job_context(job_id="job-phase-five-failing-memory")
     assert blob_store.exists(job_path(failed_job, "published", "translation.json"))
+
+
+def test_phase_five_multi_batch_drain_keeps_routing_and_manifest_order(
+    tmp_path: Path,
+) -> None:
+    final_state, runtime, blob_store = _run_workflow(tmp_path, scenario="happy")
+    scope_token = job_scope_token(_job_context())
+    extra_batches = (
+        MemoryWriteBatch(
+            batch_id=f"batch-extra-a-{scope_token}",
+            job_id=_job_context().job_id,
+            source_stage="translation_adjudication",
+            semantic_writes=(
+                MemoryWrite(
+                    kind="semantic",
+                    content="Batch A memory.",
+                    scope_kind="pair",
+                    scope_key="en::fr",
+                ),
+            ),
+            metadata={
+                "tenant_id": _job_context().tenant_id,
+                "project_id": _job_context().project_id,
+                "source_language": _job_context().source_language,
+                "target_language": _job_context().target_language,
+            },
+        ),
+        MemoryWriteBatch(
+            batch_id=f"batch-extra-b-{scope_token}",
+            job_id=_job_context().job_id,
+            source_stage="translation_adjudication",
+            semantic_writes=(
+                MemoryWrite(
+                    kind="semantic",
+                    content="Batch B memory.",
+                    scope_kind="pair",
+                    scope_key="en::fr",
+                ),
+            ),
+            metadata={
+                "tenant_id": _job_context().tenant_id,
+                "project_id": _job_context().project_id,
+                "source_language": _job_context().source_language,
+                "target_language": _job_context().target_language,
+            },
+        ),
+    )
+    for batch in extra_batches:
+        runtime.memory_batch_store.save_batch(
+            batch,
+            storage_job_id=operational_job_key(_job_context()),
+        )
+        blob_store.put_bytes(
+            job_path(_job_context(), "memory", "batches", f"{batch.batch_id}.json"),
+            (json.dumps(batch.model_dump(mode="json"), indent=2, sort_keys=True) + "\n").encode(
+                "utf-8"
+            ),
+        )
+
+    drained = drain_background_memory(
+        final_state.model_copy(
+            update={
+                "memory_batch_ids": (
+                    *final_state.memory_batch_ids,
+                    *(batch.batch_id for batch in extra_batches),
+                )
+            }
+        ),
+        runtime,
+    )
+
+    consolidated_values = [
+        fact.value
+        for fact in drained.routing_facts
+        if fact.stage == "background_memory_pipeline"
+        and fact.fact_type == "memory_batch_consolidated"
+        and "batch-extra" in fact.value
+    ]
+    manifest = json.loads(
+        blob_store.read_bytes(job_path(_job_context(), "published", "artifacts.json")).decode(
+            "utf-8"
+        )
+    )
+    assert consolidated_values == [
+        f"consolidation-{extra_batches[0].batch_id}",
+        f"consolidation-{extra_batches[1].batch_id}",
+    ]
+    extra_consolidation_refs = [
+        ref for ref in manifest["memory_consolidation_refs"] if "batch-extra" in ref
+    ]
+    assert extra_consolidation_refs == [
+        job_path(
+            _job_context(),
+            "memory",
+            "consolidations",
+            f"consolidation-{extra_batches[0].batch_id}.json",
+        ),
+        job_path(
+            _job_context(),
+            "memory",
+            "consolidations",
+            f"consolidation-{extra_batches[1].batch_id}.json",
+        ),
+    ]
 
 
 def test_phase_five_memory_consolidation_dedupes_and_scopes_recall() -> None:

@@ -23,6 +23,8 @@ class PromptEvolutionBackend(Protocol):
 class DeterministicPromptEvolutionBackend:
     """Mainline adjudication no longer emits prompt proposals directly."""
 
+    supports_parallel_compute_only = True
+
     def propose_prompt_evolution(
         self,
         consolidation: MemoryConsolidation,

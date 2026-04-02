@@ -59,6 +59,76 @@ def test_phase_three_runtime_uses_translation_timeout_and_chunk_settings(
     )
 
     assert captured_kwargs["timeout_seconds"] == 95.0
+    assert captured_kwargs["max_chunk_workers"] == 4
     assert captured_kwargs["max_chunk_characters"] == 4321
     assert captured_kwargs["max_chunk_segments"] == 87
     assert captured_kwargs["context_segment_window"] == 3
+
+
+def test_phase_three_runtime_wires_parallelism_settings(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        "translation_agent.graph.runtime.ensure_langgraph_runtime_supported",
+        lambda: None,
+    )
+    settings = Settings(
+        adapter_mode="real",
+        allow_langgraph_py314_warning=True,
+        state_db_dsn="postgresql://user:pass@db.example.com:5432/app",  # pragma: allowlist secret
+        assemblyai_api_key="assembly",  # pragma: allowlist secret
+        speechmatics_api_key="speech",  # pragma: allowlist secret
+        openai_api_key="openai",  # pragma: allowlist secret
+        transcription_providers="assemblyai,speechmatics",
+        transcription_max_workers=2,
+        translation_candidate_max_workers=3,
+        translation_chunk_max_workers=5,
+        review_max_workers=4,
+        reference_evaluation_max_workers=6,
+        memory_drain_max_workers=2,
+    )
+
+    runtime = build_phase_three_runtime(
+        settings=settings,
+        blob_store=LocalBlobStore(tmp_path / "blobs"),
+        run_store=cast(Any, InMemoryRunStore()),
+        trace_sink=NoOpTraceSink(),
+        source_artifact_ref="jobs/request.json",
+    )
+
+    assert runtime.parallelism.transcription_max_workers == 2
+    assert runtime.parallelism.translation_candidate_max_workers == 3
+    assert runtime.parallelism.translation_chunk_max_workers == 5
+    assert runtime.parallelism.review_max_workers == 4
+    assert runtime.parallelism.reference_evaluation_max_workers == 6
+    assert runtime.parallelism.memory_drain_max_workers == 2
+
+
+def test_phase_three_runtime_defaults_transcription_workers_to_selected_provider_count(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        "translation_agent.graph.runtime.ensure_langgraph_runtime_supported",
+        lambda: None,
+    )
+    settings = Settings(
+        adapter_mode="real",
+        allow_langgraph_py314_warning=True,
+        state_db_dsn="postgresql://user:pass@db.example.com:5432/app",  # pragma: allowlist secret
+        assemblyai_api_key="assembly",  # pragma: allowlist secret
+        deepgram_api_key="deepgram",  # pragma: allowlist secret
+        openai_api_key="openai",  # pragma: allowlist secret
+        transcription_providers="assemblyai,deepgram",
+    )
+
+    runtime = build_phase_three_runtime(
+        settings=settings,
+        blob_store=LocalBlobStore(tmp_path / "blobs"),
+        run_store=cast(Any, InMemoryRunStore()),
+        trace_sink=NoOpTraceSink(),
+        source_artifact_ref="jobs/request.json",
+    )
+
+    assert runtime.parallelism.transcription_max_workers == 2

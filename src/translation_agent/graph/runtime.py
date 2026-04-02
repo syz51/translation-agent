@@ -49,6 +49,7 @@ from translation_agent.models import (
     TranslationCandidate,
 )
 from translation_agent.observability import TraceSink
+from translation_agent.parallelism import RuntimeParallelismPolicy
 from translation_agent.storage import (
     BlobStore,
     DecisionStore,
@@ -80,6 +81,7 @@ class WorkflowRuntime:
     memory_consolidation_backend: MemoryConsolidationBackend
     prompt_evolution_backend: PromptEvolutionBackend
     prompt_resolver: PromptResolver
+    parallelism: RuntimeParallelismPolicy
     source_artifact_ref: str
     scenario: str = DEFAULT_SCENARIO
     adapter_mode: str = "fake"
@@ -278,46 +280,56 @@ class FakeTranscriptionAdapter:
         audio_artifact: AudioArtifact,
         request_context: RequestContext,
     ) -> TranscriptCandidate:
+        candidate, raw_payload = self.transcribe_with_payload(audio_artifact, request_context)
+        self._blob_store.put_bytes(
+            candidate.raw_payload_ref or "",
+            (json.dumps(raw_payload, sort_keys=True) + "\n").encode("utf-8"),
+        )
+        return candidate
+
+    def transcribe_with_payload(
+        self,
+        audio_artifact: AudioArtifact,
+        request_context: RequestContext,
+    ) -> tuple[TranscriptCandidate, dict[str, object]]:
         scenario = str(request_context.metadata.get("scenario", DEFAULT_SCENARIO))
         failed_providers = _transcription_failures_for_scenario(scenario)
         if self.provider_id in failed_providers:
             raise RuntimeError(f"simulated transcription failure for {self.provider_id}")
 
         text = _transcript_text_for_provider(self.provider_id, scenario)
+        raw_payload: dict[str, object] = {"provider": self.provider_id, "text": text}
         raw_payload_ref = job_path(
             request_context.job,
             "raw",
             "provider-payloads",
             f"{self.provider_id}.json",
         )
-        self._blob_store.put_bytes(
-            raw_payload_ref,
-            (
-                json.dumps({"provider": self.provider_id, "text": text}, sort_keys=True) + "\n"
-            ).encode("utf-8"),
-        )
         scope_token = job_scope_token(request_context.job)
-        return TranscriptCandidate(
-            candidate_id=f"tr-{self.provider_id}-{request_context.job.job_id}-{scope_token}",
-            job_id=request_context.job.job_id,
-            provider_id=self.provider_id,
-            provider_request_id=f"req-{self.provider_id}-{request_context.run_id}",
-            language=request_context.job.source_language,
-            segments=(
-                Segment(
-                    segment_id=f"seg-{self.provider_id}-1",
-                    start_ms=0,
-                    end_ms=1_200,
-                    speaker="speaker-1",
-                    source_text=text,
+        return (
+            TranscriptCandidate(
+                candidate_id=f"tr-{self.provider_id}-{request_context.job.job_id}-{scope_token}",
+                job_id=request_context.job.job_id,
+                provider_id=self.provider_id,
+                provider_request_id=f"req-{self.provider_id}-{request_context.run_id}",
+                language=request_context.job.source_language,
+                segments=(
+                    Segment(
+                        segment_id=f"seg-{self.provider_id}-1",
+                        start_ms=0,
+                        end_ms=1_200,
+                        speaker="speaker-1",
+                        source_text=text,
+                    ),
                 ),
+                full_text=text,
+                speaker_map={"speaker-1": "Host"},
+                timing_resolution="segment",
+                raw_payload_ref=raw_payload_ref,
+                normalization_version=PHASE_TWO_NORMALIZATION_VERSION,
+                metadata={"provider_rank": _provider_rank(self.provider_id)},
             ),
-            full_text=text,
-            speaker_map={"speaker-1": "Host"},
-            timing_resolution="segment",
-            raw_payload_ref=raw_payload_ref,
-            normalization_version=PHASE_TWO_NORMALIZATION_VERSION,
-            metadata={"provider_rank": _provider_rank(self.provider_id)},
+            raw_payload,
         )
 
 
@@ -335,6 +347,23 @@ class FakeTranslationAdapter:
         prompt_variant_id: str,
         request_context: RequestContext,
     ) -> TranslationCandidate:
+        candidate, raw_payload = self.generate_translation_with_payload(
+            final_transcript,
+            prompt_variant_id,
+            request_context,
+        )
+        self._blob_store.put_bytes(
+            candidate.raw_response_ref or "",
+            (json.dumps(raw_payload, sort_keys=True) + "\n").encode("utf-8"),
+        )
+        return candidate
+
+    def generate_translation_with_payload(
+        self,
+        final_transcript: TranscriptCandidate,
+        prompt_variant_id: str,
+        request_context: RequestContext,
+    ) -> tuple[TranslationCandidate, dict[str, object]]:
         scenario = str(request_context.metadata.get("scenario", DEFAULT_SCENARIO))
         failed_variants = _translation_failures_for_scenario(scenario)
         if prompt_variant_id in failed_variants:
@@ -342,55 +371,56 @@ class FakeTranslationAdapter:
 
         resolved_prompt = request_context.metadata.get("resolved_translation_prompt", {})
         text = _translation_text_for_variant(prompt_variant_id, scenario)
+        raw_payload: dict[str, object] = {
+            "translation": text,
+            "variant": prompt_variant_id,
+        }
         raw_response_ref = job_path(
             request_context.job,
             "raw",
             "provider-payloads",
             f"openai-{prompt_variant_id}.json",
         )
-        self._blob_store.put_bytes(
-            raw_response_ref,
-            (
-                json.dumps(
-                    {"translation": text, "variant": prompt_variant_id},
-                    sort_keys=True,
-                )
-                + "\n"
-            ).encode("utf-8"),
-        )
         scope_token = job_scope_token(request_context.job)
-        return TranslationCandidate(
-            candidate_id=f"tl-{prompt_variant_id}-{request_context.job.job_id}-{scope_token}",
-            job_id=request_context.job.job_id,
-            source_transcript_candidate_id=final_transcript.candidate_id,
-            model_id=self.model_id,
-            prompt_variant_id=prompt_variant_id,
-            prompt_version=str(resolved_prompt.get("effective_prompt_version", "phase-2-v1")),
-            language=request_context.job.target_language,
-            segments=(
-                Segment(
-                    segment_id=(
-                        f"seg-{prompt_variant_id}-1"
-                        if prompt_variant_id in {"variant-a", "variant-b"}
-                        else final_transcript.segments[0].segment_id
-                        if final_transcript.segments
-                        else f"seg-{prompt_variant_id}-1"
+        return (
+            TranslationCandidate(
+                candidate_id=f"tl-{prompt_variant_id}-{request_context.job.job_id}-{scope_token}",
+                job_id=request_context.job.job_id,
+                source_transcript_candidate_id=final_transcript.candidate_id,
+                model_id=self.model_id,
+                prompt_variant_id=prompt_variant_id,
+                prompt_version=str(resolved_prompt.get("effective_prompt_version", "phase-2-v1")),
+                language=request_context.job.target_language,
+                segments=(
+                    Segment(
+                        segment_id=(
+                            f"seg-{prompt_variant_id}-1"
+                            if prompt_variant_id in {"variant-a", "variant-b"}
+                            else final_transcript.segments[0].segment_id
+                            if final_transcript.segments
+                            else f"seg-{prompt_variant_id}-1"
+                        ),
+                        start_ms=(
+                            final_transcript.segments[0].start_ms
+                            if final_transcript.segments
+                            else 0
+                        ),
+                        end_ms=(
+                            final_transcript.segments[0].end_ms
+                            if final_transcript.segments
+                            else 1_200
+                        ),
+                        speaker="speaker-1",
+                        source_text=final_transcript.full_text,
+                        target_text=text,
                     ),
-                    start_ms=(
-                        final_transcript.segments[0].start_ms if final_transcript.segments else 0
-                    ),
-                    end_ms=(
-                        final_transcript.segments[0].end_ms if final_transcript.segments else 1_200
-                    ),
-                    speaker="speaker-1",
-                    source_text=final_transcript.full_text,
-                    target_text=text,
                 ),
+                full_text=text,
+                raw_response_ref=raw_response_ref,
+                normalization_version=PHASE_TWO_NORMALIZATION_VERSION,
+                metadata={"scenario": scenario, "prompt_resolver": resolved_prompt},
             ),
-            full_text=text,
-            raw_response_ref=raw_response_ref,
-            normalization_version=PHASE_TWO_NORMALIZATION_VERSION,
-            metadata={"scenario": scenario, "prompt_resolver": resolved_prompt},
+            raw_payload,
         )
 
 
@@ -427,6 +457,7 @@ def build_phase_two_runtime(
         memory_consolidation_backend=DeterministicMemoryConsolidationBackend(memory_store),
         prompt_evolution_backend=DeterministicPromptEvolutionBackend(),
         prompt_resolver=ProposalBackedPromptResolver(blob_store),
+        parallelism=_default_parallelism_policy(provider_count=3),
         source_artifact_ref=source_artifact_ref,
         scenario=scenario,
         adapter_mode="fake",
@@ -524,6 +555,7 @@ def build_phase_three_runtime(
         base_url=settings.openai_base_url,
         timeout_seconds=settings.translation_timeout_seconds,
         retry_policy=retry_policy,
+        max_chunk_workers=settings.translation_chunk_max_workers,
         max_chunk_characters=settings.translation_max_chunk_characters,
         max_chunk_segments=settings.translation_max_chunk_segments,
         context_segment_window=settings.translation_context_segment_window,
@@ -546,6 +578,10 @@ def build_phase_three_runtime(
         memory_consolidation_backend=DeterministicMemoryConsolidationBackend(memory_store),
         prompt_evolution_backend=DeterministicPromptEvolutionBackend(),
         prompt_resolver=ProposalBackedPromptResolver(blob_store),
+        parallelism=_settings_parallelism_policy(
+            settings,
+            provider_count=len(transcription_adapters),
+        ),
         source_artifact_ref=source_artifact_ref,
         scenario=scenario,
         adapter_mode="real",
@@ -616,6 +652,34 @@ def _build_real_transcription_adapters(
     if not adapters:
         raise RuntimeError("TA_TRANSCRIPTION_PROVIDERS must select at least one provider when set")
     return tuple(adapters)
+
+
+def _default_parallelism_policy(*, provider_count: int) -> RuntimeParallelismPolicy:
+    return RuntimeParallelismPolicy(
+        transcription_max_workers=min(max(provider_count, 1), 4),
+        translation_candidate_max_workers=2,
+        translation_chunk_max_workers=4,
+        review_max_workers=2,
+        reference_evaluation_max_workers=4,
+        memory_drain_max_workers=2,
+    )
+
+
+def _settings_parallelism_policy(
+    settings: Settings,
+    *,
+    provider_count: int,
+) -> RuntimeParallelismPolicy:
+    defaults = _default_parallelism_policy(provider_count=provider_count)
+    return RuntimeParallelismPolicy(
+        transcription_max_workers=settings.transcription_max_workers
+        or defaults.transcription_max_workers,
+        translation_candidate_max_workers=settings.translation_candidate_max_workers,
+        translation_chunk_max_workers=settings.translation_chunk_max_workers,
+        review_max_workers=settings.review_max_workers,
+        reference_evaluation_max_workers=settings.reference_evaluation_max_workers,
+        memory_drain_max_workers=settings.memory_drain_max_workers,
+    )
 
 
 def _blob_root(blob_store: BlobStore) -> str | None:

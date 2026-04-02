@@ -812,7 +812,16 @@ def test_replay_scorecards_memory_and_prompt_proposals_are_stable_regression(
         second_blob_store,
         consolidation_path,
     )
-    assert _load_json(first_blob_store, prompt_path) == _load_json(second_blob_store, prompt_path)
+    if first_blob_store.exists(prompt_path) or second_blob_store.exists(prompt_path):
+        assert first_blob_store.exists(prompt_path)
+        assert second_blob_store.exists(prompt_path)
+        assert _load_json(first_blob_store, prompt_path) == _load_json(
+            second_blob_store,
+            prompt_path,
+        )
+    else:
+        assert first_blob_store.exists(prompt_path) is False
+        assert second_blob_store.exists(prompt_path) is False
 
 
 def test_replay_translation_failure_manifest_is_stable_regression(tmp_path: Path) -> None:
