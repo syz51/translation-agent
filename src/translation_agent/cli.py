@@ -240,9 +240,11 @@ def _interactive_review_flow(
             print("no pending translation review")
         return 0
 
+    _print_human_review_summary(payload)
     while True:
         _print_candidate_list(candidates)
-        raw_command = input("review command ([number], a <number>, q): ").strip()
+        raw_command = input("review command ([number]=details, a <number>=approve, q=quit): ")
+        raw_command = raw_command.strip()
         if raw_command.lower() in {"q", "quit", "exit"}:
             return 0
         if raw_command.isdigit():
@@ -280,11 +282,15 @@ def _print_candidate_list(candidates: list[dict[str, Any]]) -> None:
     for candidate in candidates:
         source = candidate.get("source_transcript", {})
         provider = source.get("provider_id") if isinstance(source, dict) else None
+        contradiction_count = candidate.get("contradiction_count", 0)
+        blocking_count = candidate.get("blocking_hard_contradiction_count", 0)
         print(
             f"{candidate['rank']}. {candidate['candidate_id']} "
             f"[{candidate['prompt_variant_id']}] "
             f"transcript={candidate['source_transcript_candidate_id']} "
-            f"provider={provider or 'unknown'}"
+            f"provider={provider or 'unknown'} "
+            f"contradictions={contradiction_count} "
+            f"blocking={blocking_count}"
         )
 
 
@@ -307,6 +313,79 @@ def _print_candidate_details(candidate: dict[str, Any], payload: dict[str, Any])
     if isinstance(review_summary, dict):
         print(f"transcript_decision_ref: {review_summary.get('decision_ref')}")
         print(f"transcript_investigation_ref: {review_summary.get('investigation_ref')}")
+    _print_reviewer_preferences(candidate)
+    _print_candidate_contradictions(candidate)
+
+
+def _print_human_review_summary(payload: dict[str, Any]) -> None:
+    summary = payload.get("human_review_summary", {})
+    if not isinstance(summary, dict):
+        return
+    contradiction_count = summary.get("contradiction_count")
+    blocking_count = summary.get("blocking_hard_contradiction_count")
+    if contradiction_count is not None or blocking_count is not None:
+        print(
+            "review_summary: "
+            f"contradictions={contradiction_count or 0} "
+            f"blocking_hard={blocking_count or 0}"
+        )
+    preferences = summary.get("reviewer_preferences")
+    if not isinstance(preferences, list) or not preferences:
+        return
+    print("reviewer_preferences:")
+    for preference in preferences:
+        if not isinstance(preference, dict):
+            continue
+        preferred_candidate_id = preference.get("preferred_candidate_id") or "none"
+        print(
+            f"- {preference.get('reviewer_role')}: "
+            f"preferred={preferred_candidate_id} "
+            f"confidence={preference.get('confidence')}"
+        )
+
+
+def _print_reviewer_preferences(candidate: dict[str, Any]) -> None:
+    preferences = candidate.get("reviewer_preferences", [])
+    if not isinstance(preferences, list) or not preferences:
+        return
+    print("candidate_reviewer_preferences:")
+    for preference in preferences:
+        if not isinstance(preference, dict):
+            continue
+        rationale = preference.get("rationale")
+        rationale_suffix = f" rationale={rationale}" if rationale else ""
+        print(
+            f"- {preference.get('reviewer_role')}: "
+            f"rank={preference.get('rank')} "
+            f"confidence={preference.get('confidence')}{rationale_suffix}"
+        )
+
+
+def _print_candidate_contradictions(candidate: dict[str, Any]) -> None:
+    contradictions = candidate.get("contradictions", [])
+    if not isinstance(contradictions, list) or not contradictions:
+        print("contradictions: none")
+        return
+    print("contradictions:")
+    for index, contradiction in enumerate(contradictions, start=1):
+        if not isinstance(contradiction, dict):
+            continue
+        reviewer_roles = contradiction.get("reviewer_roles")
+        reviewer_text = ", ".join(reviewer_roles) if isinstance(reviewer_roles, list) else "unknown"
+        span_text = (
+            contradiction.get("time_range") or contradiction.get("source_span_id") or "unknown"
+        )
+        print(
+            f"{index}. {span_text} | {contradiction.get('dimension')} | "
+            f"{contradiction.get('severity')} | reviewers={reviewer_text}"
+        )
+        print(f"   note: {contradiction.get('evidence_text')}")
+        if contradiction.get("normalized_value"):
+            print(f"   normalized_value: {contradiction['normalized_value']}")
+        if contradiction.get("source_excerpt"):
+            print(f"   source_excerpt: {contradiction['source_excerpt']}")
+        if contradiction.get("target_excerpt"):
+            print(f"   target_excerpt: {contradiction['target_excerpt']}")
 
 
 def _should_enter_interactive_review(*, mode: str) -> bool:

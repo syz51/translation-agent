@@ -1199,11 +1199,57 @@ def test_review_job_json_exposes_candidates_and_provenance(
         "speechmatics",
         "deepgram",
     }
+    contradictory_candidate = next(
+        candidate for candidate in payload["candidates"] if candidate["contradiction_count"] >= 1
+    )
+    assert contradictory_candidate["blocking_hard_contradiction_count"] >= 1
+    contradiction = contradictory_candidate["contradictions"][0]
+    assert contradiction["dimension"] in {"meaning", "entity", "number_date_unit", "coverage"}
+    assert contradiction["evidence_text"]
+    assert contradiction["time_range"]
+    assert payload["human_review_summary"]["contradiction_count"] >= 1
     assert Path(candidate["translation_preview_json_path"]).exists()
     assert Path(candidate["translation_preview_srt_path"]).exists()
     assert payload["transcript_review_summary"]["decision_ref"].endswith(
         "/decisions/transcript.json"
     )
+
+
+@pytest.mark.unit
+def test_review_job_interactive_shows_contradictions(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("TA_DATA_DIR", str(tmp_path / "runtime"))
+    monkeypatch.delenv("TA_STATE_DB_DSN", raising=False)
+
+    result = run_job(
+        RunJobRequest(
+            source="input.mp4",
+            job_id="job-review-interactive",
+            metadata={"scenario": "translation_conflict_timeout"},
+        )
+    )
+    payload = review_job(result.run_id)
+    candidates = cast(list[dict[str, object]], payload["candidates"])
+    candidate_index = next(
+        index
+        for index, candidate in enumerate(candidates, start=1)
+        if cast(int, candidate["contradiction_count"]) >= 1
+    )
+    commands = iter([str(candidate_index), "q"])
+    monkeypatch.setattr("builtins.input", lambda _: next(commands))
+
+    exit_code = main(["review-job", result.run_id])
+
+    output = capsys.readouterr().out
+    assert exit_code == 0
+    assert "review_summary: contradictions=" in output
+    assert "candidate_reviewer_preferences:" in output
+    assert "contradictions:" in output
+    assert "note:" in output
+    assert "reviewers=" in output
 
 
 @pytest.mark.unit

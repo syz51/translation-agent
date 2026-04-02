@@ -17,6 +17,9 @@ from translation_agent.models import (
     JobContext,
     MemoryWrite,
     MemoryWriteBatch,
+    ReviewBundle,
+    Segment,
+    StructuredEvidence,
     TranscriptApprovalLearningEvent,
     TranscriptCandidate,
     TranscriptProviderQualityStats,
@@ -45,6 +48,8 @@ from translation_agent.observability import NoOpTraceSink
 from translation_agent.publish.outputs import publish_outputs
 from translation_agent.storage import LocalBlobStore, OperationalStore, job_path
 from translation_agent.subtitles import render_translation_srt
+
+_HARD_CONTRADICTION_DIMENSIONS = {"meaning", "entity", "number_date_unit", "coverage"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,11 +182,36 @@ def build_review_payload(
         )
 
     machine_review_refs = []
+    translation_reviews: tuple[ReviewBundle, ...] = ()
     if translation_decision is not None:
         machine_review_refs = [
             translation_review_key(context.job, review_id)
             for review_id in translation_decision.review_refs
         ]
+        translation_reviews = tuple(
+            read_model_artifact(
+                runtime,
+                translation_review_key(context.job, review_id),
+                ReviewBundle,
+            )
+            for review_id in translation_decision.review_refs
+            if runtime.blob_store.exists(translation_review_key(context.job, review_id))
+        )
+
+    contradiction_summary = _build_contradiction_summary(
+        translation_candidates=translation_candidates,
+        reviews=translation_reviews,
+    )
+    candidate_summaries = contradiction_summary["candidate_summaries"]
+    for payload in candidate_payloads:
+        candidate_summary = candidate_summaries.get(str(payload["candidate_id"]), {})
+        payload["contradiction_count"] = candidate_summary.get("contradiction_count", 0)
+        payload["blocking_hard_contradiction_count"] = candidate_summary.get(
+            "blocking_hard_contradiction_count",
+            0,
+        )
+        payload["reviewer_preferences"] = candidate_summary.get("reviewer_preferences", [])
+        payload["contradictions"] = candidate_summary.get("contradictions", [])
 
     return {
         "run_id": run_id,
@@ -217,6 +247,7 @@ def build_review_payload(
             "investigation": translation_investigation,
             "machine_review_refs": machine_review_refs,
         },
+        "human_review_summary": contradiction_summary["summary"],
         "approval": approval,
         "resume_commands": [
             f"uv run translation-agent review-job {run_id}",
@@ -553,6 +584,218 @@ def _render_candidate_previews(
         if transcript_txt_path is not None
         else None,
     }
+
+
+def _build_contradiction_summary(
+    *,
+    translation_candidates: list[TranslationCandidate],
+    reviews: tuple[ReviewBundle, ...],
+) -> dict[str, Any]:
+    candidate_map = {candidate.candidate_id: candidate for candidate in translation_candidates}
+    candidate_summaries: dict[str, dict[str, Any]] = {
+        candidate.candidate_id: {
+            "candidate_id": candidate.candidate_id,
+            "contradiction_count": 0,
+            "blocking_hard_contradiction_count": 0,
+            "reviewer_preferences": [],
+            "contradictions": [],
+        }
+        for candidate in translation_candidates
+    }
+    contradiction_index: dict[
+        tuple[str, str | None, str, str, str | None],
+        dict[str, Any],
+    ] = {}
+    reviewer_preferences: list[dict[str, Any]] = []
+
+    for review in reviews:
+        top_choice = review.candidate_preferences[0] if review.candidate_preferences else None
+        reviewer_preferences.append(
+            {
+                "reviewer_role": review.reviewer_role,
+                "preferred_candidate_id": (
+                    top_choice.candidate_id if top_choice is not None else None
+                ),
+                "confidence": review.confidence,
+                "escalation_signal": review.escalation_signal,
+            }
+        )
+        for preference in review.candidate_preferences:
+            candidate_summary = candidate_summaries.get(preference.candidate_id)
+            if candidate_summary is None:
+                continue
+            cast(list[dict[str, Any]], candidate_summary["reviewer_preferences"]).append(
+                {
+                    "reviewer_role": review.reviewer_role,
+                    "rank": preference.rank,
+                    "rationale": preference.rationale,
+                    "confidence": review.confidence,
+                }
+            )
+        for evidence in review.structured_evidence:
+            if evidence.polarity != "refutes":
+                continue
+            candidate = candidate_map.get(evidence.candidate_id)
+            if candidate is None:
+                continue
+            candidate_summary = candidate_summaries[evidence.candidate_id]
+            _record_contradiction(
+                contradiction_index=contradiction_index,
+                candidate_summary=candidate_summary,
+                candidate=candidate,
+                review=review,
+                evidence=evidence,
+            )
+
+    for candidate_summary in candidate_summaries.values():
+        contradictions = cast(list[dict[str, Any]], candidate_summary["contradictions"])
+        contradictions.sort(
+            key=lambda item: (
+                _span_sort_key(cast(str | None, item["source_span_id"])),
+                _severity_sort_key(cast(str, item["severity"])),
+                cast(str, item["dimension"]),
+            )
+        )
+        candidate_summary["contradiction_count"] = len(contradictions)
+        candidate_summary["blocking_hard_contradiction_count"] = sum(
+            1 for item in contradictions if cast(bool, item["blocking_hard_contradiction"])
+        )
+
+    contradiction_count = sum(
+        cast(int, candidate_summary["contradiction_count"])
+        for candidate_summary in candidate_summaries.values()
+    )
+    blocking_hard_count = sum(
+        cast(int, candidate_summary["blocking_hard_contradiction_count"])
+        for candidate_summary in candidate_summaries.values()
+    )
+    return {
+        "summary": {
+            "contradiction_count": contradiction_count,
+            "blocking_hard_contradiction_count": blocking_hard_count,
+            "reviewer_preferences": reviewer_preferences,
+        },
+        "candidate_summaries": candidate_summaries,
+    }
+
+
+def _record_contradiction(
+    *,
+    contradiction_index: dict[tuple[str, str | None, str, str, str | None], dict[str, Any]],
+    candidate_summary: dict[str, Any],
+    candidate: TranslationCandidate,
+    review: ReviewBundle,
+    evidence: StructuredEvidence,
+) -> None:
+    key = (
+        evidence.candidate_id,
+        evidence.source_span_id,
+        evidence.dimension,
+        evidence.evidence_text,
+        evidence.normalized_value,
+    )
+    existing = contradiction_index.get(key)
+    if existing is None:
+        source_excerpt, target_excerpt = _segment_excerpts_for_span(
+            candidate.segments,
+            evidence.source_span_id,
+        )
+        existing = {
+            "source_span_id": evidence.source_span_id,
+            "time_range": _format_span_range(evidence.source_span_id),
+            "dimension": evidence.dimension,
+            "severity": evidence.severity,
+            "evidence_text": evidence.evidence_text,
+            "normalized_value": evidence.normalized_value,
+            "reviewer_roles": [review.reviewer_role],
+            "source_excerpt": source_excerpt,
+            "target_excerpt": target_excerpt,
+            "blocking_hard_contradiction": evidence.dimension in _HARD_CONTRADICTION_DIMENSIONS,
+        }
+        contradiction_index[key] = existing
+        cast(list[dict[str, Any]], candidate_summary["contradictions"]).append(existing)
+        return
+
+    roles = cast(list[str], existing["reviewer_roles"])
+    if review.reviewer_role not in roles:
+        roles.append(review.reviewer_role)
+    existing["severity"] = _max_severity(cast(str, existing["severity"]), evidence.severity)
+
+
+def _segment_excerpts_for_span(
+    segments: tuple[Segment, ...],
+    source_span_id: str | None,
+) -> tuple[str | None, str | None]:
+    start_ms, end_ms = _parse_span_id(source_span_id)
+    if start_ms is None or end_ms is None:
+        return None, None
+    overlapping_segments = [
+        segment for segment in segments if segment.end_ms > start_ms and segment.start_ms < end_ms
+    ]
+    if not overlapping_segments:
+        return None, None
+    return (
+        _truncate_excerpt(_join_segment_text(overlapping_segments, "source_text")),
+        _truncate_excerpt(_join_segment_text(overlapping_segments, "target_text")),
+    )
+
+
+def _join_segment_text(segments: list[Segment], field_name: str) -> str | None:
+    joined = " ".join(
+        text.strip()
+        for segment in segments
+        if isinstance((text := getattr(segment, field_name)), str) and text.strip()
+    ).strip()
+    return joined or None
+
+
+def _truncate_excerpt(text: str | None, limit: int = 220) -> str | None:
+    if text is None or len(text) <= limit:
+        return text
+    return text[: limit - 3].rstrip() + "..."
+
+
+def _parse_span_id(source_span_id: str | None) -> tuple[int | None, int | None]:
+    if source_span_id is None:
+        return None, None
+    _, separator, remainder = source_span_id.partition(":")
+    if separator == "":
+        return None, None
+    start_text, separator, end_text = remainder.partition(":")
+    if separator == "":
+        return None, None
+    try:
+        return int(start_text), int(end_text)
+    except ValueError:
+        return None, None
+
+
+def _format_span_range(source_span_id: str | None) -> str | None:
+    start_ms, end_ms = _parse_span_id(source_span_id)
+    if start_ms is None or end_ms is None:
+        return source_span_id
+    return f"{_format_ms(start_ms)}-{_format_ms(end_ms)}"
+
+
+def _format_ms(value: int) -> str:
+    minutes, remainder = divmod(value, 60_000)
+    seconds, milliseconds = divmod(remainder, 1_000)
+    return f"{minutes:02d}:{seconds:02d}.{milliseconds:03d}"
+
+
+def _span_sort_key(source_span_id: str | None) -> tuple[int, int]:
+    start_ms, end_ms = _parse_span_id(source_span_id)
+    if start_ms is None or end_ms is None:
+        return (10**9, 10**9)
+    return (start_ms, end_ms)
+
+
+def _severity_sort_key(severity: str) -> int:
+    return {"critical": 0, "major": 1, "minor": 2}.get(severity, 3)
+
+
+def _max_severity(left: str, right: str) -> str:
+    return left if _severity_sort_key(left) <= _severity_sort_key(right) else right
 
 
 def _update_provider_quality_stats(
