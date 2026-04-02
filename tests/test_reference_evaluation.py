@@ -10,6 +10,7 @@ from translation_agent.api import RunJobRequest, run_job
 from translation_agent.config import Settings
 from translation_agent.memory import ProposalBackedPromptResolver
 from translation_agent.models import JobContext, PromptChange, PromptEvolutionProposal
+from translation_agent.nodes.reference_evaluation import _parse_srt
 from translation_agent.storage import LocalBlobStore, SQLiteOperationalStore, asset_path, job_path
 
 pytestmark = pytest.mark.unit
@@ -124,6 +125,45 @@ def test_reference_evaluation_path_publishes_asset_artifacts_and_keeps_canonical
     assert regenerated_draft["replaces_canonical"] is False
     assert proposal["status"] == "proposed"
     assert proposal["activation_mode"] == "approval_required"
+
+
+def test_parse_srt_uses_pysubs2_plaintext_for_reference_segments() -> None:
+    segments = _parse_srt(
+        "\n".join(
+            [
+                "1",
+                "00:00:00,000 --> 00:00:01,250",
+                "Hello",
+                "world",
+                "",
+                "2",
+                "00:00:01,250 --> 00:00:02,500",
+                r"{\i1}OpenAI{\i0} workflow",
+                "",
+            ]
+        )
+    )
+
+    assert len(segments) == 2
+    assert segments[0].start_ms == 0
+    assert segments[0].end_ms == 1250
+    assert segments[0].text == "Hello world"
+    assert segments[1].start_ms == 1250
+    assert segments[1].end_ms == 2500
+    assert segments[1].text == "OpenAI workflow"
+
+
+def test_parse_srt_rejects_malformed_payloads_without_timing_lines() -> None:
+    with pytest.raises(ValueError, match="malformed SRT timing line"):
+        _parse_srt(
+            "\n".join(
+                [
+                    "1",
+                    "NOT A TIMELINE",
+                    "Hello world",
+                ]
+            )
+        )
 
 
 def test_approved_prompt_proposals_affect_prompt_resolution(tmp_path: Path) -> None:

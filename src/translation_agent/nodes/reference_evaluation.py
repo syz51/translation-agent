@@ -10,6 +10,8 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import cast
 
+import pysubs2
+
 from translation_agent.graph.runtime import WorkflowRuntime
 from translation_agent.graph.state import GraphState, RoutingFact
 from translation_agent.models import (
@@ -40,9 +42,6 @@ from translation_agent.nodes.common import (
 from translation_agent.storage import asset_path, operational_job_key
 
 _WORD_RE = re.compile(r"[A-Za-z0-9']+")
-_SRT_TIME_RE = re.compile(
-    r"(?P<start>\d{2}:\d{2}:\d{2},\d{3})\s+-->\s+(?P<end>\d{2}:\d{2}:\d{2},\d{3})"
-)
 
 
 def run_reference_evaluation(state: GraphState, runtime: WorkflowRuntime) -> dict[str, object]:
@@ -654,35 +653,23 @@ def _proposal_instruction(pattern: str) -> str:
 
 
 def _parse_srt(payload: str) -> tuple[ReferenceSegment, ...]:
-    blocks = [
-        block.strip() for block in payload.replace("\r\n", "\n").split("\n\n") if block.strip()
-    ]
-    segments: list[ReferenceSegment] = []
-    for index, block in enumerate(blocks):
-        lines = [line.strip("\ufeff") for line in block.splitlines() if line.strip()]
-        if len(lines) < 2:
-            raise ValueError("malformed SRT block")
-        timeline_line = lines[1] if "-->" in lines[1] else lines[0]
-        text_lines = lines[2:] if timeline_line == lines[1] else lines[1:]
-        match = _SRT_TIME_RE.fullmatch(timeline_line)
-        if match is None or not text_lines:
-            raise ValueError("malformed SRT timing line")
-        segments.append(
-            ReferenceSegment(
-                segment_id=f"ref-seg-{index + 1}",
-                sequence=index,
-                start_ms=_parse_srt_time(match.group("start")),
-                end_ms=_parse_srt_time(match.group("end")),
-                text=" ".join(text_lines).strip(),
-            )
+    subtitles = pysubs2.SSAFile.from_string(payload, format_="srt")
+    if payload.strip() and not subtitles.events:
+        raise ValueError("malformed SRT timing line")
+
+    segments = [
+        ReferenceSegment(
+            segment_id=f"ref-seg-{index + 1}",
+            sequence=index,
+            start_ms=event.start,
+            end_ms=event.end,
+            text=" ".join(event.plaintext.splitlines()).strip(),
         )
+        for index, event in enumerate(subtitles.events)
+    ]
+    if any(not segment.text for segment in segments):
+        raise ValueError("malformed SRT block")
     return tuple(segments)
-
-
-def _parse_srt_time(value: str) -> int:
-    hours, minutes, seconds_ms = value.split(":")
-    seconds, millis = seconds_ms.split(",")
-    return (int(hours) * 3_600_000) + (int(minutes) * 60_000) + (int(seconds) * 1_000) + int(millis)
 
 
 def _normalized_tokens(value: str) -> list[str]:
