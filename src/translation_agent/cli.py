@@ -16,6 +16,7 @@ from translation_agent.api import (
     approve_review,
     convert_translation_json_to_srt,
     list_runs,
+    resume_transcription,
     resume_translation,
     review_job,
     run_job,
@@ -87,6 +88,25 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
     )
     resume_parser.add_argument("--json", action="store_true", dest="as_json")
+
+    resume_transcription_parser = subparsers.add_parser(
+        "resume-transcription",
+        help="Resume transcription from persisted audio and rerun selected providers",
+    )
+    resume_transcription_parser.add_argument("run_id")
+    resume_transcription_parser.add_argument(
+        "--provider",
+        action="append",
+        dest="providers",
+        default=[],
+        help="Provider ID to rerun; repeat to target multiple providers",
+    )
+    resume_transcription_parser.add_argument(
+        "--review",
+        choices=["auto", "always", "never"],
+        default="auto",
+    )
+    resume_transcription_parser.add_argument("--json", action="store_true", dest="as_json")
 
     approve_parser = subparsers.add_parser(
         "approve-review",
@@ -232,6 +252,41 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "resume-translation":
         settings = load_settings()
         result = resume_translation(args.run_id, review_mode=args.review, settings=settings)
+        payload = _json_ready(asdict(result))
+        if args.as_json:
+            print(json.dumps(payload))
+        else:
+            print(result.run_id)
+            print(result.status)
+            print(f"source_language: {result.source_language}")
+            print(f"target_language: {result.target_language}")
+            print(f"{result.state_backend}: {result.state_db_target}")
+            print(result.trace_path)
+            if result.default_output_path is not None:
+                print(f"default_output_path: {result.default_output_path}")
+            if result.failure_summary:
+                print(result.failure_summary)
+            for reason in result.failure_reasons:
+                print(reason)
+            if result.review_required_stage == "translation":
+                if _should_enter_interactive_review(mode=args.review):
+                    return _interactive_review_flow(result.run_id, settings=settings)
+                if args.review == "always" and not _has_tty():
+                    print("interactive review requires a real TTY")
+                    return 2
+                print("review_required_stage: translation")
+                for command in result.resume_commands:
+                    print(command)
+        return 0
+
+    if args.command == "resume-transcription":
+        settings = load_settings()
+        result = resume_transcription(
+            args.run_id,
+            provider_ids=tuple(args.providers),
+            review_mode=args.review,
+            settings=settings,
+        )
         payload = _json_ready(asdict(result))
         if args.as_json:
             print(json.dumps(payload))

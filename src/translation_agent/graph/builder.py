@@ -76,6 +76,36 @@ def build_translation_resume_graph(runtime: WorkflowRuntime):
     return builder.compile(name="translation_agent_translation_resume")
 
 
+def build_transcription_resume_graph(runtime: WorkflowRuntime):
+    """Compile the transcription-resume graph starting from persisted audio."""
+
+    builder = StateGraph(GraphState)
+    _add_translation_nodes(builder, runtime)
+    builder.add_node(
+        "fanout_transcription",
+        _instrumented_node("fanout_transcription", runtime, fanout_transcription),
+    )
+    builder.add_node(
+        "normalize_transcripts",
+        _instrumented_node("normalize_transcripts", runtime, normalize_transcripts),
+    )
+    builder.add_node(
+        "review_transcripts",
+        _instrumented_node("review_transcripts", runtime, review_transcripts),
+    )
+    builder.add_node(
+        "adjudicate_transcript",
+        _instrumented_node("adjudicate_transcript", runtime, adjudicate_transcript),
+    )
+    builder.add_edge(START, "fanout_transcription")
+    builder.add_edge("fanout_transcription", "normalize_transcripts")
+    builder.add_edge("normalize_transcripts", "review_transcripts")
+    builder.add_edge("review_transcripts", "adjudicate_transcript")
+    builder.add_edge("adjudicate_transcript", "background_memory_pipeline")
+    _add_translation_edges(builder)
+    return builder.compile(name="translation_agent_transcription_resume")
+
+
 def run_workflow(initial_state: GraphState, runtime: WorkflowRuntime) -> GraphState:
     """Execute the compiled workflow and validate the final state."""
 
@@ -89,6 +119,15 @@ def run_translation_resume_workflow(
     """Execute the translation-only resume workflow and validate the final state."""
 
     compiled = build_translation_resume_graph(runtime)
+    return _run_compiled_workflow(compiled, initial_state, runtime)
+
+
+def run_transcription_resume_workflow(
+    initial_state: GraphState, runtime: WorkflowRuntime
+) -> GraphState:
+    """Execute the transcription-resume workflow and validate the final state."""
+
+    compiled = build_transcription_resume_graph(runtime)
     return _run_compiled_workflow(compiled, initial_state, runtime)
 
 

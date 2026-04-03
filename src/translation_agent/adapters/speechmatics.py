@@ -153,7 +153,7 @@ class SpeechmaticsTranscriptionAdapter:
                 timeout_seconds=self._timeout_seconds,
             )
         )
-        return _validated_json_response(self.provider_id, response)
+        return _normalized_job_status_payload(_validated_json_response(self.provider_id, response))
 
     def _fetch_transcript(self, job_id: str) -> dict[str, Any]:
         response = self._transport.request(
@@ -309,6 +309,28 @@ def _validated_json_response(provider_id: str, response) -> dict[str, Any]:
             category="malformed_response",
             retryable=False,
         )
+    return payload
+
+
+def _normalized_job_status_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    status = payload.get("status")
+    if isinstance(status, str) and status.strip():
+        return payload
+
+    job = payload.get("job")
+    if isinstance(job, dict):
+        nested_status = job.get("status")
+        if isinstance(nested_status, str) and nested_status.strip():
+            return {**payload, "status": nested_status}
+
+    jobs = payload.get("jobs")
+    if isinstance(jobs, list) and jobs:
+        first_job = jobs[0]
+        if isinstance(first_job, dict):
+            nested_status = first_job.get("status")
+            if isinstance(nested_status, str) and nested_status.strip():
+                return {**payload, "status": nested_status}
+
     return payload
 
 

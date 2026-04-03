@@ -309,7 +309,7 @@ The settings model accepts more fields than most users need. These are the ones 
 | `TA_TRANSCRIPTION_PROVIDERS` | comma-separated subset of real-mode transcription providers: `assemblyai`, `speechmatics`, `deepgram` |
 | `TA_ALLOW_LANGGRAPH_PY314_WARNING` | opt into real mode despite the current warning gate |
 | `TA_FFMPEG_BINARY` | override the `ffmpeg` executable path |
-| `TA_PROVIDER_TIMEOUT_SECONDS` | provider HTTP timeout |
+| `TA_PROVIDER_TIMEOUT_SECONDS` | provider HTTP timeout for transcription providers without a provider-specific override; defaults to 300 seconds |
 | `TA_ADAPTER_RETRY_ATTEMPTS` | retry attempts for provider calls |
 | `TA_ADAPTER_INITIAL_BACKOFF_SECONDS` | initial retry backoff |
 | `TA_ADAPTER_MAX_BACKOFF_SECONDS` | max retry backoff |

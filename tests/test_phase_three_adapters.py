@@ -504,6 +504,72 @@ def test_assemblyai_adapter_rejects_missing_timed_segments(tmp_path: Path) -> No
         adapter.transcribe(audio_artifact, _request_context())
 
 
+def test_assemblyai_adapter_reuses_cached_upload_for_same_media(tmp_path: Path) -> None:
+    blob_store = LocalBlobStore(tmp_path / "blobs")
+    audio_artifact = _audio_artifact()
+    request_context = _request_context()
+    blob_store.put_bytes(audio_artifact.blob_ref, b"audio-bytes")
+    transport = SequencedTransport(
+        [
+            _json_response({"upload_url": "https://upload.example/audio.wav"}),
+            _json_response({"id": "tr-job-1"}),
+            _json_response(
+                {
+                    "id": "tr-job-1",
+                    "status": "completed",
+                    "text": "Hello world",
+                    "utterances": [
+                        {
+                            "start": 0,
+                            "end": 1000,
+                            "speaker": "A",
+                            "text": "Hello world",
+                            "confidence": 0.98,
+                        }
+                    ],
+                }
+            ),
+            _json_response({"id": "tr-job-2"}),
+            _json_response(
+                {
+                    "id": "tr-job-2",
+                    "status": "completed",
+                    "text": "Hello again",
+                    "utterances": [
+                        {
+                            "start": 0,
+                            "end": 1000,
+                            "speaker": "A",
+                            "text": "Hello again",
+                            "confidence": 0.98,
+                        }
+                    ],
+                }
+            ),
+        ]
+    )
+    adapter = AssemblyAITranscriptionAdapter(
+        api_key="test-key",
+        blob_store=blob_store,
+        transport=transport,
+        retry_policy=_retry_policy(),
+        sleep=lambda _: None,
+    )
+
+    first = adapter.transcribe(audio_artifact, request_context)
+    second = adapter.transcribe(audio_artifact, request_context)
+
+    assert first.provider_request_id == "tr-job-1"
+    assert second.provider_request_id == "tr-job-2"
+    assert [request.url for request in transport.requests] == [
+        "https://api.assemblyai.com/v2/upload",
+        "https://api.assemblyai.com/v2/transcript",
+        "https://api.assemblyai.com/v2/transcript/tr-job-1",
+        "https://api.assemblyai.com/v2/transcript",
+        "https://api.assemblyai.com/v2/transcript/tr-job-2",
+    ]
+
+
 def test_assemblyai_adapter_rejects_malformed_payload(tmp_path: Path) -> None:
     blob_store = LocalBlobStore(tmp_path / "blobs")
     audio_artifact = _audio_artifact()
@@ -680,6 +746,22 @@ def test_speechmatics_adapter_retries_and_normalizes_segments(tmp_path: Path) ->
     assert blob_store.exists(candidate.raw_payload_ref or "")
 
 
+def test_speechmatics_fetch_job_normalizes_nested_cloud_status(tmp_path: Path) -> None:
+    blob_store = LocalBlobStore(tmp_path / "blobs")
+    transport = SequencedTransport([_json_response({"job": {"id": "sm-job", "status": "done"}})])
+    adapter = SpeechmaticsTranscriptionAdapter(
+        api_key="test-key",
+        blob_store=blob_store,
+        transport=transport,
+        retry_policy=_retry_policy(),
+        sleep=lambda _: None,
+    )
+
+    payload = adapter._fetch_job("sm-job")
+
+    assert payload["status"] == "done"
+
+
 def test_speechmatics_adapter_retries_timeout(tmp_path: Path) -> None:
     blob_store = LocalBlobStore(tmp_path / "blobs")
     audio_artifact = _audio_artifact()
@@ -831,7 +913,47 @@ def test_deepgram_adapter_retries_and_normalizes_utterances(tmp_path: Path) -> N
     assert candidate.provider_request_id == "dg-job"
     assert candidate.full_text == "Hello world"
     assert candidate.segments[0].speaker == "speaker-0"
+    assert "utt_split=0.8" in transport.requests[1].url
     assert blob_store.exists(candidate.raw_payload_ref or "")
+
+
+def test_deepgram_adapter_respects_configured_utterance_split(tmp_path: Path) -> None:
+    blob_store = LocalBlobStore(tmp_path / "blobs")
+    audio_artifact = _audio_artifact()
+    blob_store.put_bytes(audio_artifact.blob_ref, b"audio-bytes")
+    transport = SequencedTransport(
+        [
+            _json_response(
+                {
+                    "metadata": {"request_id": "dg-job"},
+                    "results": {
+                        "channels": [{"alternatives": [{"transcript": "Hello world"}]}],
+                        "utterances": [
+                            {
+                                "start": 0.0,
+                                "end": 1.0,
+                                "speaker": 0,
+                                "transcript": "Hello world",
+                                "confidence": 0.96,
+                            }
+                        ],
+                    },
+                }
+            ),
+        ]
+    )
+    adapter = DeepgramTranscriptionAdapter(
+        api_key="test-key",
+        blob_store=blob_store,
+        utterance_split_seconds=0.6,
+        transport=transport,
+        retry_policy=_retry_policy(),
+        sleep=lambda _: None,
+    )
+
+    adapter.transcribe(audio_artifact, _request_context())
+
+    assert "utt_split=0.6" in transport.requests[0].url
 
 
 def test_deepgram_adapter_rejects_missing_timed_segments(tmp_path: Path) -> None:
@@ -1452,6 +1574,51 @@ def test_phase_three_normalization_helpers_canonicalize_candidates() -> None:
     assert normalized_translation.metadata["prompt"]["variant_id"] == "variant-a"
     assert normalized_translation.metadata["prompt"]["version"] == "phase-3-v1"
     assert normalized_translation.metadata["prompt"]["model_id"] == "gpt-5.4-mini"
+
+
+def test_normalize_transcript_candidate_resegments_overlong_segments() -> None:
+    transcript = TranscriptCandidate(
+        candidate_id="tr-overlong",
+        job_id="job-phase-three",
+        provider_id="assemblyai",
+        provider_request_id="req-overlong",
+        language="ko",
+        segments=(
+            Segment(
+                segment_id="seg-assemblyai-28",
+                start_ms=306_177,
+                end_ms=357_195,
+                speaker="speaker-a",
+                source_text=(
+                    "이제 감이 왔어요. 감이 왔어요. 감축드리오미. 아 감사합니다. "
+                    "아니 근데 재혁이는 재혁이랑 데이트만 하고 나면 다 재혁이한테 표가 가나요? "
+                    "저는 어제 은별님이랑 데이트가 너무 좋았는데 또 막상 오늘 서현님이랑도 하니까 "
+                    "데이트가 너무 좋았어가지고 그냥.."
+                ),
+            ),
+        ),
+        full_text="",
+        raw_payload_ref=_artifact_path("raw", "provider-payloads", "assemblyai.json"),
+        normalization_version="raw",
+        metadata={},
+    )
+
+    normalized = normalize_transcript_candidate(transcript)
+
+    assert normalized.normalization_version == CURRENT_NORMALIZATION_VERSION
+    assert len(normalized.segments) >= 4
+    assert normalized.segments[0].start_ms == 306_177
+    assert normalized.segments[-1].end_ms == 357_195
+    assert all(segment.end_ms - segment.start_ms <= 15_000 for segment in normalized.segments)
+    assert all(segment.speaker == "speaker-a" for segment in normalized.segments)
+    assert all(
+        segment.annotations.get("source_segment_id") == "seg-assemblyai-28"
+        for segment in normalized.segments
+    )
+    assert normalized.metadata["transcript_resegmented"] is True
+    assert normalized.metadata["transcript_resegmented_source_segment_count"] == 1
+    assert normalized.metadata["transcript_segment_count_before"] == 1
+    assert normalized.metadata["transcript_segment_count_after"] == len(normalized.segments)
 
 
 def test_phase_three_runtime_uses_configured_ffmpeg_retry_budget(
@@ -2220,7 +2387,7 @@ def test_build_real_transcription_adapters_uses_assemblyai_specific_timeout(
 
     runtime_module._build_real_transcription_adapters(
         settings=_real_settings(
-            provider_timeout_seconds=30.0,
+            provider_timeout_seconds=300.0,
             assemblyai_timeout_seconds=300.0,
         ),
         blob_store=LocalBlobStore(tmp_path / "blobs"),
@@ -2229,6 +2396,6 @@ def test_build_real_transcription_adapters_uses_assemblyai_specific_timeout(
 
     assert captured_timeouts == {
         "assemblyai": 300.0,
-        "speechmatics": 30.0,
-        "deepgram": 30.0,
+        "speechmatics": 300.0,
+        "deepgram": 300.0,
     }

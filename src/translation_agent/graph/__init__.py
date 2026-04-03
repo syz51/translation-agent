@@ -1,8 +1,10 @@
 """Workflow graph package."""
 
 from .builder import (
+    build_transcription_resume_graph,
     build_translation_resume_graph,
     build_workflow_graph,
+    run_transcription_resume_workflow,
     run_translation_resume_workflow,
     run_workflow,
     sync_trace_artifact,
@@ -34,8 +36,10 @@ __all__ = [
     "build_runtime",
     "build_phase_three_runtime",
     "build_phase_two_runtime",
+    "build_transcription_resume_graph",
     "build_translation_resume_graph",
     "build_workflow_graph",
+    "run_transcription_resume_workflow",
     "run_translation_resume_workflow",
     "run_workflow",
     "sync_trace_artifact",

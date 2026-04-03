@@ -55,7 +55,7 @@ class Settings(BaseSettings):
     adapter_mode: Literal["fake", "real"] = "fake"
     allow_langgraph_py314_warning: bool = False
     ffmpeg_binary: str = "ffmpeg"
-    provider_timeout_seconds: float = 30.0
+    provider_timeout_seconds: float = 300.0
     translation_timeout_seconds: float = 90.0
     assemblyai_timeout_seconds: float = 300.0
     adapter_retry_attempts: int = Field(default=3, ge=1, le=5)
@@ -70,6 +70,7 @@ class Settings(BaseSettings):
     speechmatics_base_url: str = "https://eu1.asr.api.speechmatics.com/v2"
     deepgram_api_key: str | None = None
     deepgram_base_url: str = "https://api.deepgram.com/v1/listen"
+    deepgram_utterance_split_seconds: float = Field(default=0.8, ge=0.2, le=3.0)
     openai_api_key: str | None = None
     openai_base_url: str = "https://api.openai.com/v1/responses"
     default_source_language: str = "en"

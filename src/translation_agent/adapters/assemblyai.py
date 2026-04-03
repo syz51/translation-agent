@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Callable
 from typing import Any
 
@@ -18,7 +20,7 @@ from translation_agent.adapters.common import (
     require_usable_timed_segments,
 )
 from translation_agent.models import AudioArtifact, RequestContext, Segment, TranscriptCandidate
-from translation_agent.storage import BlobStore, job_path, job_scope_token
+from translation_agent.storage import BlobStore, asset_path, job_path, job_scope_token
 
 JsonFetcher = Callable[[str], dict[str, Any]]
 
@@ -62,14 +64,9 @@ class AssemblyAITranscriptionAdapter:
         request_context: RequestContext,
     ) -> tuple[TranscriptCandidate, dict[str, Any]]:
         audio_bytes = self._blob_store.read_bytes(audio_artifact.blob_ref)
-        upload_payload = perform_with_retries(
-            lambda: self._upload_audio(audio_bytes),
-            provider_id=self.provider_id,
-            retry_policy=self._retry_policy,
-            sleep=self._sleep,
-        )
+        upload_url = self._upload_url(audio_bytes, request_context)
         transcript_job = perform_with_retries(
-            lambda: self._create_transcript(upload_payload["upload_url"], request_context),
+            lambda: self._create_transcript(upload_url, request_context),
             provider_id=self.provider_id,
             retry_policy=self._retry_policy,
             sleep=self._sleep,
@@ -104,6 +101,20 @@ class AssemblyAITranscriptionAdapter:
             ),
             final_payload,
         )
+
+    def _upload_url(self, audio_bytes: bytes, request_context: RequestContext) -> str:
+        cached_upload_url = self._cached_upload_url(audio_bytes, request_context)
+        if cached_upload_url is not None:
+            return cached_upload_url
+        upload_payload = perform_with_retries(
+            lambda: self._upload_audio(audio_bytes),
+            provider_id=self.provider_id,
+            retry_policy=self._retry_policy,
+            sleep=self._sleep,
+        )
+        upload_url = _require_string(upload_payload, "upload_url", provider_id=self.provider_id)
+        self._store_upload_cache(audio_bytes, request_context, upload_url)
+        return upload_url
 
     def _upload_audio(self, audio_bytes: bytes) -> dict[str, Any]:
         response = self._transport.request(
@@ -150,6 +161,49 @@ class AssemblyAITranscriptionAdapter:
         if content_type is not None:
             headers["content-type"] = content_type
         return headers
+
+    def _cached_upload_url(
+        self,
+        audio_bytes: bytes,
+        request_context: RequestContext,
+    ) -> str | None:
+        cache_ref = _upload_cache_ref(request_context)
+        if not self._blob_store.exists(cache_ref):
+            return None
+        try:
+            payload = json.loads(self._blob_store.read_bytes(cache_ref).decode("utf-8"))
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        if payload.get("audio_sha256") != _audio_sha256(audio_bytes):
+            return None
+        upload_url = payload.get("upload_url")
+        if isinstance(upload_url, str) and upload_url:
+            return upload_url
+        return None
+
+    def _store_upload_cache(
+        self,
+        audio_bytes: bytes,
+        request_context: RequestContext,
+        upload_url: str,
+    ) -> None:
+        self._blob_store.put_bytes(
+            _upload_cache_ref(request_context),
+            (
+                json.dumps(
+                    {
+                        "provider_id": self.provider_id,
+                        "audio_sha256": _audio_sha256(audio_bytes),
+                        "upload_url": upload_url,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n"
+            ).encode("utf-8"),
+        )
 
     def _store_raw_payload(self, key: str, payload: dict[str, Any]) -> None:
         self._blob_store.put_bytes(key, (_json(payload) + "\n").encode("utf-8"))
@@ -224,6 +278,19 @@ def _assemblyai_speaker_name(value: object) -> str | None:
     if not cleaned:
         return None
     return f"speaker-{cleaned.lower()}"
+
+
+def _audio_sha256(audio_bytes: bytes) -> str:
+    return hashlib.sha256(audio_bytes).hexdigest()
+
+
+def _upload_cache_ref(request_context: RequestContext) -> str:
+    return asset_path(
+        request_context.job.media_key,
+        "provider-cache",
+        "assemblyai",
+        "upload.json",
+    )
 
 
 def _build_request(

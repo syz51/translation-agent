@@ -60,7 +60,7 @@ from translation_agent.storage import (
 )
 
 PHASE_TWO_NORMALIZATION_VERSION = "2026-03-30-phase-2"
-PHASE_THREE_NORMALIZATION_VERSION = "2026-03-30-phase-3"
+PHASE_THREE_NORMALIZATION_VERSION = "2026-04-03-phase-4"
 DEFAULT_SCENARIO = "happy"
 
 
@@ -645,6 +645,7 @@ def _build_real_transcription_adapters(
                 blob_store=blob_store,
                 api_key=_required_setting(settings.deepgram_api_key, "TA_DEEPGRAM_API_KEY"),
                 base_url=settings.deepgram_base_url,
+                utterance_split_seconds=settings.deepgram_utterance_split_seconds,
                 timeout_seconds=settings.provider_timeout_seconds,
                 retry_policy=retry_policy,
             )

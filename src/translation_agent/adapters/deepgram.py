@@ -35,6 +35,7 @@ class DeepgramTranscriptionAdapter:
         blob_store: BlobStore,
         base_url: str = "https://api.deepgram.com/v1/listen",
         model: str = "nova-3",
+        utterance_split_seconds: float = 0.8,
         timeout_seconds: float = 60.0,
         retry_policy: RetryPolicy | None = None,
         transport: HttpTransport | None = None,
@@ -44,6 +45,7 @@ class DeepgramTranscriptionAdapter:
         self._blob_store = blob_store
         self._base_url = base_url
         self._model = model
+        self._utterance_split_seconds = utterance_split_seconds
         self._timeout_seconds = timeout_seconds
         self._retry_policy = retry_policy or RetryPolicy()
         self._transport = transport or StdlibHttpTransport()
@@ -100,6 +102,7 @@ class DeepgramTranscriptionAdapter:
                 "model": self._model,
                 "diarize": "true",
                 "utterances": "true",
+                "utt_split": f"{self._utterance_split_seconds:g}",
                 "smart_format": "true",
                 "language": request_context.job.source_language,
             }

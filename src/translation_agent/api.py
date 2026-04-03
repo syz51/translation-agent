@@ -15,12 +15,14 @@ from translation_agent.graph import (
     GraphState,
     RoutingFact,
     build_runtime,
+    run_transcription_resume_workflow,
     run_translation_resume_workflow,
     run_workflow,
     sync_trace_artifact,
 )
 from translation_agent.media_identity import compute_media_fingerprint
 from translation_agent.models import (
+    AudioArtifact,
     FinalTranscriptDecision,
     HistoricalRunLink,
     JobContext,
@@ -28,6 +30,7 @@ from translation_agent.models import (
     TranslationCandidate,
 )
 from translation_agent.nodes.common import (
+    audio_artifact_key,
     raw_transcript_candidate_key,
     transcript_candidate_key,
     transcript_decision_key,
@@ -105,6 +108,7 @@ class ConvertTranslationJsonToSrtResult:
 
 @dataclass(slots=True)
 class ResumedTranscriptState:
+    audio_artifact_ref: str | None
     transcript_candidate_ids: tuple[str, ...]
     final_transcript_candidate_id: str | None
     final_transcript_decision_ref: str | None
@@ -677,6 +681,315 @@ def resume_translation(
     return result
 
 
+def resume_transcription(
+    source_run_id: str,
+    *,
+    provider_ids: tuple[str, ...] | None = None,
+    review_mode: Literal["auto", "always", "never"] = "auto",
+    settings: Settings | None = None,
+) -> RunJobResult:
+    """Resume transcription from persisted audio while preserving other providers."""
+
+    settings = settings or load_settings()
+    validation = validate_environment(settings)
+    if not validation.ok:
+        message = validation.state_db_error or "invalid runtime configuration"
+        raise RuntimeError(message)
+    blob_dir = settings.blob_dir
+    trace_dir = settings.trace_dir
+
+    configure_structured_logging()
+    logger = get_structured_logger("translation_agent.api")
+    blob_store = LocalBlobStore(blob_dir)
+
+    now = datetime.now(UTC)
+    new_run_id = uuid4().hex
+    requested_provider_ids = _normalized_provider_ids(provider_ids)
+
+    with _open_operational_store(settings) as store:
+        source_run = store.get_run(source_run_id)
+        if source_run is None:
+            raise ValueError(f"unknown run_id: {source_run_id}")
+        source_input = _dict_payload(source_run.input_data)
+        source_artifact_ref = _required_artifact_ref(source_input, run_id=source_run_id)
+        request_payload = json.loads(blob_store.read_bytes(source_artifact_ref).decode("utf-8"))
+        source_job = _job_context_from_run(
+            run_record=source_run,
+            input_data=source_input,
+            request_payload=request_payload,
+        )
+        source_metadata = _dict_payload(source_run.metadata)
+        transcript_candidates = store.list_transcript_candidates(
+            source_job.job_id,
+            storage_job_id=operational_job_key(source_job),
+        )
+        failed_provider_ids = _failed_transcription_provider_ids(
+            store=store,
+            source_run=source_run,
+        )
+        retry_provider_ids = requested_provider_ids or failed_provider_ids
+        if not retry_provider_ids:
+            raise ValueError(
+                f"run {source_run_id} does not have failed transcription providers to resume from"
+            )
+        resumed_job_id = _resume_job_id(source_job.job_id, new_run_id)
+        resumed_job = source_job.model_copy(
+            update={
+                "job_id": resumed_job_id,
+                "created_at": now,
+            }
+        )
+        request_artifact = blob_store.put_bytes(
+            f"jobs/{new_run_id}-request.json",
+            _serialize_resume_request_payload(
+                request_payload,
+                source_job=source_job,
+                resumed_job=resumed_job,
+                created_at=now,
+                resumed_from_run_id=source_run_id,
+            ).encode("utf-8"),
+        )
+        resume_metadata = {
+            **{key: value for key, value in source_metadata.items() if isinstance(value, str)},
+            "resume_mode": "transcription",
+            "resumed_from_run_id": source_run_id,
+        }
+        store.create_run(
+            run_id=new_run_id,
+            tenant_id=resumed_job.tenant_id,
+            project_id=resumed_job.project_id,
+            status="bootstrapped",
+            input_data={
+                "job_id": resumed_job.job_id,
+                "source": resumed_job.source_video_ref,
+                "artifact_ref": request_artifact.key,
+                "asset_id": resumed_job.asset_id,
+                "media_fingerprint": resumed_job.media_fingerprint,
+                "media_key": resumed_job.media_key,
+                "reference_mode": resumed_job.reference_mode,
+                "resumed_from_run_id": source_run_id,
+                "resume_mode": "transcription",
+                "retry_provider_ids": list(retry_provider_ids),
+            },
+            metadata=resume_metadata,
+        )
+        store.upsert_historical_run_link(
+            HistoricalRunLink(
+                run_id=new_run_id,
+                media_key=resumed_job.media_key,
+                job_id=resumed_job.job_id,
+                tenant_id=resumed_job.tenant_id,
+                project_id=resumed_job.project_id,
+                source_language=resumed_job.source_language,
+                target_language=resumed_job.target_language,
+                created_at=resumed_job.created_at,
+            )
+        )
+        transcript_state = _seed_resumed_transcription_retry_state(
+            store=store,
+            blob_store=blob_store,
+            source_job=source_job,
+            resumed_job=resumed_job,
+            source_run_id=source_run_id,
+            transcript_candidates=transcript_candidates,
+            retry_provider_ids=retry_provider_ids,
+        )
+
+    trace_path = trace_dir / f"{new_run_id}.jsonl"
+    with JsonlTraceSink(trace_path) as trace_sink:
+        runtime_run_store = _open_operational_store(settings)
+        runtime = None
+        try:
+            runtime = build_runtime(
+                settings=settings,
+                blob_store=blob_store,
+                run_store=runtime_run_store,
+                decision_store=runtime_run_store,
+                memory_batch_store=runtime_run_store,
+                trace_sink=trace_sink,
+                source_artifact_ref=request_artifact.key,
+                scenario=resume_metadata.get("scenario", "happy"),
+            )
+            runtime.transcription_adapters = _selected_transcription_adapters(
+                runtime.transcription_adapters,
+                retry_provider_ids=retry_provider_ids,
+            )
+            trace_sink.record(
+                TraceEvent(
+                    run_id=new_run_id,
+                    name="run.bootstrapped",
+                    attributes={
+                        "job_id": resumed_job.job_id,
+                        "source": resumed_job.source_video_ref,
+                        "artifact_ref": request_artifact.key,
+                        "resumed_from_run_id": source_run_id,
+                        "resume_mode": "transcription",
+                        "retry_provider_ids": list(retry_provider_ids),
+                    },
+                )
+            )
+            initial_state = GraphState(
+                run_id=new_run_id,
+                job=resumed_job,
+                current_stage="fanout_transcription",
+                source_video_ref=resumed_job.source_video_ref,
+                source_artifact_ref=request_artifact.key,
+                audio_artifact_ref=transcript_state.audio_artifact_ref,
+                transcript_candidate_ids=transcript_state.transcript_candidate_ids,
+                routing_facts=transcript_state.routing_facts,
+            )
+            runtime.run_store.update_run(new_run_id, status="running")
+            trace_sink.record(
+                TraceEvent(
+                    run_id=new_run_id,
+                    name="run.started",
+                    attributes={
+                        "job_id": resumed_job.job_id,
+                        "scenario": runtime.scenario,
+                        "resumed_from_run_id": source_run_id,
+                        "resume_mode": "transcription",
+                        "retry_provider_ids": list(retry_provider_ids),
+                    },
+                )
+            )
+            final_state = run_transcription_resume_workflow(initial_state, runtime)
+            _upsert_current_run_link(runtime_run_store, final_state)
+        except Exception as exc:
+            error_payload = exception_error_payload(exc)
+            runtime_run_store.update_run(
+                new_run_id,
+                status="failed",
+                output_data={"final_stage": "bootstrap" if runtime is None else None},
+                error=error_payload,
+            )
+            trace_sink.record(
+                TraceEvent(
+                    run_id=new_run_id,
+                    name="run.failed",
+                    attributes={
+                        "error": error_payload["message"],
+                        "error_payload": error_payload,
+                        "phase": "bootstrap" if runtime is None else "run",
+                        "resumed_from_run_id": source_run_id,
+                    },
+                )
+            )
+            log_structured_event(
+                logger,
+                "run.failed",
+                level="error",
+                run_id=new_run_id,
+                job_id=resumed_job.job_id,
+                source=resumed_job.source_video_ref,
+                artifact_ref=request_artifact.key,
+                error=error_payload["message"],
+                error_payload=error_payload,
+                trace_path=str(trace_path),
+            )
+            runtime_run_store.close()
+            raise
+
+        final_status = _final_status(final_state)
+        failure_ref, failure_summary, failure_reasons = _failure_details(
+            final_state=final_state,
+            blob_store=blob_store,
+        )
+        terminal_error = _terminal_run_error(
+            final_state=final_state,
+            failure_ref=failure_ref,
+            failure_summary=failure_summary,
+            failure_reasons=failure_reasons,
+            translation_provider_id=getattr(runtime.translation_adapter, "provider_id", None),
+        )
+        runtime_run_store.update_run(
+            new_run_id,
+            status=final_status,
+            output_data={
+                "final_stage": final_state.current_stage,
+                "published_artifact_refs": list(final_state.published_artifact_refs),
+                "human_review_required": final_state.human_review_required,
+                "review_required_stage": final_state.review_required_stage,
+                "translation_failed": final_state.translation_failed,
+                "memory_batch_ids": list(final_state.memory_batch_ids),
+                "media_key": final_state.job.media_key,
+                "transcript_decision_ref": final_state.final_transcript_decision_ref,
+                "translation_decision_ref": final_state.final_translation_decision_ref,
+                "transcript_investigation_ref": _investigation_ref(
+                    final_state,
+                    stage="transcript",
+                ),
+                "translation_investigation_ref": _investigation_ref(
+                    final_state,
+                    stage="translation",
+                ),
+                "reference_transcript_ref": final_state.reference_transcript_ref,
+                "evaluation_report_ref": final_state.evaluation_report_ref,
+                "regenerated_translation_draft_ref": final_state.regenerated_translation_draft_ref,
+                "improvement_proposal_refs": list(final_state.improvement_proposal_refs),
+                "approval_ref": final_state.approval_ref,
+                "approved_candidate_id": final_state.approved_candidate_id,
+                "approved_source_transcript_candidate_id": (
+                    final_state.approved_source_transcript_candidate_id
+                ),
+                "failure_ref": failure_ref,
+                "failure_summary": failure_summary,
+                "failure_reasons": list(failure_reasons),
+                "resumed_from_run_id": source_run_id,
+                "retry_provider_ids": list(retry_provider_ids),
+            },
+            error=terminal_error,
+        )
+        trace_sink.record(
+            TraceEvent(
+                run_id=new_run_id,
+                name="run.completed",
+                attributes={
+                    "status": final_status,
+                    "published_artifact_refs": list(final_state.published_artifact_refs),
+                    "resumed_from_run_id": source_run_id,
+                    "retry_provider_ids": list(retry_provider_ids),
+                },
+            )
+        )
+        sync_trace_artifact(final_state, runtime)
+        runtime_run_store.close()
+
+    log_structured_event(
+        logger,
+        "run.completed",
+        run_id=new_run_id,
+        job_id=resumed_job.job_id,
+        source=resumed_job.source_video_ref,
+        artifact_ref=request_artifact.key,
+        status=final_status,
+        trace_path=str(trace_path),
+    )
+    result = RunJobResult(
+        run_id=new_run_id,
+        job_id=resumed_job.job_id,
+        status=final_status,
+        source=resumed_job.source_video_ref,
+        source_language=final_state.job.source_language,
+        target_language=final_state.job.target_language,
+        blob_root=blob_dir,
+        state_backend=validation.state_backend,
+        state_db_target=validation.state_db_target,
+        trace_path=trace_path,
+        default_output_path=_default_output_path(blob_dir, final_state),
+        failure_ref=failure_ref,
+        failure_summary=failure_summary,
+        failure_reasons=failure_reasons,
+        review_required_stage=final_state.review_required_stage,
+        approval_ref=final_state.approval_ref,
+        approved_candidate_id=final_state.approved_candidate_id,
+        approved_source_transcript_candidate_id=final_state.approved_source_transcript_candidate_id,
+        resume_commands=_resume_commands(new_run_id, final_state),
+    )
+    if review_mode == "never":
+        return result
+    return result
+
+
 def review_job(
     run_id: str,
     *,
@@ -780,6 +1093,20 @@ def _job_context_from_run(
 
 def _resume_job_id(source_job_id: str, new_run_id: str) -> str:
     return f"{source_job_id}-resume-{new_run_id[:8]}"
+
+
+def _normalized_provider_ids(provider_ids: tuple[str, ...] | None) -> tuple[str, ...]:
+    if not provider_ids:
+        return ()
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for provider_id in provider_ids:
+        cleaned = str(provider_id).strip().lower()
+        if not cleaned or cleaned in seen:
+            continue
+        normalized.append(cleaned)
+        seen.add(cleaned)
+    return tuple(normalized)
 
 
 def _serialize_resume_request_payload(
@@ -936,11 +1263,188 @@ def _seed_resumed_transcript_state(
         )
 
     return ResumedTranscriptState(
+        audio_artifact_ref=None,
         transcript_candidate_ids=tuple(copied_candidate_ids),
         final_transcript_candidate_id=final_transcript_candidate_id,
         final_transcript_decision_ref=copied_decision_ref,
         routing_facts=tuple(routing_facts),
     )
+
+
+def _seed_resumed_transcription_retry_state(
+    *,
+    store,
+    blob_store: LocalBlobStore,
+    source_job: JobContext,
+    resumed_job: JobContext,
+    source_run_id: str,
+    transcript_candidates: list[TranscriptCandidate],
+    retry_provider_ids: tuple[str, ...],
+) -> ResumedTranscriptState:
+    copied_audio = _copy_audio_artifact(
+        blob_store=blob_store,
+        source_job=source_job,
+        resumed_job=resumed_job,
+        source_run_id=source_run_id,
+    )
+    copied_candidate_ids: list[str] = []
+    storage_job_id = operational_job_key(resumed_job)
+    retry_provider_id_set = set(retry_provider_ids)
+    for candidate in transcript_candidates:
+        if candidate.provider_id in retry_provider_id_set:
+            continue
+        copied_raw_payload_ref = candidate.raw_payload_ref
+        if candidate.raw_payload_ref and blob_store.exists(candidate.raw_payload_ref):
+            copied_raw_payload_ref = raw_transcript_candidate_key(
+                resumed_job,
+                candidate.provider_id,
+            )
+            blob_store.put_bytes(
+                copied_raw_payload_ref,
+                blob_store.read_bytes(candidate.raw_payload_ref),
+            )
+        copied_candidate = candidate.model_copy(
+            update={
+                "job_id": resumed_job.job_id,
+                "raw_payload_ref": copied_raw_payload_ref,
+                "metadata": {
+                    **candidate.metadata,
+                    "raw_payload_ref": copied_raw_payload_ref,
+                    "resumed_from_run_id": source_run_id,
+                },
+            }
+        )
+        store.save_transcript_candidate(copied_candidate, storage_job_id=storage_job_id)
+        _write_blob_model_artifact(
+            blob_store,
+            transcript_candidate_key(resumed_job, copied_candidate.candidate_id),
+            copied_candidate,
+        )
+        copied_candidate_ids.append(copied_candidate.candidate_id)
+
+    routing_facts = [  # preserve the provenance and the explicit retry target set
+        RoutingFact(
+            stage="resume_transcription",
+            fact_type="resumed_from_run",
+            value=source_run_id,
+            source_ref=audio_artifact_key(resumed_job),
+        ),
+        *(
+            RoutingFact(
+                stage="resume_transcription",
+                fact_type="transcription_provider_retry_requested",
+                value=provider_id,
+                source_ref=audio_artifact_key(resumed_job),
+            )
+            for provider_id in retry_provider_ids
+        ),
+    ]
+
+    return ResumedTranscriptState(
+        audio_artifact_ref=copied_audio.blob_ref,
+        transcript_candidate_ids=tuple(copied_candidate_ids),
+        final_transcript_candidate_id=None,
+        final_transcript_decision_ref=None,
+        routing_facts=tuple(routing_facts),
+    )
+
+
+def _copy_audio_artifact(
+    *,
+    blob_store: LocalBlobStore,
+    source_job: JobContext,
+    resumed_job: JobContext,
+    source_run_id: str,
+) -> AudioArtifact:
+    source_audio_ref = audio_artifact_key(source_job)
+    if not blob_store.exists(source_audio_ref):
+        raise ValueError(f"run {source_run_id} does not have a persisted audio artifact to resume")
+    source_audio = AudioArtifact.model_validate_json(blob_store.read_bytes(source_audio_ref))
+    if not blob_store.exists(source_audio.blob_ref):
+        raise ValueError(f"run {source_run_id} is missing audio blob {source_audio.blob_ref}")
+    copied_blob_ref = job_path(resumed_job, "artifacts", Path(source_audio.blob_ref).name)
+    blob_store.put_bytes(copied_blob_ref, blob_store.read_bytes(source_audio.blob_ref))
+    copied_audio = source_audio.model_copy(
+        update={
+            "job_id": resumed_job.job_id,
+            "blob_ref": copied_blob_ref,
+            "extraction_metadata": {
+                **source_audio.extraction_metadata,
+                "resumed_from_run_id": source_run_id,
+            },
+        }
+    )
+    _write_blob_model_artifact(blob_store, audio_artifact_key(resumed_job), copied_audio)
+    return copied_audio
+
+
+def _failed_transcription_provider_ids(
+    *,
+    store,
+    source_run: RunRecord,
+) -> tuple[str, ...]:
+    provider_ids: list[str] = []
+    seen: set[str] = set()
+    error_payload = _dict_payload(source_run.error)
+    for provider_id in _provider_ids_from_error_payload(error_payload):
+        if provider_id in seen:
+            continue
+        provider_ids.append(provider_id)
+        seen.add(provider_id)
+    for node_execution in store.list_node_executions(source_run.run_id):
+        if node_execution.node_name != "fanout_transcription":
+            continue
+        payload = _dict_payload(node_execution.output_data)
+        for fact in payload.get("routing_facts", []):
+            if not isinstance(fact, dict):
+                continue
+            if fact.get("fact_type") != "transcription_provider_failed":
+                continue
+            provider_id = _normalized_optional_identifier(str(fact.get("value") or ""))
+            if provider_id is None or provider_id in seen:
+                continue
+            provider_ids.append(provider_id)
+            seen.add(provider_id)
+    return tuple(provider_ids)
+
+
+def _provider_ids_from_error_payload(error_payload: dict[str, Any]) -> tuple[str, ...]:
+    entries = error_payload.get("provider_errors")
+    if not isinstance(entries, list):
+        return ()
+    provider_ids: list[str] = []
+    seen: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        provider_id = _normalized_optional_identifier(str(entry.get("provider_id") or ""))
+        if provider_id is None or provider_id in seen:
+            continue
+        provider_ids.append(provider_id)
+        seen.add(provider_id)
+    return tuple(provider_ids)
+
+
+def _selected_transcription_adapters(
+    adapters,
+    *,
+    retry_provider_ids: tuple[str, ...],
+):
+    retry_provider_id_set = set(retry_provider_ids)
+    selected = tuple(
+        adapter
+        for adapter in adapters
+        if getattr(adapter, "provider_id", None) in retry_provider_id_set
+    )
+    missing_provider_ids = sorted(
+        retry_provider_id_set - {getattr(adapter, "provider_id", None) for adapter in selected}
+    )
+    if missing_provider_ids:
+        raise ValueError(
+            "requested transcription providers are not available in current runtime: "
+            + ", ".join(missing_provider_ids)
+        )
+    return selected
 
 
 def _fallback_final_transcript_candidate_id(

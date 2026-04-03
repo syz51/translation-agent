@@ -15,6 +15,7 @@ from translation_agent.api import (
     _failure_details,
     _final_status,
     list_runs,
+    resume_transcription,
     resume_translation,
     review_job,
     run_job,
@@ -159,6 +160,15 @@ def test_load_settings_reads_environment(monkeypatch, tmp_path: Path) -> None:
     assert settings.state_db_dsn == (
         "postgresql://user:secret@db.example.com:5432/translation_agent?sslmode=require"
     )
+
+
+@pytest.mark.unit
+def test_load_settings_defaults_provider_timeout_to_five_minutes(monkeypatch) -> None:
+    monkeypatch.delenv("TA_PROVIDER_TIMEOUT_SECONDS", raising=False)
+
+    settings = load_settings(env_file=None)
+
+    assert settings.provider_timeout_seconds == 300.0
 
 
 @pytest.mark.unit
@@ -901,7 +911,7 @@ def test_cli_convert_json_to_srt_matches_published_export_in_postgres_runtime(
     assert exit_code == 0
     assert lines == [
         str(converted_output_path.resolve()),
-        "subtitles: 1",
+        "subtitles: 2",
     ]
     assert converted_output_path.read_text(encoding="utf-8") == existing_export_path.read_text(
         encoding="utf-8"
@@ -1295,6 +1305,73 @@ def test_resume_translation_from_partial_variant_run_completes(
     assert node_names[0] == "generate_translation_candidates"
 
 
+def test_resume_transcription_retries_only_failed_providers_and_preserves_successful_candidates(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("TA_DATA_DIR", str(tmp_path / "runtime"))
+    monkeypatch.delenv("TA_STATE_DB_DSN", raising=False)
+
+    source = run_job(
+        RunJobRequest(
+            source="input.mp4",
+            job_id="job-resume-transcription",
+            metadata={"scenario": "degraded_stt"},
+        )
+    )
+
+    with SQLiteOperationalStore(tmp_path / "runtime" / "state.sqlite3") as store:
+        source_record = store.get_run(source.run_id)
+        assert source_record is not None
+        source_artifact_ref = source_record.input_data["artifact_ref"]
+        store.update_run(source.run_id, metadata={"scenario": "happy"})
+    blob_store = LocalBlobStore(tmp_path / "runtime" / "blobs")
+    source_request = json.loads(blob_store.read_bytes(source_artifact_ref).decode("utf-8"))
+    source_request["metadata"] = {"scenario": "happy"}
+    blob_store.put_bytes(
+        source_artifact_ref,
+        (json.dumps(source_request, indent=2, sort_keys=True) + "\n").encode("utf-8"),
+    )
+
+    resumed = resume_transcription(
+        source.run_id,
+        provider_ids=("speechmatics",),
+        settings=load_settings(),
+    )
+
+    with SQLiteOperationalStore(tmp_path / "runtime" / "state.sqlite3") as store:
+        resumed_record = store.get_run(resumed.run_id)
+        node_names = [record.node_name for record in store.list_node_executions(resumed.run_id)]
+        resumed_transcripts = store.list_transcript_candidates(
+            resumed.job_id,
+            storage_job_id=operational_job_key(_job_context(resumed.job_id)),
+        )
+
+    assert resumed.status == "completed"
+    assert resumed_record is not None
+    assert resumed_record.input_data["resumed_from_run_id"] == source.run_id
+    assert "ingest" not in node_names
+    assert "extract_audio" not in node_names
+    assert node_names[0] == "fanout_transcription"
+    assert {candidate.provider_id for candidate in resumed_transcripts} == {
+        "assemblyai",
+        "speechmatics",
+        "deepgram",
+    }
+    assert any(
+        candidate.provider_id == "assemblyai" and source.job_id in candidate.candidate_id
+        for candidate in resumed_transcripts
+    )
+    assert any(
+        candidate.provider_id == "deepgram" and source.job_id in candidate.candidate_id
+        for candidate in resumed_transcripts
+    )
+    assert any(
+        candidate.provider_id == "speechmatics" and candidate.job_id == resumed.job_id
+        for candidate in resumed_transcripts
+    )
+
+
 @pytest.mark.unit
 def test_failure_details_returns_ref_when_manifest_missing(tmp_path: Path) -> None:
     blob_store = LocalBlobStore(tmp_path / "blobs")
@@ -1320,6 +1397,54 @@ def test_failure_details_returns_ref_when_manifest_missing(tmp_path: Path) -> No
     )
     assert failure_summary is None
     assert failure_reasons == ()
+
+
+def test_cli_resume_transcription_repeated_provider_flags_and_conditional_instructions(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("TA_DATA_DIR", str(tmp_path / "runtime"))
+    monkeypatch.delenv("TA_STATE_DB_DSN", raising=False)
+
+    source = run_job(
+        RunJobRequest(
+            source="input.mp4",
+            job_id="job-resume-transcription-cli",
+            metadata={"scenario": "degraded_stt"},
+        )
+    )
+
+    with SQLiteOperationalStore(tmp_path / "runtime" / "state.sqlite3") as store:
+        source_record = store.get_run(source.run_id)
+        assert source_record is not None
+        source_artifact_ref = source_record.input_data["artifact_ref"]
+        store.update_run(source.run_id, metadata={"scenario": "happy"})
+    blob_store = LocalBlobStore(tmp_path / "runtime" / "blobs")
+    source_request = json.loads(blob_store.read_bytes(source_artifact_ref).decode("utf-8"))
+    source_request["metadata"] = {"scenario": "happy"}
+    blob_store.put_bytes(
+        source_artifact_ref,
+        (json.dumps(source_request, indent=2, sort_keys=True) + "\n").encode("utf-8"),
+    )
+
+    exit_code = main(
+        [
+            "resume-transcription",
+            source.run_id,
+            "--provider",
+            "speechmatics",
+            "--provider",
+            "deepgram",
+        ]
+    )
+
+    output = capsys.readouterr().out
+    assert exit_code == 0
+    assert "ingest" not in output
+    assert "extract_audio" not in output
+    assert "review_required_stage" not in output
+    assert "interactive review requires a real TTY" not in output
 
 
 @pytest.mark.integration

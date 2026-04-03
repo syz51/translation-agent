@@ -348,6 +348,208 @@ def test_openai_translation_adapter_splits_partial_segment_coverage_chunks(
     assert stored_payload["chunks"][0]["response"]["id"] == "resp-parent"
 
 
+def test_openai_translation_adapter_splits_implausibly_long_segment_translations(
+    tmp_path: Path,
+) -> None:
+    blob_store = LocalBlobStore(tmp_path / "blobs")
+    transcript = _transcript_candidate()
+    runaway_text = "Bonjour " * 20
+    transport = SequencedTransport(
+        [
+            _json_response(
+                {
+                    "id": "resp-parent",
+                    "output_text": json.dumps(
+                        {
+                            "full_text": f"{runaway_text} Bonjour beta Bonjour gamma",
+                            "segments": [
+                                {"segment_id": "seg-1", "target_text": runaway_text},
+                                {"segment_id": "seg-2", "target_text": "Bonjour beta"},
+                                {"segment_id": "seg-3", "target_text": "Bonjour gamma"},
+                            ],
+                        }
+                    ),
+                }
+            ),
+            _json_response(
+                {
+                    "id": "resp-left",
+                    "output_text": json.dumps(
+                        {
+                            "full_text": "Bonjour alpha",
+                            "segments": [
+                                {"segment_id": "seg-1", "target_text": "Bonjour alpha"},
+                            ],
+                        }
+                    ),
+                }
+            ),
+            _json_response(
+                {
+                    "id": "resp-right",
+                    "output_text": json.dumps(
+                        {
+                            "full_text": "Bonjour beta Bonjour gamma",
+                            "segments": [
+                                {"segment_id": "seg-2", "target_text": "Bonjour beta"},
+                                {"segment_id": "seg-3", "target_text": "Bonjour gamma"},
+                            ],
+                        }
+                    ),
+                }
+            ),
+        ]
+    )
+    adapter = OpenAITranslationAdapter(
+        api_key="test-key",  # pragma: allowlist secret
+        blob_store=blob_store,
+        transport=transport,
+        retry_policy=RetryPolicy(max_attempts=1),
+        sleep=lambda _: None,
+        max_chunk_characters=200,
+        max_chunk_segments=10,
+        context_segment_window=1,
+    )
+
+    candidate = adapter.generate_translation(transcript, "variant-a", _request_context())
+
+    assert len(transport.requests) == 3
+    assert [segment.target_text for segment in candidate.segments] == [
+        "Bonjour alpha",
+        "Bonjour beta",
+        "Bonjour gamma",
+    ]
+
+    stored_payload = json.loads(
+        blob_store.read_bytes(candidate.raw_response_ref or "").decode("utf-8")
+    )
+    assert stored_payload["chunks"][0]["status"] == "split_after_validation_failure"
+    assert stored_payload["chunks"][0]["fallback_children"] == ["chunk-0.a", "chunk-0.b"]
+    assert stored_payload["chunks"][0]["error"]["message"].startswith(
+        "translation payload produced implausibly long text"
+    )
+
+
+def test_openai_translation_adapter_splits_segments_that_duplicate_later_text(
+    tmp_path: Path,
+) -> None:
+    blob_store = LocalBlobStore(tmp_path / "blobs")
+    transcript = _transcript_candidate().model_copy(
+        update={
+            "segments": (
+                Segment(
+                    segment_id="seg-1",
+                    start_ms=0,
+                    end_ms=1_000,
+                    speaker="speaker-1",
+                    source_text="Alpha source sentence with enough length",
+                ),
+                Segment(
+                    segment_id="seg-2",
+                    start_ms=1_000,
+                    end_ms=2_000,
+                    speaker="speaker-1",
+                    source_text="Beta source sentence with enough length",
+                ),
+                Segment(
+                    segment_id="seg-3",
+                    start_ms=2_000,
+                    end_ms=3_000,
+                    speaker="speaker-2",
+                    source_text="Gamma source sentence with enough length",
+                ),
+            ),
+            "full_text": (
+                "Alpha source sentence with enough length "
+                "Beta source sentence with enough length "
+                "Gamma source sentence with enough length"
+            ),
+        }
+    )
+    duplicated_later_text = (
+        "Je suis perdu. Les deux personnes ont un charme different. Choisir est difficile."
+    )
+    transport = SequencedTransport(
+        [
+            _json_response(
+                {
+                    "id": "resp-parent",
+                    "output_text": json.dumps(
+                        {
+                            "full_text": (
+                                f"Bonjour alpha {duplicated_later_text} {duplicated_later_text}"
+                            ),
+                            "segments": [
+                                {
+                                    "segment_id": "seg-1",
+                                    "target_text": f"Bonjour alpha {duplicated_later_text}",
+                                },
+                                {"segment_id": "seg-2", "target_text": "Bonjour beta"},
+                                {"segment_id": "seg-3", "target_text": duplicated_later_text},
+                            ],
+                        }
+                    ),
+                }
+            ),
+            _json_response(
+                {
+                    "id": "resp-left",
+                    "output_text": json.dumps(
+                        {
+                            "full_text": "Bonjour alpha",
+                            "segments": [
+                                {"segment_id": "seg-1", "target_text": "Bonjour alpha"},
+                            ],
+                        }
+                    ),
+                }
+            ),
+            _json_response(
+                {
+                    "id": "resp-right",
+                    "output_text": json.dumps(
+                        {
+                            "full_text": "Bonjour beta " + duplicated_later_text,
+                            "segments": [
+                                {"segment_id": "seg-2", "target_text": "Bonjour beta"},
+                                {"segment_id": "seg-3", "target_text": duplicated_later_text},
+                            ],
+                        }
+                    ),
+                }
+            ),
+        ]
+    )
+    adapter = OpenAITranslationAdapter(
+        api_key="test-key",  # pragma: allowlist secret
+        blob_store=blob_store,
+        transport=transport,
+        retry_policy=RetryPolicy(max_attempts=1),
+        sleep=lambda _: None,
+        max_chunk_characters=200,
+        max_chunk_segments=10,
+        context_segment_window=1,
+    )
+
+    candidate = adapter.generate_translation(transcript, "variant-a", _request_context())
+
+    assert len(transport.requests) == 3
+    assert [segment.target_text for segment in candidate.segments] == [
+        "Bonjour alpha",
+        "Bonjour beta",
+        duplicated_later_text,
+    ]
+
+    stored_payload = json.loads(
+        blob_store.read_bytes(candidate.raw_response_ref or "").decode("utf-8")
+    )
+    assert stored_payload["chunks"][0]["status"] == "split_after_validation_failure"
+    assert stored_payload["chunks"][0]["fallback_children"] == ["chunk-0.a", "chunk-0.b"]
+    assert stored_payload["chunks"][0]["error"]["message"].startswith(
+        "translation payload duplicated later segment text"
+    )
+
+
 def test_openai_translation_adapter_preserves_chunk_order_under_parallel_completion(
     tmp_path: Path,
 ) -> None:

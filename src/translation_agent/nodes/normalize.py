@@ -19,7 +19,8 @@ from translation_agent.storage import operational_job_key
 def normalize_transcripts(state: GraphState, runtime: WorkflowRuntime) -> dict[str, object]:
     """Normalize raw transcript payloads into canonical candidates."""
 
-    candidates: list[TranscriptCandidate] = []
+    candidate_ids: list[str] = list(state.transcript_candidate_ids)
+    seen_candidate_ids = set(candidate_ids)
     for raw_ref in state.raw_transcript_candidate_refs:
         candidate = read_model_artifact(runtime, raw_ref, TranscriptCandidate)
         normalized = normalized_transcript(candidate)
@@ -32,21 +33,24 @@ def normalize_transcripts(state: GraphState, runtime: WorkflowRuntime) -> dict[s
             transcript_candidate_key(state.job, normalized.candidate_id),
             normalized,
         )
-        candidates.append(normalized)
+        if normalized.candidate_id in seen_candidate_ids:
+            continue
+        candidate_ids.append(normalized.candidate_id)
+        seen_candidate_ids.add(normalized.candidate_id)
 
-    if not candidates:
+    if not candidate_ids:
         raise RuntimeError("no transcript candidates survived normalization")
 
     return {
         "current_stage": "normalize_transcripts",
-        "transcript_candidate_ids": tuple(candidate.candidate_id for candidate in candidates),
+        "transcript_candidate_ids": tuple(candidate_ids),
         "routing_facts": state.routing_facts
         + (
             RoutingFact(
                 stage="normalize_transcripts",
                 fact_type="surviving_transcript_candidates",
-                value=str(len(candidates)),
-                source_ref=transcript_candidate_key(state.job, candidates[0].candidate_id),
+                value=str(len(candidate_ids)),
+                source_ref=transcript_candidate_key(state.job, candidate_ids[0]),
             ),
         ),
     }

@@ -28,6 +28,10 @@ from translation_agent.storage import BlobStore, job_path, job_scope_token
 DEFAULT_MAX_CHUNK_CHARACTERS = 5_000
 DEFAULT_MAX_CHUNK_SEGMENTS = 100
 DEFAULT_CONTEXT_SEGMENT_WINDOW = 2
+MAX_SEGMENT_TARGET_EXPANSION_RATIO = 4
+MAX_SEGMENT_TARGET_EXPANSION_MARGIN = 80
+SEGMENT_DUPLICATION_LOOKAHEAD = 4
+MIN_DUPLICATED_SEGMENT_TEXT_LENGTH = 24
 
 
 @dataclass(frozen=True, slots=True)
@@ -514,6 +518,8 @@ def _should_split_chunk(chunk: _TranslationChunk, error: AdapterError) -> bool:
         return False
     if error.retryable:
         return True
+    if error.category == "translation_validation":
+        return True
     return error.category == "malformed_response" and str(error).startswith(
         "translation payload was missing segment translations"
     )
@@ -796,6 +802,7 @@ def _merge_segments(
         if target_text is None:
             missing_segment_ids.append(segment.segment_id)
             continue
+        _validate_segment_translation(segment, target_text)
         translated.append(
             segment.model_copy(
                 update={
@@ -813,7 +820,58 @@ def _merge_segments(
             category="malformed_response",
             retryable=False,
         )
-    return tuple(translated)
+    translated_tuple = tuple(translated)
+    _validate_chunk_segment_alignment(translated_tuple)
+    return translated_tuple
+
+
+def _validate_segment_translation(segment: Segment, target_text: str) -> None:
+    source_text = (segment.source_text or "").strip()
+    if not source_text:
+        return
+    source_length = len(source_text)
+    target_length = len(target_text)
+    max_target_length = max(
+        source_length * MAX_SEGMENT_TARGET_EXPANSION_RATIO,
+        source_length + MAX_SEGMENT_TARGET_EXPANSION_MARGIN,
+    )
+    if target_length <= max_target_length:
+        return
+    raise AdapterError(
+        provider_id="openai",
+        message=(
+            "translation payload produced implausibly long text for "
+            f"{segment.segment_id}: source_length={source_length} "
+            f"target_length={target_length}"
+        ),
+        category="translation_validation",
+        retryable=False,
+    )
+
+
+def _validate_chunk_segment_alignment(segments: tuple[Segment, ...]) -> None:
+    for index, segment in enumerate(segments):
+        current_text = _normalized_translation_text(segment.target_text or "")
+        if len(current_text) < MIN_DUPLICATED_SEGMENT_TEXT_LENGTH:
+            continue
+        for later_segment in segments[index + 1 : index + 1 + SEGMENT_DUPLICATION_LOOKAHEAD]:
+            later_text = _normalized_translation_text(later_segment.target_text or "")
+            if len(later_text) < MIN_DUPLICATED_SEGMENT_TEXT_LENGTH:
+                continue
+            if later_text in current_text:
+                raise AdapterError(
+                    provider_id="openai",
+                    message=(
+                        "translation payload duplicated later segment text: "
+                        f"{segment.segment_id} contains {later_segment.segment_id}"
+                    ),
+                    category="translation_validation",
+                    retryable=False,
+                )
+
+
+def _normalized_translation_text(text: str) -> str:
+    return "".join(character for character in text if character.isalnum())
 
 
 def _provider_request_id(response_payload: dict[str, Any]) -> str | None:
