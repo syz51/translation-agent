@@ -15,6 +15,7 @@ from translation_agent.api import (
     _failure_details,
     _final_status,
     list_runs,
+    resolve_review,
     resume_transcription,
     resume_translation,
     review_job,
@@ -2243,11 +2244,13 @@ def test_approve_review_json_republishes_outputs_and_updates_provider_stats(
     blob_store = LocalBlobStore(tmp_path / "runtime" / "blobs")
     job = _job_context("job-review-approve-a")
     approval_path = Path(job_path(job, "approvals", "translation.json"))
+    resolution_path = Path(job_path(job, "review-resolutions", "translation.json"))
     learning_path = Path(job_path(job, "learning", "transcript-approval.json"))
     transcript_path = Path(job_path(job, "published", "transcript.json"))
     translation_path = Path(job_path(job, "published", "translation.json"))
 
     assert blob_store.exists(str(approval_path))
+    assert blob_store.exists(str(resolution_path))
     assert blob_store.exists(str(learning_path))
     assert blob_store.exists(str(transcript_path))
     assert blob_store.exists(str(translation_path))
@@ -2274,10 +2277,157 @@ def test_approve_review_json_republishes_outputs_and_updates_provider_stats(
     assert first_record is not None
     assert first_record.status == "completed_after_human_review"
     assert first_record.output_data["approval_ref"] == str(approval_path)
+    assert first_record.output_data["resolution_kind"] == "approved_good"
     assert stats is not None
     assert stats.total_approved_outcomes == 2
     assert stats.total_review_escalations == 2
     assert stats.recent_approved_outcomes_30d == 2
+
+
+@pytest.mark.unit
+def test_resolve_review_validation_enforces_candidate_and_failure_tag_rules(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("TA_DATA_DIR", str(tmp_path / "runtime"))
+    monkeypatch.delenv("TA_STATE_DB_DSN", raising=False)
+
+    result = run_job(
+        RunJobRequest(
+            source="input.mp4",
+            job_id="job-review-validate-resolution",
+            metadata={"scenario": "translation_conflict_timeout"},
+        )
+    )
+    payload = review_job(result.run_id)
+    candidate_id = cast(
+        str,
+        cast(list[dict[str, object]], payload["candidates"])[0]["candidate_id"],
+    )
+
+    with pytest.raises(ValueError, match="candidate_id is required"):
+        resolve_review(result.run_id, resolution="approved_best_available")
+
+    with pytest.raises(ValueError, match="candidate_id is forbidden"):
+        resolve_review(
+            result.run_id,
+            resolution="rejected_all",
+            candidate_id=candidate_id,
+            failure_tags=("subtitle_gibberish",),
+        )
+
+    with pytest.raises(ValueError, match="at least one failure_tag"):
+        resolve_review(result.run_id, resolution="rejected_all")
+
+
+@pytest.mark.unit
+def test_resolve_review_approved_best_available_persists_soft_feedback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("TA_DATA_DIR", str(tmp_path / "runtime"))
+    monkeypatch.delenv("TA_STATE_DB_DSN", raising=False)
+
+    result = run_job(
+        RunJobRequest(
+            source="input.mp4",
+            job_id="job-review-soft-resolution",
+            metadata={"scenario": "translation_conflict_timeout"},
+        )
+    )
+    review_payload = review_job(result.run_id)
+    selected = cast(list[dict[str, object]], review_payload["candidates"])[0]
+    payload = resolve_review(
+        result.run_id,
+        resolution="approved_best_available",
+        candidate_id=cast(str, selected["candidate_id"]),
+        failure_tags=("literal_but_wrong_semantics",),
+        approved_by="tester",
+        note="best we have",
+    )
+
+    assert payload["status"] == "completed_after_human_review"
+    assert payload["resolution_kind"] == "approved_best_available"
+    assert payload["approval_ref"] is not None
+    assert payload["approved_candidate_id"] == selected["candidate_id"]
+
+    refreshed_review = review_job(result.run_id)
+    assert refreshed_review["resolution_kind"] == "approved_best_available"
+    assert refreshed_review["residual_failure_tags"] == ["literal_but_wrong_semantics"]
+
+    with SQLiteOperationalStore(tmp_path / "runtime" / "state.sqlite3") as store:
+        provider_stats = store.get_transcript_provider_quality_stats(
+            provider_id=cast(
+                str,
+                cast(dict[str, object], selected["source_transcript"])["provider_id"],
+            ),
+            source_language="en",
+            target_language="zh",
+        )
+        combo_stats = store.get_translation_feedback_stats(cast(str, selected["combo_key"]))
+
+    assert provider_stats is not None
+    assert provider_stats.approved_best_available_count == 1
+    assert provider_stats.soft_positive_score == pytest.approx(0.35)
+    assert combo_stats is not None
+    assert combo_stats.approved_best_available_count == 1
+
+
+@pytest.mark.unit
+def test_resolve_review_rejected_all_persists_negative_feedback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("TA_DATA_DIR", str(tmp_path / "runtime"))
+    monkeypatch.delenv("TA_STATE_DB_DSN", raising=False)
+
+    result = run_job(
+        RunJobRequest(
+            source="input.mp4",
+            job_id="job-review-rejected-all",
+            metadata={"scenario": "translation_conflict_timeout"},
+        )
+    )
+    review_payload = review_job(result.run_id)
+    candidates = cast(list[dict[str, object]], review_payload["candidates"])
+    payload = resolve_review(
+        result.run_id,
+        resolution="rejected_all",
+        failure_tags=("subtitle_gibberish", "ungrounded_addition"),
+        approved_by="tester",
+        note="all variants broken",
+    )
+
+    assert payload["status"] == "rejected_after_human_review"
+    assert payload["approval_ref"] is None
+    assert payload["default_output_path"] is None
+
+    refreshed_review = review_job(result.run_id)
+    assert refreshed_review["resolution_kind"] == "rejected_all"
+    assert refreshed_review["failure_tags"] == [
+        "subtitle_gibberish",
+        "ungrounded_addition",
+    ]
+
+    blob_store = LocalBlobStore(tmp_path / "runtime" / "blobs")
+    resolution_path = Path(
+        job_path(
+            _job_context("job-review-rejected-all"),
+            "review-resolutions",
+            "translation.json",
+        )
+    )
+    assert blob_store.exists(str(resolution_path))
+
+    with SQLiteOperationalStore(tmp_path / "runtime" / "state.sqlite3") as store:
+        record = store.get_human_review_resolution(result.run_id)
+        combo_stats = store.get_translation_feedback_stats(cast(str, candidates[0]["combo_key"]))
+
+    assert record is not None
+    assert record.resolution_kind == "rejected_all"
+    assert combo_stats is not None
+    assert combo_stats.rejected_all_count == 1
+    assert combo_stats.failure_tag_counts["subtitle_gibberish"] == 1
 
 
 @pytest.mark.unit

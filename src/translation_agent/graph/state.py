@@ -53,6 +53,10 @@ class GraphState(ContractModel):
     escalation_pending: bool = False
     human_review_required: bool = False
     review_required_stage: str | None = None
+    resolution_ref: str | None = None
+    resolution_kind: str | None = None
+    failure_tags: tuple[str, ...] = ()
+    residual_failure_tags: tuple[str, ...] = ()
     approval_ref: str | None = None
     approved_candidate_id: str | None = None
     approved_source_transcript_candidate_id: str | None = None

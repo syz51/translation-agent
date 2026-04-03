@@ -82,6 +82,11 @@ class MemoryQuery(ContractModel):
     stage: NonEmptyStr
     query_text: NonEmptyStr
     candidate_ids: tuple[str, ...] = ()
+    provider_ids: tuple[str, ...] = ()
+    prompt_variant_ids: tuple[str, ...] = ()
+    model_ids: tuple[str, ...] = ()
+    failure_tags: tuple[str, ...] = ()
+    media_key: str | None = None
     max_items: int = Field(default=10, ge=1, le=100)
 
 

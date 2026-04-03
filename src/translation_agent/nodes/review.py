@@ -62,6 +62,7 @@ def review_transcripts(state: GraphState, runtime: WorkflowRuntime) -> dict[str,
             state,
             stage="review_transcripts",
             candidate_ids=state.transcript_candidate_ids,
+            provider_ids=tuple(candidate.provider_id for candidate in candidates),
         )
     )
     if not candidates:
@@ -116,11 +117,24 @@ def review_translations(state: GraphState, runtime: WorkflowRuntime) -> dict[str
         job=state.job,
         candidate_ids=state.translation_candidate_ids,
     )
+    transcript_provider_ids = tuple(
+        transcript.provider_id
+        for transcript in select_transcript_candidates(
+            runtime,
+            job=state.job,
+            candidate_ids=tuple(
+                candidate.source_transcript_candidate_id or "" for candidate in candidates
+            ),
+        )
+    )
     memory_bundle = runtime.memory_recall_backend.recall_memory(
         build_memory_query(
             state,
             stage="review_translations",
             candidate_ids=state.translation_candidate_ids,
+            provider_ids=transcript_provider_ids,
+            prompt_variant_ids=tuple(candidate.prompt_variant_id for candidate in candidates),
+            model_ids=tuple(candidate.model_id for candidate in candidates),
         )
     )
     if not candidates:

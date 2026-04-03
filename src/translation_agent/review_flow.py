@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import getpass
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -12,11 +13,18 @@ from typing import Any, cast
 from translation_agent.graph import GraphState, build_phase_two_runtime
 from translation_agent.graph.state import RoutingFact
 from translation_agent.models import (
+    FailureTag,
     FinalTranslationDecision,
     HumanApprovalRecord,
+    HumanReviewedCandidateContext,
+    HumanReviewResolutionRecord,
+    HumanSupervisionKind,
     JobContext,
     MemoryWrite,
     MemoryWriteBatch,
+    PromptChange,
+    PromptCompatibilityTuple,
+    PromptEvolutionProposal,
     ReviewBundle,
     Segment,
     StructuredEvidence,
@@ -24,6 +32,7 @@ from translation_agent.models import (
     TranscriptCandidate,
     TranscriptProviderQualityStats,
     TranslationCandidate,
+    TranslationFeedbackStats,
 )
 from translation_agent.models.jobs import ReferenceMode
 from translation_agent.nodes.common import (
@@ -33,6 +42,7 @@ from translation_agent.nodes.common import (
     operational_job_key,
     read_model_artifact,
     review_preview_key,
+    review_resolution_key,
     select_transcript_candidates,
     select_translation_candidates,
     transcript_approval_learning_key,
@@ -51,6 +61,15 @@ from translation_agent.subtitles import render_translation_srt
 
 _HARD_CONTRADICTION_DIMENSIONS = {"meaning", "entity", "number_date_unit", "coverage"}
 _NO_OVERLAPPING_EXCERPT = "[no overlapping excerpt]"
+_FAILURE_TAG_INSTRUCTIONS: dict[str, str] = {
+    "honorific_leak": "Forbid carrying Korean honorific suffixes into Chinese output.",
+    "romanization_leak": (
+        "Prefer natural Chinese renderings over raw romanization unless corroborated."
+    ),
+    "ungrounded_addition": "Prefer conservative translation under transcript uncertainty.",
+    "late_run_degeneration": "Forbid improvisational expansion in late cues.",
+    "subtitle_gibberish": "Reject mixed-script junk and unresolved transliterations.",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,6 +147,7 @@ def build_review_payload(
         or translation_investigation_key(context.job),
     )
     approval = _optional_json(runtime, approval_record_key(context.job))
+    resolution = _load_resolution_payload(context)
 
     preferred_candidate_id = None
     if translation_decision is not None:
@@ -162,6 +182,11 @@ def build_review_payload(
                 "prompt_variant_id": candidate.prompt_variant_id,
                 "prompt_version": candidate.prompt_version,
                 "language": candidate.language,
+                "combo_key": _candidate_combo_key(
+                    context.job,
+                    candidate,
+                    transcript,
+                ),
                 "translation_text_preview": candidate.full_text[:400],
                 "translation_ref": job_path(
                     context.job, "candidates", "translations", f"{candidate.candidate_id}.json"
@@ -219,12 +244,24 @@ def build_review_payload(
         payload["reviewer_preferences"] = candidate_summary.get("reviewer_preferences", [])
         payload["contradictions"] = candidate_summary.get("contradictions", [])
 
+    recommended_failure_tags = _recommended_failure_tags(
+        candidate_payloads=candidate_payloads,
+        contradiction_summary=contradiction_summary,
+        reviews=translation_reviews,
+    )
     return {
         "run_id": run_id,
         "job_id": context.job.job_id,
         "status": context.run_record.status,
         "review_required_stage": output_data.get("review_required_stage"),
         "review_available": output_data.get("review_required_stage") == "translation",
+        "resolution_ref": resolution.get("resolution_ref") if resolution else None,
+        "resolution_kind": resolution.get("resolution_kind") if resolution else None,
+        "failure_tags": list(resolution.get("failure_tags", [])) if resolution else [],
+        "residual_failure_tags": (
+            list(resolution.get("residual_failure_tags", [])) if resolution else []
+        ),
+        "recommended_failure_tags": list(recommended_failure_tags),
         "summary": (
             translation_decision.rationale_summary
             if translation_decision is not None
@@ -259,27 +296,40 @@ def build_review_payload(
         "resume_commands": [
             f"uv run translation-agent review-job {run_id}",
             f"uv run translation-agent approve-review {run_id} --candidate-id <candidate-id>",
+            (
+                "uv run translation-agent resolve-review "
+                f"{run_id} --resolution approved_best_available --candidate-id <candidate-id>"
+            ),
         ],
     }
 
 
-def approve_translation_review(
+def resolve_translation_review(
     run_id: str,
     *,
-    candidate_id: str,
+    resolution_kind: HumanSupervisionKind,
+    candidate_id: str | None,
+    failure_tags: tuple[FailureTag, ...] = (),
     approved_by: str | None,
     note: str | None,
     store: OperationalStore,
     blob_store: LocalBlobStore,
 ) -> dict[str, Any]:
-    """Approve one translation candidate and republish canonical artifacts in place."""
+    """Resolve one pending translation review and republish canonical artifacts in place."""
 
     context = _load_review_session(run_id, store=store, blob_store=blob_store)
     output_data = _dict_payload(context.run_record.output_data)
     if output_data.get("review_required_stage") != "translation":
         raise ValueError("run does not have a pending translation review")
+    resolution_ref = review_resolution_key(context.job)
+    if context.blob_store.exists(resolution_ref):
+        existing = _optional_json(context.runtime, resolution_ref)
+        raise ValueError(f"run already has a resolution record: {existing}")
     approval_ref = approval_record_key(context.job)
-    if context.blob_store.exists(approval_ref):
+    if resolution_kind in {
+        "approved_good",
+        "approved_best_available",
+    } and context.blob_store.exists(approval_ref):
         existing = _optional_json(context.runtime, approval_ref)
         raise ValueError(f"run already has an approval record: {existing}")
 
@@ -292,11 +342,6 @@ def approve_translation_review(
             storage_job_id=storage_job_id,
         )
     }
-    approved_candidate = translation_candidates.get(candidate_id)
-    if approved_candidate is None:
-        raise ValueError(f"unknown candidate_id: {candidate_id}")
-    if not approved_candidate.source_transcript_candidate_id:
-        raise ValueError("approved translation candidate is missing transcript provenance")
     transcript_candidates = {
         candidate.candidate_id: candidate
         for candidate in runtime.decision_store.list_transcript_candidates(
@@ -304,10 +349,28 @@ def approve_translation_review(
             storage_job_id=storage_job_id,
         )
     }
-    approved_transcript = transcript_candidates.get(
-        approved_candidate.source_transcript_candidate_id
+    reviewed_candidates = _reviewed_candidate_contexts(
+        job=context.job,
+        translation_candidates=translation_candidates,
+        transcript_candidates=transcript_candidates,
     )
-    if approved_transcript is None:
+    _validate_resolution_inputs(
+        resolution_kind=resolution_kind,
+        candidate_id=candidate_id,
+        failure_tags=failure_tags,
+        translation_candidates=translation_candidates,
+    )
+    approved_candidate = (
+        translation_candidates[candidate_id]
+        if candidate_id is not None and candidate_id in translation_candidates
+        else None
+    )
+    approved_transcript = (
+        transcript_candidates.get(approved_candidate.source_transcript_candidate_id or "")
+        if approved_candidate is not None
+        else None
+    )
+    if approved_candidate is not None and approved_transcript is None:
         raise ValueError("approved source transcript candidate was not found")
 
     from translation_agent.models import FinalTranslationDecision
@@ -317,16 +380,43 @@ def approve_translation_review(
         output_data.get("translation_decision_ref") or translation_decision_key(context.job),
         FinalTranslationDecision,
     )
-    approved_at = datetime.now(UTC)
+    resolved_at = datetime.now(UTC)
     approved_by = _normalized_approved_by(approved_by)
-    approval_record = HumanApprovalRecord(
+    normalized_failure_tags = tuple(dict.fromkeys(failure_tags))
+    residual_failure_tags = normalized_failure_tags if resolution_kind != "approved_good" else ()
+    resolution_record = HumanReviewResolutionRecord(
         run_id=run_id,
         job_id=context.job.job_id,
-        approved_candidate_id=approved_candidate.candidate_id,
-        approved_source_transcript_candidate_id=approved_transcript.candidate_id,
+        resolution_kind=resolution_kind,
+        candidate_id=approved_candidate.candidate_id if approved_candidate is not None else None,
         approved_by=approved_by,
         note=note or "",
-        approved_at=approved_at,
+        failure_tags=normalized_failure_tags,
+        residual_failure_tags=residual_failure_tags,
+        transcript_provider_id=approved_transcript.provider_id if approved_transcript else None,
+        source_transcript_candidate_id=(
+            approved_transcript.candidate_id if approved_transcript is not None else None
+        ),
+        model_id=approved_candidate.model_id if approved_candidate is not None else None,
+        prompt_variant_id=(
+            approved_candidate.prompt_variant_id if approved_candidate is not None else None
+        ),
+        prompt_version=approved_candidate.prompt_version
+        if approved_candidate is not None
+        else None,
+        base_prompt_version=(
+            _candidate_base_prompt_version(approved_candidate) if approved_candidate else None
+        ),
+        combo_key=(
+            _candidate_combo_key(context.job, approved_candidate, approved_transcript)
+            if approved_candidate is not None and approved_transcript is not None
+            else None
+        ),
+        source_language=context.job.source_language,
+        target_language=context.job.target_language,
+        tenant_id=context.job.tenant_id,
+        project_id=context.job.project_id,
+        media_key=context.job.media_key,
         machine_translation_decision_ref=output_data.get("translation_decision_ref")
         or translation_decision_key(context.job),
         machine_investigation_ref=output_data.get("translation_investigation_ref")
@@ -339,49 +429,86 @@ def approve_translation_review(
             translation_review_key(context.job, review_id)
             for review_id in machine_translation_decision.review_refs
         ),
+        reviewed_candidates=reviewed_candidates,
+        resolved_at=resolved_at,
     )
-    write_model_artifact(runtime, approval_ref, approval_record)
+    write_model_artifact(runtime, resolution_ref, resolution_record)
+    store.save_human_review_resolution(resolution_record)
 
-    learning_ref = transcript_approval_learning_key(context.job)
-    learning_event = TranscriptApprovalLearningEvent(
-        run_id=run_id,
-        job_id=context.job.job_id,
-        approved_translation_candidate_id=approved_candidate.candidate_id,
-        approved_source_transcript_candidate_id=approved_transcript.candidate_id,
-        transcript_provider_id=approved_transcript.provider_id,
-        source_language=context.job.source_language,
-        target_language=context.job.target_language,
-        tenant_id=context.job.tenant_id,
-        project_id=context.job.project_id,
-        media_key=context.job.media_key,
-        linked_translation_approval_ref=approval_ref,
-        created_at=approved_at,
-    )
-    write_model_artifact(runtime, learning_ref, learning_event)
+    approval_record = None
+    learning_ref = None
+    if approved_candidate is not None and approved_transcript is not None:
+        approval_record = HumanApprovalRecord(
+            run_id=run_id,
+            job_id=context.job.job_id,
+            approved_candidate_id=approved_candidate.candidate_id,
+            approved_source_transcript_candidate_id=approved_transcript.candidate_id,
+            approved_by=approved_by,
+            note=note or "",
+            approved_at=resolved_at,
+            machine_translation_decision_ref=resolution_record.machine_translation_decision_ref,
+            machine_investigation_ref=resolution_record.machine_investigation_ref,
+            machine_review_refs=resolution_record.machine_review_refs,
+        )
+        write_model_artifact(runtime, approval_ref, approval_record)
+        learning_ref = transcript_approval_learning_key(context.job)
+        learning_event = TranscriptApprovalLearningEvent(
+            run_id=run_id,
+            job_id=context.job.job_id,
+            approved_translation_candidate_id=approved_candidate.candidate_id,
+            approved_source_transcript_candidate_id=approved_transcript.candidate_id,
+            transcript_provider_id=approved_transcript.provider_id,
+            source_language=context.job.source_language,
+            target_language=context.job.target_language,
+            tenant_id=context.job.tenant_id,
+            project_id=context.job.project_id,
+            media_key=context.job.media_key,
+            linked_translation_approval_ref=approval_ref,
+            supervision_kind=resolution_kind,
+            supervision_strength=resolution_record.supervision_strength,
+            created_at=resolved_at,
+        )
+        write_model_artifact(runtime, learning_ref, learning_event)
 
     _update_provider_quality_stats(
         store=store,
-        transcript_candidate=approved_transcript,
+        reviewed_candidates=reviewed_candidates,
+        selected_provider_id=approved_transcript.provider_id if approved_transcript else None,
         job=context.job,
-        approved_at=approved_at,
+        resolution_kind=resolution_kind,
+        resolved_at=resolved_at,
     )
-    memory_batch, consolidation_ref, routing_facts = _write_approval_learning_memory(
+    _update_translation_feedback_stats(
+        store=store,
+        resolution=resolution_record,
+        resolved_at=resolved_at,
+    )
+    proposal_refs = _update_feedback_prompt_proposals(
         context=context,
-        approval_record=approval_record,
+        resolution=resolution_record,
+        resolution_ref=resolution_ref,
+    )
+    memory_batch, consolidation_ref, routing_facts = _write_resolution_learning_memory(
+        context=context,
+        resolution=resolution_record,
+        resolution_ref=resolution_ref,
         learning_ref=learning_ref,
-        approved_candidate=approved_candidate,
-        approved_transcript=approved_transcript,
     )
 
-    state = _approval_publish_state(
+    state = _resolution_publish_state(
         context=context,
         output_data=output_data,
         approved_candidate=approved_candidate,
         approved_transcript=approved_transcript,
+        resolution_ref=resolution_ref,
+        resolution_kind=resolution_kind,
+        failure_tags=normalized_failure_tags,
+        residual_failure_tags=residual_failure_tags,
         approval_ref=approval_ref,
         learning_ref=learning_ref,
         memory_batch=memory_batch,
         routing_facts=routing_facts,
+        improvement_proposal_refs=proposal_refs,
     )
     artifacts, manifest_ref = publish_outputs(state, runtime)
     update_historical_run_link(state, runtime, artifacts)
@@ -392,6 +519,7 @@ def approve_translation_review(
             artifacts.final_transcript_ref,
             artifacts.final_translation_ref,
             artifacts.recoverable_translation_failure_ref,
+            *artifacts.resolution_refs,
             *artifacts.approval_refs,
             *artifacts.learning_refs,
             *artifacts.reference_transcript_refs,
@@ -410,17 +538,29 @@ def approve_translation_review(
     )
     updated_output_data = {
         **output_data,
-        "approval_ref": approval_ref,
-        "approved_candidate_id": approved_candidate.candidate_id,
-        "approved_source_transcript_candidate_id": approved_transcript.candidate_id,
+        "resolution_ref": resolution_ref,
+        "resolution_kind": resolution_kind,
+        "failure_tags": list(normalized_failure_tags),
+        "residual_failure_tags": list(residual_failure_tags),
+        "approval_ref": approval_ref if approval_record is not None else None,
+        "approved_candidate_id": approved_candidate.candidate_id if approved_candidate else None,
+        "approved_source_transcript_candidate_id": (
+            approved_transcript.candidate_id if approved_transcript is not None else None
+        ),
         "review_required_stage": "translation",
         "human_review_required": False,
-        "translation_failed": False,
-        "final_stage": "approve_review",
+        "translation_failed": resolution_kind == "rejected_all",
+        "final_stage": "resolve_review",
         "published_artifact_refs": list(published_refs),
         "final_transcript_ref": artifacts.final_transcript_ref,
         "final_translation_ref": artifacts.final_translation_ref,
         "learning_ref": learning_ref,
+        "improvement_proposal_refs": sorted(
+            {
+                *(str(ref) for ref in output_data.get("improvement_proposal_refs", [])),
+                *proposal_refs,
+            }
+        ),
         "memory_batch_ids": sorted(
             {
                 *(str(batch_id) for batch_id in output_data.get("memory_batch_ids", [])),
@@ -436,25 +576,66 @@ def approve_translation_review(
     }
     store.update_run(
         run_id,
-        status="completed_after_human_review",
+        status=(
+            "completed_after_human_review"
+            if resolution_kind in {"approved_good", "approved_best_available"}
+            else "rejected_after_human_review"
+        ),
         output_data=updated_output_data,
         error=None,
     )
     return {
         "run_id": run_id,
         "job_id": context.job.job_id,
-        "status": "completed_after_human_review",
-        "approval_ref": approval_ref,
-        "approved_candidate_id": approved_candidate.candidate_id,
-        "approved_source_transcript_candidate_id": approved_transcript.candidate_id,
+        "status": (
+            "completed_after_human_review"
+            if resolution_kind in {"approved_good", "approved_best_available"}
+            else "rejected_after_human_review"
+        ),
+        "resolution_ref": resolution_ref,
+        "resolution_kind": resolution_kind,
+        "failure_tags": list(normalized_failure_tags),
+        "residual_failure_tags": list(residual_failure_tags),
+        "approval_ref": approval_ref if approval_record is not None else None,
+        "approved_candidate_id": approved_candidate.candidate_id if approved_candidate else None,
+        "approved_source_transcript_candidate_id": (
+            approved_transcript.candidate_id if approved_transcript is not None else None
+        ),
         "final_transcript_ref": artifacts.final_transcript_ref,
         "final_translation_ref": artifacts.final_translation_ref,
-        "default_output_path": str(
-            (
-                context.blob_store.root / job_path(context.job, "exports", "translation.srt")
-            ).resolve()
+        "default_output_path": (
+            str(
+                (
+                    context.blob_store.root / job_path(context.job, "exports", "translation.srt")
+                ).resolve()
+            )
+            if resolution_kind in {"approved_good", "approved_best_available"}
+            else None
         ),
     }
+
+
+def approve_translation_review(
+    run_id: str,
+    *,
+    candidate_id: str,
+    approved_by: str | None,
+    note: str | None,
+    store: OperationalStore,
+    blob_store: LocalBlobStore,
+) -> dict[str, Any]:
+    """Backward-compatible alias for resolving a review as approved_good."""
+
+    return resolve_translation_review(
+        run_id,
+        resolution_kind="approved_good",
+        candidate_id=candidate_id,
+        failure_tags=(),
+        approved_by=approved_by,
+        note=note,
+        store=store,
+        blob_store=blob_store,
+    )
 
 
 def _load_review_session(
@@ -1060,153 +1241,500 @@ def _max_severity(left: str, right: str) -> str:
     return left if _severity_sort_key(left) <= _severity_sort_key(right) else right
 
 
-def _update_provider_quality_stats(
+def _load_resolution_payload(context: ReviewSessionContext) -> dict[str, Any] | None:
+    payload = _optional_json(context.runtime, review_resolution_key(context.job))
+    if payload is not None:
+        payload["resolution_ref"] = review_resolution_key(context.job)
+        return payload
+    approval = _optional_json(context.runtime, approval_record_key(context.job))
+    if approval is None:
+        return None
+    return {
+        "resolution_ref": approval_record_key(context.job),
+        "resolution_kind": "approved_good",
+        "failure_tags": [],
+        "residual_failure_tags": [],
+        "candidate_id": approval.get("approved_candidate_id"),
+    }
+
+
+def _recommended_failure_tags(
     *,
-    store: OperationalStore,
-    transcript_candidate: TranscriptCandidate,
-    job: JobContext,
-    approved_at: datetime,
+    candidate_payloads: list[dict[str, Any]],
+    contradiction_summary: dict[str, Any],
+    reviews: tuple[ReviewBundle, ...],
+) -> tuple[FailureTag, ...]:
+    scores: dict[str, int] = {}
+    source_transcript_ids = {
+        str(payload.get("source_transcript_candidate_id"))
+        for payload in candidate_payloads
+        if payload.get("source_transcript_candidate_id") is not None
+    }
+    if len(source_transcript_ids) > 1:
+        scores["source_transcript_instability"] = 1
+    for review in reviews:
+        for evidence in review.structured_evidence:
+            text = f"{evidence.dimension} {evidence.evidence_text}".casefold()
+            if evidence.dimension == "entity":
+                scores["name_entity_drift"] = scores.get("name_entity_drift", 0) + 1
+            if "honorific" in text:
+                scores["honorific_leak"] = scores.get("honorific_leak", 0) + 1
+            if "romaniz" in text or "transliter" in text:
+                scores["romanization_leak"] = scores.get("romanization_leak", 0) + 1
+            if "gibberish" in text or "mixed-script" in text or "junk" in text:
+                scores["subtitle_gibberish"] = scores.get("subtitle_gibberish", 0) + 1
+            if "late" in text or "degeneration" in text:
+                scores["late_run_degeneration"] = scores.get("late_run_degeneration", 0) + 1
+            if evidence.dimension == "coverage" and (
+                "unsupported" in text or "addition" in text or "added" in text
+            ):
+                scores["ungrounded_addition"] = scores.get("ungrounded_addition", 0) + 1
+            if evidence.dimension == "meaning" and "literal" in text:
+                scores["literal_but_wrong_semantics"] = (
+                    scores.get("literal_but_wrong_semantics", 0) + 1
+                )
+    ordered = sorted(scores.items(), key=lambda item: (-item[1], item[0]))
+    return tuple(tag for tag, _ in ordered[:4])  # type: ignore[return-value]
+
+
+def _validate_resolution_inputs(
+    *,
+    resolution_kind: HumanSupervisionKind,
+    candidate_id: str | None,
+    failure_tags: tuple[FailureTag, ...],
+    translation_candidates: dict[str, TranslationCandidate],
 ) -> None:
-    current = store.get_transcript_provider_quality_stats(
-        provider_id=transcript_candidate.provider_id,
-        source_language=job.source_language,
-        target_language=job.target_language,
-    )
-    approval_timestamps = list(current.approval_timestamps if current is not None else ())
-    review_timestamps = list(current.review_escalation_timestamps if current is not None else ())
-    approval_timestamps.append(approved_at)
-    review_timestamps.append(approved_at)
-    recent_cutoff = approved_at - timedelta(days=30)
-    recent_approval_timestamps = [ts for ts in approval_timestamps if ts >= recent_cutoff]
-    recent_review_timestamps = [ts for ts in review_timestamps if ts >= recent_cutoff]
-    total_review_escalations = (current.total_review_escalations if current is not None else 0) + 1
-    total_approved_outcomes = (current.total_approved_outcomes if current is not None else 0) + 1
-    selected_count = (
-        current.selected_via_approved_translation_count if current is not None else 0
-    ) + 1
-    indirect_approval_rate = round(
-        selected_count / total_review_escalations if total_review_escalations else 0.0,
-        4,
-    )
-    store.save_transcript_provider_quality_stats(
-        TranscriptProviderQualityStats(
-            provider_id=transcript_candidate.provider_id,
-            source_language=job.source_language,
-            target_language=job.target_language,
-            total_review_escalations=total_review_escalations,
-            total_approved_outcomes=total_approved_outcomes,
-            selected_via_approved_translation_count=selected_count,
-            recent_review_escalations_30d=len(recent_review_timestamps),
-            recent_approved_outcomes_30d=len(recent_approval_timestamps),
-            indirect_approval_rate=indirect_approval_rate,
-            review_escalation_timestamps=tuple(review_timestamps),
-            approval_timestamps=tuple(approval_timestamps),
-            last_approved_at=approved_at,
-            updated_at=approved_at,
+    if resolution_kind in {"approved_good", "approved_best_available"}:
+        if candidate_id is None:
+            raise ValueError("candidate_id is required for approved resolutions")
+        if candidate_id not in translation_candidates:
+            raise ValueError(f"unknown candidate_id: {candidate_id}")
+    if resolution_kind == "rejected_all":
+        if candidate_id is not None:
+            raise ValueError("candidate_id is forbidden for rejected_all")
+        if not failure_tags:
+            raise ValueError("at least one failure_tag is required for rejected_all")
+
+
+def _reviewed_candidate_contexts(
+    *,
+    job: JobContext,
+    translation_candidates: dict[str, TranslationCandidate],
+    transcript_candidates: dict[str, TranscriptCandidate],
+) -> tuple[HumanReviewedCandidateContext, ...]:
+    contexts: list[HumanReviewedCandidateContext] = []
+    for candidate in sorted(translation_candidates.values(), key=lambda item: item.candidate_id):
+        transcript = transcript_candidates.get(candidate.source_transcript_candidate_id or "")
+        contexts.append(
+            HumanReviewedCandidateContext(
+                candidate_id=candidate.candidate_id,
+                source_transcript_candidate_id=candidate.source_transcript_candidate_id,
+                transcript_provider_id=transcript.provider_id if transcript is not None else None,
+                model_id=candidate.model_id,
+                prompt_variant_id=candidate.prompt_variant_id,
+                prompt_version=candidate.prompt_version,
+                base_prompt_version=_candidate_base_prompt_version(candidate),
+                combo_key=_candidate_combo_key(job, candidate, transcript),
+                prompt_resolution_mode=_candidate_prompt_resolution_mode(candidate),
+                selected_proposal_id=_candidate_selected_proposal_id(candidate),
+            )
+        )
+    return tuple(contexts)
+
+
+def _candidate_base_prompt_version(candidate: TranslationCandidate) -> str:
+    resolver = candidate.metadata.get("prompt_resolver")
+    if isinstance(resolver, dict):
+        base = resolver.get("base_prompt_version")
+        if isinstance(base, str) and base.strip():
+            return base
+    return candidate.prompt_version
+
+
+def _candidate_prompt_resolution_mode(candidate: TranslationCandidate) -> str | None:
+    resolver = candidate.metadata.get("prompt_resolver")
+    if not isinstance(resolver, dict):
+        return None
+    mode = resolver.get("resolution_mode")
+    if isinstance(mode, str) and mode.strip():
+        return mode
+    return None
+
+
+def _candidate_selected_proposal_id(candidate: TranslationCandidate) -> str | None:
+    resolver = candidate.metadata.get("prompt_resolver")
+    if not isinstance(resolver, dict):
+        return None
+    proposal_id = resolver.get("selected_proposal_id")
+    if isinstance(proposal_id, str) and proposal_id.strip():
+        return proposal_id
+    return None
+
+
+def _candidate_combo_key(
+    job: JobContext,
+    candidate: TranslationCandidate,
+    transcript: TranscriptCandidate | None,
+) -> str:
+    provider_id = transcript.provider_id if transcript is not None else "unknown-provider"
+    return "::".join(
+        (
+            job.source_language,
+            job.target_language,
+            provider_id,
+            candidate.model_id,
+            candidate.prompt_variant_id,
+            candidate.prompt_version,
         )
     )
 
 
-def _write_approval_learning_memory(
+def _update_provider_quality_stats(
+    *,
+    store: OperationalStore,
+    reviewed_candidates: tuple[HumanReviewedCandidateContext, ...],
+    selected_provider_id: str | None,
+    job: JobContext,
+    resolution_kind: HumanSupervisionKind,
+    resolved_at: datetime,
+) -> None:
+    provider_ids = {
+        context.transcript_provider_id
+        for context in reviewed_candidates
+        if context.transcript_provider_id is not None
+    }
+    recent_cutoff = resolved_at - timedelta(days=30)
+    for provider_id in provider_ids:
+        current = store.get_transcript_provider_quality_stats(
+            provider_id=provider_id,
+            source_language=job.source_language,
+            target_language=job.target_language,
+        ) or TranscriptProviderQualityStats(
+            provider_id=provider_id,
+            source_language=job.source_language,
+            target_language=job.target_language,
+            updated_at=resolved_at,
+        )
+        review_timestamps = list(current.review_escalation_timestamps) + [resolved_at]
+        approval_timestamps = list(current.approval_timestamps)
+        soft_timestamps = list(current.approved_best_available_timestamps)
+        rejected_timestamps = list(current.rejected_all_timestamps)
+        total_approved_outcomes = current.total_approved_outcomes
+        approved_good_count = current.approved_good_count
+        approved_best_available_count = current.approved_best_available_count
+        rejected_all_count = current.rejected_all_count
+        selected_count = current.selected_via_approved_translation_count
+        hard_positive_score = current.hard_positive_score
+        soft_positive_score = current.soft_positive_score
+        negative_feedback_score = current.negative_feedback_score
+        last_approved_at = current.last_approved_at
+        if resolution_kind == "approved_good" and provider_id == selected_provider_id:
+            approval_timestamps.append(resolved_at)
+            total_approved_outcomes += 1
+            approved_good_count += 1
+            selected_count += 1
+            hard_positive_score += 1.0
+            last_approved_at = resolved_at
+        elif resolution_kind == "approved_best_available" and provider_id == selected_provider_id:
+            approval_timestamps.append(resolved_at)
+            soft_timestamps.append(resolved_at)
+            total_approved_outcomes += 1
+            approved_best_available_count += 1
+            selected_count += 1
+            soft_positive_score += 0.35
+            last_approved_at = resolved_at
+        elif resolution_kind == "rejected_all":
+            rejected_timestamps.append(resolved_at)
+            rejected_all_count += 1
+            negative_feedback_score += 1.0
+        recent_review_timestamps = [ts for ts in review_timestamps if ts >= recent_cutoff]
+        recent_approval_timestamps = [ts for ts in approval_timestamps if ts >= recent_cutoff]
+        recent_soft_timestamps = [ts for ts in soft_timestamps if ts >= recent_cutoff]
+        recent_rejected_timestamps = [ts for ts in rejected_timestamps if ts >= recent_cutoff]
+        total_review_escalations = len(review_timestamps)
+        indirect_approval_rate = round(
+            selected_count / total_review_escalations if total_review_escalations else 0.0,
+            4,
+        )
+        store.save_transcript_provider_quality_stats(
+            current.model_copy(
+                update={
+                    "total_review_escalations": total_review_escalations,
+                    "total_approved_outcomes": total_approved_outcomes,
+                    "selected_via_approved_translation_count": selected_count,
+                    "recent_review_escalations_30d": len(recent_review_timestamps),
+                    "recent_approved_outcomes_30d": len(recent_approval_timestamps),
+                    "approved_good_count": approved_good_count,
+                    "approved_best_available_count": approved_best_available_count,
+                    "rejected_all_count": rejected_all_count,
+                    "recent_approved_best_available_count_30d": len(recent_soft_timestamps),
+                    "recent_rejected_all_count_30d": len(recent_rejected_timestamps),
+                    "hard_positive_score": round(hard_positive_score, 4),
+                    "soft_positive_score": round(soft_positive_score, 4),
+                    "negative_feedback_score": round(negative_feedback_score, 4),
+                    "indirect_approval_rate": indirect_approval_rate,
+                    "review_escalation_timestamps": tuple(review_timestamps),
+                    "approval_timestamps": tuple(approval_timestamps),
+                    "approved_best_available_timestamps": tuple(soft_timestamps),
+                    "rejected_all_timestamps": tuple(rejected_timestamps),
+                    "last_approved_at": last_approved_at,
+                    "updated_at": resolved_at,
+                }
+            )
+        )
+
+
+def _update_translation_feedback_stats(
+    *,
+    store: OperationalStore,
+    resolution: HumanReviewResolutionRecord,
+    resolved_at: datetime,
+) -> None:
+    current_stats: dict[str, TranslationFeedbackStats] = {}
+
+    def _stats_for(context: HumanReviewedCandidateContext) -> TranslationFeedbackStats:
+        existing = current_stats.get(context.combo_key)
+        if existing is not None:
+            return existing
+        loaded = store.get_translation_feedback_stats(context.combo_key)
+        if loaded is None:
+            loaded = TranslationFeedbackStats(
+                combo_key=context.combo_key,
+                source_language=resolution.source_language,
+                target_language=resolution.target_language,
+                transcript_provider_id=context.transcript_provider_id or "unknown-provider",
+                model_id=context.model_id,
+                prompt_variant_id=context.prompt_variant_id,
+                prompt_version=context.prompt_version,
+                last_seen_at=resolved_at,
+                updated_at=resolved_at,
+            )
+        current_stats[context.combo_key] = loaded
+        return loaded
+
+    selected = next(
+        (
+            context
+            for context in resolution.reviewed_candidates
+            if context.candidate_id == resolution.candidate_id
+        ),
+        None,
+    )
+    weight = 1.0 if resolution.resolution_kind == "approved_good" else 0.35
+    for context in resolution.reviewed_candidates:
+        stats = _stats_for(context)
+        failure_tag_counts = dict(stats.failure_tag_counts)
+        if (
+            context.candidate_id == resolution.candidate_id
+            and resolution.resolution_kind == "approved_good"
+        ):
+            updated = stats.model_copy(
+                update={
+                    "approved_good_count": stats.approved_good_count + 1,
+                    "last_seen_at": resolved_at,
+                    "updated_at": resolved_at,
+                }
+            )
+        elif (
+            context.candidate_id == resolution.candidate_id
+            and resolution.resolution_kind == "approved_best_available"
+        ):
+            for tag in resolution.failure_tags:
+                failure_tag_counts[tag] = failure_tag_counts.get(tag, 0) + 1
+            updated = stats.model_copy(
+                update={
+                    "approved_best_available_count": stats.approved_best_available_count + 1,
+                    "failure_tag_counts": failure_tag_counts,
+                    "last_seen_at": resolved_at,
+                    "updated_at": resolved_at,
+                }
+            )
+        elif resolution.resolution_kind == "rejected_all":
+            for tag in resolution.failure_tags:
+                failure_tag_counts[tag] = failure_tag_counts.get(tag, 0) + 1
+            updated = stats.model_copy(
+                update={
+                    "rejected_all_count": stats.rejected_all_count + 1,
+                    "failure_tag_counts": failure_tag_counts,
+                    "last_seen_at": resolved_at,
+                    "updated_at": resolved_at,
+                }
+            )
+        elif selected is not None and context.combo_key != selected.combo_key:
+            updated = stats.model_copy(
+                update={
+                    "pairwise_loss_score": round(stats.pairwise_loss_score + weight, 4),
+                    "last_seen_at": resolved_at,
+                    "updated_at": resolved_at,
+                }
+            )
+        else:
+            updated = stats.model_copy(
+                update={"last_seen_at": resolved_at, "updated_at": resolved_at}
+            )
+        current_stats[context.combo_key] = updated
+
+    if selected is not None and resolution.resolution_kind in {
+        "approved_good",
+        "approved_best_available",
+    }:
+        selected_stats = _stats_for(selected)
+        current_stats[selected.combo_key] = selected_stats.model_copy(
+            update={
+                "pairwise_win_score": round(selected_stats.pairwise_win_score + weight, 4),
+                "last_seen_at": resolved_at,
+                "updated_at": resolved_at,
+            }
+        )
+
+    for stats in current_stats.values():
+        store.save_translation_feedback_stats(stats)
+
+
+def _write_resolution_learning_memory(
     *,
     context: ReviewSessionContext,
-    approval_record: HumanApprovalRecord,
-    learning_ref: str,
-    approved_candidate: TranslationCandidate,
-    approved_transcript: TranscriptCandidate,
+    resolution: HumanReviewResolutionRecord,
+    resolution_ref: str,
+    learning_ref: str | None,
 ) -> tuple[MemoryWriteBatch, str, tuple[RoutingFact, ...]]:
-    now = approval_record.approved_at
-    scope_key = f"{context.job.source_language}::{context.job.target_language}"
-    batch = MemoryWriteBatch(
-        batch_id=f"batch-translation_human_approval-{context.run_record.run_id}",
-        job_id=context.job.job_id,
-        source_stage="translation_human_approval",
-        decision_ref=approval_record.machine_translation_decision_ref,
-        investigation_ref=approval_record.machine_investigation_ref,
-        winner_candidate_id=approved_candidate.candidate_id,
-        decision_mode="human_approval",
-        decision_confidence=1.0,
-        disagreement_bucket="unresolved",
-        translation_model_winner=approved_candidate.model_id,
-        prompt_variant_winner=approved_candidate.prompt_variant_id,
-        prompt_version_winner=approved_candidate.prompt_version,
-        semantic_writes=(
+    now = resolution.resolved_at
+    project_scope_key = (
+        f"{context.job.tenant_id}::{context.job.project_id}::"
+        f"{context.job.source_language}::{context.job.target_language}"
+    )
+    pair_scope_key = f"{context.job.source_language}::{context.job.target_language}"
+    semantic_writes: list[MemoryWrite] = []
+    episodic_writes: list[MemoryWrite] = [
+        MemoryWrite(
+            kind="episodic",
+            content=(
+                f"Human review resolved {resolution.resolution_kind} "
+                f"for run {context.run_record.run_id}."
+            ),
+            scope_kind="project_pair",
+            scope_key=project_scope_key,
+            updated_at=now,
+            score=0.95 if resolution.resolution_kind == "approved_good" else 0.7,
+            source_ref=resolution_ref,
+            metadata={
+                "dedupe_key": f"resolution:event:{context.run_record.run_id}",
+                "event_id": context.run_record.run_id,
+                "supervision_kind": resolution.resolution_kind,
+                "supervision_strength": resolution.supervision_strength,
+                "failure_tags": list(resolution.failure_tags),
+            },
+        )
+    ]
+    procedural_writes: list[MemoryWrite] = []
+    if resolution.candidate_id is not None and resolution.transcript_provider_id is not None:
+        semantic_writes.append(
             MemoryWrite(
                 kind="semantic",
                 content=(
-                    "Approved translations for "
-                    f"{context.job.source_language}->{context.job.target_language} "
-                    f"selected transcript provider {approved_transcript.provider_id}."
+                    f"Operator review for {context.job.media_key} preferred transcript provider "
+                    f"{resolution.transcript_provider_id} under {resolution.resolution_kind}."
                 ),
-                scope_kind="pair",
-                scope_key=scope_key,
+                scope_kind="project_pair",
+                scope_key=project_scope_key,
                 updated_at=now,
-                score=0.92,
-                source_ref=learning_ref,
+                score=0.95 if resolution.resolution_kind == "approved_good" else 0.7,
+                source_ref=learning_ref or resolution_ref,
                 metadata={
                     "dedupe_key": (
-                        "approval:transcript-source:"
-                        f"{approved_transcript.provider_id}:{context.job.source_language}:"
-                        f"{context.job.target_language}"
+                        f"resolution:provider:{resolution.transcript_provider_id}:"
+                        f"{context.job.media_key}:{resolution.resolution_kind}"
                     ),
                     "category": "transcript_source_learning",
+                    "supervision_kind": resolution.resolution_kind,
+                    "supervision_strength": resolution.supervision_strength,
+                    "transcript_provider_id": resolution.transcript_provider_id,
+                    "combo_key": resolution.combo_key,
+                    "media_key": context.job.media_key,
                 },
-            ),
-        ),
-        episodic_writes=(
-            MemoryWrite(
-                kind="episodic",
-                content=(
-                    "Human approval chose "
-                    f"{approved_candidate.candidate_id} and implied transcript "
-                    f"{approved_transcript.candidate_id}."
-                ),
-                scope_kind="pair",
-                scope_key=scope_key,
-                updated_at=now,
-                score=0.95,
-                source_ref=approval_record.machine_translation_decision_ref,
-                metadata={
-                    "dedupe_key": f"approval:event:{context.run_record.run_id}",
-                    "event_id": context.run_record.run_id,
-                },
-            ),
-        ),
-        procedural_writes=(
+            )
+        )
+        procedural_writes.append(
             MemoryWrite(
                 kind="procedural",
                 content=(
-                    "Approved translation outcomes are strong indirect supervision for transcript "
-                    "source ranking and translation candidate preference."
+                    "Favor translation combo "
+                    f"{resolution.combo_key} when review context is similar, "
+                    f"but keep contradiction checks blocking."
                 ),
                 scope_kind="pair",
-                scope_key=scope_key,
+                scope_key=pair_scope_key,
                 updated_at=now,
-                score=0.9,
-                source_ref=approval_record.machine_translation_decision_ref,
+                score=0.92 if resolution.resolution_kind == "approved_good" else 0.65,
+                source_ref=learning_ref or resolution_ref,
                 metadata={
-                    "dedupe_key": (
-                        "approval:translation-learning:"
-                        f"{approved_candidate.model_id}:{approved_candidate.prompt_variant_id}:"
-                        f"{approved_candidate.prompt_version}"
-                    ),
+                    "dedupe_key": f"resolution:combo:{resolution.combo_key}",
+                    "supervision_kind": resolution.resolution_kind,
+                    "supervision_strength": resolution.supervision_strength,
+                    "failure_tags": list(resolution.failure_tags),
+                    "transcript_provider_id": resolution.transcript_provider_id,
+                    "prompt_variant_id": resolution.prompt_variant_id,
+                    "prompt_version": resolution.prompt_version,
+                    "model_id": resolution.model_id,
+                    "combo_key": resolution.combo_key,
+                    "category": "translation_combo_guidance",
                     "prompt_family": "translation",
                 },
-            ),
-        ),
-        dedupe_keys=(
-            f"approval:transcript-source:{approved_transcript.provider_id}:{scope_key}",
-            f"approval:event:{context.run_record.run_id}",
-            (
-                "approval:translation-learning:"
-                f"{approved_candidate.model_id}:{approved_candidate.prompt_variant_id}:"
-                f"{approved_candidate.prompt_version}"
-            ),
+            )
+        )
+    if resolution.resolution_kind == "rejected_all":
+        for tag in resolution.failure_tags:
+            procedural_writes.append(
+                MemoryWrite(
+                    kind="procedural",
+                    content=_failure_tag_instruction(tag),
+                    scope_kind="pair",
+                    scope_key=pair_scope_key,
+                    updated_at=now,
+                    score=0.78,
+                    source_ref=resolution_ref,
+                    metadata={
+                        "dedupe_key": f"resolution:anti-pattern:{tag}:{pair_scope_key}",
+                        "supervision_kind": resolution.resolution_kind,
+                        "supervision_strength": resolution.supervision_strength,
+                        "failure_tags": [tag],
+                        "category": "anti_pattern",
+                        "prompt_family": "translation",
+                    },
+                )
+            )
+    batch = MemoryWriteBatch(
+        batch_id=f"batch-translation_human_resolution-{context.run_record.run_id}",
+        job_id=context.job.job_id,
+        source_stage="translation_human_resolution",
+        decision_ref=resolution.machine_translation_decision_ref,
+        investigation_ref=resolution.machine_investigation_ref,
+        winner_candidate_id=resolution.candidate_id,
+        decision_mode=resolution.resolution_kind,
+        decision_confidence=1.0,
+        disagreement_bucket="unresolved",
+        translation_model_winner=resolution.model_id,
+        prompt_variant_winner=resolution.prompt_variant_id,
+        prompt_version_winner=resolution.prompt_version,
+        semantic_writes=tuple(semantic_writes),
+        episodic_writes=tuple(episodic_writes),
+        procedural_writes=tuple(procedural_writes),
+        dedupe_keys=tuple(
+            write.metadata["dedupe_key"]
+            for write in (*semantic_writes, *episodic_writes, *procedural_writes)
         ),
         metadata={
-            "approved_candidate_id": approved_candidate.candidate_id,
-            "approved_source_transcript_candidate_id": approved_transcript.candidate_id,
-            "approved_by": approval_record.approved_by,
+            "resolution_kind": resolution.resolution_kind,
+            "approved_by": resolution.approved_by,
+            "failure_tags": list(resolution.failure_tags),
+            "supervision_kind": resolution.resolution_kind,
+            "supervision_strength": resolution.supervision_strength,
+            "transcript_provider_id": resolution.transcript_provider_id,
+            "prompt_variant_id": resolution.prompt_variant_id,
+            "prompt_version": resolution.prompt_version,
+            "model_id": resolution.model_id,
+            "combo_key": resolution.combo_key,
+            "media_key": context.job.media_key,
         },
     )
     context.store.save_batch(batch, storage_job_id=operational_job_key(context.job))
@@ -1225,13 +1753,13 @@ def _write_approval_learning_memory(
     )
     routing_facts = (
         RoutingFact(
-            stage="approve_review",
+            stage="resolve_review",
             fact_type="memory_batch_staged",
             value=batch.batch_id,
             source_ref=batch_ref,
         ),
         RoutingFact(
-            stage="approve_review",
+            stage="resolve_review",
             fact_type="memory_batch_consolidated",
             value=consolidation.consolidation_id,
             source_ref=consolidation_ref,
@@ -1240,22 +1768,41 @@ def _write_approval_learning_memory(
     return updated_batch, consolidation_ref, routing_facts
 
 
-def _approval_publish_state(
+def _resolution_publish_state(
     *,
     context: ReviewSessionContext,
     output_data: dict[str, Any],
-    approved_candidate: TranslationCandidate,
-    approved_transcript: TranscriptCandidate,
+    approved_candidate: TranslationCandidate | None,
+    approved_transcript: TranscriptCandidate | None,
+    resolution_ref: str,
+    resolution_kind: HumanSupervisionKind,
+    failure_tags: tuple[FailureTag, ...],
+    residual_failure_tags: tuple[FailureTag, ...],
     approval_ref: str,
-    learning_ref: str,
+    learning_ref: str | None,
     memory_batch: MemoryWriteBatch,
     routing_facts: tuple[RoutingFact, ...],
+    improvement_proposal_refs: tuple[str, ...],
 ) -> GraphState:
     existing_facts = _existing_routing_facts(context)
+    transcript_decision_ref = output_data.get("transcript_decision_ref") or transcript_decision_key(
+        context.job
+    )
+    final_transcript_candidate_id = output_data.get("final_transcript_candidate_id")
+    if not isinstance(final_transcript_candidate_id, str) or not final_transcript_candidate_id:
+        transcript_decision = _optional_json(context.runtime, transcript_decision_ref)
+        final_transcript_candidate_id = (
+            str(transcript_decision.get("winner_candidate_id"))
+            if isinstance(transcript_decision, dict)
+            and isinstance(transcript_decision.get("winner_candidate_id"), str)
+            else None
+        )
+    if approved_transcript is not None:
+        final_transcript_candidate_id = approved_transcript.candidate_id
     return GraphState(
         run_id=context.run_record.run_id,
         job=context.job,
-        current_stage="approve_review",
+        current_stage="resolve_review",
         source_video_ref=context.job.source_video_ref,
         source_artifact_ref=context.source_artifact_ref,
         transcript_candidate_ids=tuple(
@@ -1265,9 +1812,8 @@ def _approval_publish_state(
                 storage_job_id=operational_job_key(context.job),
             )
         ),
-        final_transcript_candidate_id=approved_transcript.candidate_id,
-        final_transcript_decision_ref=output_data.get("transcript_decision_ref")
-        or transcript_decision_key(context.job),
+        final_transcript_candidate_id=final_transcript_candidate_id,
+        final_transcript_decision_ref=transcript_decision_ref,
         translation_candidate_ids=tuple(
             candidate.candidate_id
             for candidate in context.runtime.decision_store.list_translation_candidates(
@@ -1275,7 +1821,9 @@ def _approval_publish_state(
                 storage_job_id=operational_job_key(context.job),
             )
         ),
-        final_translation_candidate_id=approved_candidate.candidate_id,
+        final_translation_candidate_id=(
+            approved_candidate.candidate_id if approved_candidate is not None else None
+        ),
         final_translation_decision_ref=output_data.get("translation_decision_ref")
         or translation_decision_key(context.job),
         reference_transcript_ref=_optional_string(output_data.get("reference_transcript_ref")),
@@ -1284,7 +1832,12 @@ def _approval_publish_state(
             output_data.get("regenerated_translation_draft_ref")
         ),
         improvement_proposal_refs=tuple(
-            str(ref) for ref in output_data.get("improvement_proposal_refs", [])
+            sorted(
+                {
+                    *(str(ref) for ref in output_data.get("improvement_proposal_refs", [])),
+                    *improvement_proposal_refs,
+                }
+            )
         ),
         memory_batch_ids=tuple(
             sorted(
@@ -1297,26 +1850,383 @@ def _approval_publish_state(
         routing_facts=existing_facts
         + (
             RoutingFact(
-                stage="approve_review",
-                fact_type="learning_artifact",
-                value=learning_ref,
-                source_ref=learning_ref,
+                stage="resolve_review",
+                fact_type="review_resolution_artifact",
+                value=resolution_ref,
+                source_ref=resolution_ref,
             ),
-            RoutingFact(
-                stage="approve_review",
-                fact_type="approval_artifact",
-                value=approval_ref,
-                source_ref=approval_ref,
-            ),
+        )
+        + (
+            (
+                RoutingFact(
+                    stage="resolve_review",
+                    fact_type="approval_artifact",
+                    value=approval_ref,
+                    source_ref=approval_ref,
+                ),
+            )
+            if approved_candidate is not None
+            else ()
+        )
+        + (
+            (
+                RoutingFact(
+                    stage="resolve_review",
+                    fact_type="learning_artifact",
+                    value=learning_ref,
+                    source_ref=learning_ref,
+                ),
+            )
+            if learning_ref is not None
+            else ()
         )
         + routing_facts,
         human_review_required=False,
         review_required_stage="translation",
-        approval_ref=approval_ref,
-        approved_candidate_id=approved_candidate.candidate_id,
-        approved_source_transcript_candidate_id=approved_transcript.candidate_id,
-        translation_failed=False,
+        resolution_ref=resolution_ref,
+        resolution_kind=resolution_kind,
+        failure_tags=failure_tags,
+        residual_failure_tags=residual_failure_tags,
+        approval_ref=approval_ref if approved_candidate is not None else None,
+        approved_candidate_id=approved_candidate.candidate_id
+        if approved_candidate is not None
+        else None,
+        approved_source_transcript_candidate_id=(
+            approved_transcript.candidate_id if approved_transcript is not None else None
+        ),
+        translation_failed=resolution_kind == "rejected_all",
     )
+
+
+def _failure_tag_instruction(tag: FailureTag) -> str:
+    return _FAILURE_TAG_INSTRUCTIONS.get(
+        tag,
+        "Prefer conservative, source-grounded translation when prior runs failed this way.",
+    )
+
+
+def _update_feedback_prompt_proposals(
+    *,
+    context: ReviewSessionContext,
+    resolution: HumanReviewResolutionRecord,
+    resolution_ref: str,
+) -> tuple[str, ...]:
+    list_proposals = cast(
+        Callable[..., list[PromptEvolutionProposal]] | None,
+        getattr(context.store, "list_prompt_evolution_proposals", None),
+    )
+    save_proposal = cast(
+        Callable[[PromptEvolutionProposal], None] | None,
+        getattr(context.store, "save_prompt_evolution_proposal", None),
+    )
+    if not callable(list_proposals) or not callable(save_proposal):
+        return ()
+    compatibilities = {
+        (
+            compatibility.model_id,
+            compatibility.prompt_variant_id,
+            compatibility.base_prompt_version,
+        ): compatibility
+        for compatibility in (
+            _compatibility_for_candidate_context(context.job, candidate)
+            for candidate in resolution.reviewed_candidates
+        )
+        if compatibility is not None
+    }
+    if not compatibilities:
+        return ()
+    refs: list[str] = []
+    for compatibility in compatibilities.values():
+        relevant_resolutions = [
+            record
+            for record in context.store.list_human_review_resolutions(
+                source_language=context.job.source_language,
+                target_language=context.job.target_language,
+                model_id=compatibility.model_id,
+                prompt_variant_id=compatibility.prompt_variant_id,
+            )
+            if _resolution_supports_compatibility(record, compatibility)
+            and record.resolved_at >= resolution.resolved_at - timedelta(days=30)
+        ]
+        dominant_tag, tag_ratio = _dominant_failure_tag(relevant_resolutions)
+        failure_run_count = sum(
+            1
+            for record in relevant_resolutions
+            if (
+                (
+                    record.resolution_kind == "approved_best_available"
+                    and _resolution_failure_weight(record, compatibility) > 0.0
+                )
+                or (
+                    record.resolution_kind == "rejected_all"
+                    and _resolution_failure_weight(record, compatibility) < 0.0
+                )
+            )
+        )
+        if (
+            len(relevant_resolutions) < 3
+            or failure_run_count < 2
+            or dominant_tag is None
+            or tag_ratio < 0.6
+        ):
+            continue
+        existing = [
+            proposal
+            for proposal in list_proposals(
+                prompt_family="translation",
+                target_model_id=compatibility.model_id,
+                source_language=compatibility.source_language,
+                target_language=compatibility.target_language,
+                prompt_variant_id=compatibility.prompt_variant_id,
+                base_prompt_version=compatibility.base_prompt_version,
+                scope_kind=compatibility.scope_kind,
+                scope_key=compatibility.scope_key,
+                media_key=None,
+            )
+            if proposal.compatibility == compatibility
+            and proposal.metadata.get("proposal_origin") == "human_review_feedback"
+        ]
+        proposal = (
+            existing[0]
+            if existing
+            else _build_feedback_prompt_proposal(
+                context=context,
+                compatibility=compatibility,
+                dominant_tag=dominant_tag,
+                resolution_ref=resolution_ref,
+            )
+        )
+        proposal = _updated_feedback_proposal_status(proposal, relevant_resolutions, compatibility)
+        proposal_ref = _save_feedback_prompt_proposal(context, proposal, save_proposal)
+        refs.append(proposal_ref)
+    return tuple(refs)
+
+
+def _compatibility_for_candidate_context(
+    job: JobContext,
+    candidate: HumanReviewedCandidateContext,
+) -> PromptCompatibilityTuple | None:
+    if candidate.base_prompt_version is None:
+        return None
+    return PromptCompatibilityTuple(
+        prompt_family="translation",
+        model_id=candidate.model_id,
+        prompt_variant_id=candidate.prompt_variant_id,
+        base_prompt_version=candidate.base_prompt_version,
+        source_language=job.source_language,
+        target_language=job.target_language,
+        scope_kind="pair",
+        scope_key=f"{job.source_language}::{job.target_language}",
+    )
+
+
+def _resolution_supports_compatibility(
+    resolution: HumanReviewResolutionRecord,
+    compatibility: PromptCompatibilityTuple,
+) -> bool:
+    for candidate in resolution.reviewed_candidates:
+        if (
+            candidate.model_id == compatibility.model_id
+            and candidate.prompt_variant_id == compatibility.prompt_variant_id
+            and candidate.base_prompt_version == compatibility.base_prompt_version
+        ):
+            return True
+    return False
+
+
+def _resolution_failure_weight(
+    resolution: HumanReviewResolutionRecord,
+    compatibility: PromptCompatibilityTuple,
+) -> float:
+    selected = next(
+        (
+            candidate
+            for candidate in resolution.reviewed_candidates
+            if candidate.candidate_id == resolution.candidate_id
+        ),
+        None,
+    )
+    if resolution.resolution_kind == "approved_good":
+        return (
+            1.0 if selected and _candidate_matches_compatibility(selected, compatibility) else 0.0
+        )
+    if resolution.resolution_kind == "approved_best_available":
+        return (
+            0.35 if selected and _candidate_matches_compatibility(selected, compatibility) else 0.0
+        )
+    if any(
+        _candidate_matches_compatibility(candidate, compatibility)
+        for candidate in resolution.reviewed_candidates
+    ):
+        return -1.0
+    return 0.0
+
+
+def _candidate_matches_compatibility(
+    candidate: HumanReviewedCandidateContext,
+    compatibility: PromptCompatibilityTuple,
+) -> bool:
+    return (
+        candidate.model_id == compatibility.model_id
+        and candidate.prompt_variant_id == compatibility.prompt_variant_id
+        and candidate.base_prompt_version == compatibility.base_prompt_version
+    )
+
+
+def _dominant_failure_tag(
+    resolutions: list[HumanReviewResolutionRecord],
+) -> tuple[FailureTag | None, float]:
+    counts: dict[str, int] = {}
+    tagged_runs = 0
+    for resolution in resolutions:
+        if not resolution.failure_tags:
+            continue
+        tagged_runs += 1
+        for tag in set(resolution.failure_tags):
+            counts[tag] = counts.get(tag, 0) + 1
+    if not counts or tagged_runs == 0:
+        return None, 0.0
+    dominant_tag, count = sorted(counts.items(), key=lambda item: (-item[1], item[0]))[0]
+    return dominant_tag, round(count / tagged_runs, 4)  # type: ignore[return-value]
+
+
+def _build_feedback_prompt_proposal(
+    *,
+    context: ReviewSessionContext,
+    compatibility: PromptCompatibilityTuple,
+    dominant_tag: FailureTag,
+    resolution_ref: str,
+) -> PromptEvolutionProposal:
+    proposal_id = (
+        f"human-feedback-{compatibility.model_id}-{compatibility.prompt_variant_id}-"
+        f"{compatibility.base_prompt_version}".replace("/", "-")
+    )
+    return PromptEvolutionProposal(
+        proposal_id=proposal_id,
+        job_id=context.job.job_id,
+        source_consolidation_id=f"human-feedback-{context.run_record.run_id}",
+        prompt_family="translation",
+        target_model_id=compatibility.model_id,
+        target_prompt_version=compatibility.base_prompt_version,
+        target_prompt_variant_id=compatibility.prompt_variant_id,
+        base_prompt_version=compatibility.base_prompt_version,
+        compatibility=compatibility,
+        status="proposed",
+        rationale=(
+            "Repeated human review resolutions found a dominant failure pattern for one exact "
+            "translation compatibility tuple."
+        ),
+        suggested_changes=(
+            PromptChange(section="system", instruction=_failure_tag_instruction(dominant_tag)),
+        ),
+        evidence_refs=(resolution_ref,),
+        metadata={
+            "proposal_origin": "human_review_feedback",
+            "dominant_failure_tag": dominant_tag,
+            "source_language": context.job.source_language,
+            "target_language": context.job.target_language,
+            "scope_kind": compatibility.scope_kind,
+            "scope_key": compatibility.scope_key,
+        },
+    )
+
+
+def _updated_feedback_proposal_status(
+    proposal: PromptEvolutionProposal,
+    resolutions: list[HumanReviewResolutionRecord],
+    compatibility: PromptCompatibilityTuple,
+) -> PromptEvolutionProposal:
+    canary_scores = [
+        _resolution_failure_weight(resolution, compatibility)
+        for resolution in resolutions
+        if any(
+            candidate.prompt_resolution_mode == "canary"
+            and _candidate_matches_compatibility(candidate, compatibility)
+            for candidate in resolution.reviewed_candidates
+        )
+    ]
+    control_scores = [
+        _resolution_failure_weight(resolution, compatibility)
+        for resolution in resolutions
+        if any(
+            candidate.prompt_resolution_mode in {"control", "active", None}
+            and _candidate_matches_compatibility(candidate, compatibility)
+            for candidate in resolution.reviewed_candidates
+        )
+    ]
+    canary_count = len([score for score in canary_scores if score != 0.0])
+    control_count = len([score for score in control_scores if score != 0.0])
+    canary_score = _average_score(canary_scores)
+    control_score = _average_score(control_scores)
+    canary_rejected_rate = _rejected_rate(canary_scores)
+    control_rejected_rate = _rejected_rate(control_scores)
+    status = proposal.status
+    rollback_reason = proposal.rollback_reason
+    if status == "canary":
+        if (
+            canary_count >= 5
+            and control_count >= 5
+            and canary_score >= control_score + 0.15
+            and canary_rejected_rate <= control_rejected_rate
+        ):
+            status = "active"
+            rollback_reason = None
+    elif status == "active":
+        recent_active_scores = [score for score in canary_scores[-5:] if score != 0.0]
+        if (
+            len(recent_active_scores) >= 5
+            and _average_score(recent_active_scores) <= control_score - 0.10
+        ):
+            status = "rolled_back"
+            rollback_reason = "active proposal regressed on human-feedback score"
+    return proposal.model_copy(
+        update={
+            "status": status,
+            "rollback_reason": rollback_reason,
+            "canary_run_count": canary_count,
+            "control_run_count": control_count,
+            "metadata": {
+                **proposal.metadata,
+                "canary_feedback_score": canary_score,
+                "control_feedback_score": control_score,
+                "canary_rejected_all_rate": canary_rejected_rate,
+                "control_rejected_all_rate": control_rejected_rate,
+            },
+        }
+    )
+
+
+def _average_score(values: list[float]) -> float:
+    non_zero = [value for value in values if value != 0.0]
+    if not non_zero:
+        return 0.0
+    return round(sum(non_zero) / len(non_zero), 4)
+
+
+def _rejected_rate(values: list[float]) -> float:
+    non_zero = [value for value in values if value != 0.0]
+    if not non_zero:
+        return 0.0
+    return round(sum(1 for value in non_zero if value < 0.0) / len(non_zero), 4)
+
+
+def _save_feedback_prompt_proposal(
+    context: ReviewSessionContext,
+    proposal: PromptEvolutionProposal,
+    save_proposal,
+) -> str:
+    proposal_ref = job_path(
+        context.job,
+        "memory",
+        "prompt-evolution",
+        f"{proposal.proposal_id}.json",
+    )
+    proposal = proposal.model_copy(
+        update={"metadata": {**proposal.metadata, "proposal_ref": proposal_ref}}
+    )
+    write_model_artifact(context.runtime, proposal_ref, proposal)
+    save_proposal(proposal)
+    return proposal_ref
 
 
 def _existing_routing_facts(context: ReviewSessionContext) -> tuple[RoutingFact, ...]:

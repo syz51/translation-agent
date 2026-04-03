@@ -35,6 +35,9 @@ def test_store_uses_explicit_migrated_schema(migrated_postgres_dsn: str) -> None
         "asset_records",
         "historical_run_links",
         "prompt_evolution_proposals",
+        "transcript_provider_quality_stats",
+        "human_review_resolutions",
+        "translation_feedback_stats",
     } <= tables
     assert "idx_node_executions_run_id_created_at" in indexes
 
