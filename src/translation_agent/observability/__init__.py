@@ -7,7 +7,7 @@ from .events import (
     get_structured_logger,
     log_structured_event,
 )
-from .tracing import JsonlTraceSink, NoOpTraceSink, TraceEvent, TraceSink
+from .tracing import CompositeTraceSink, JsonlTraceSink, NoOpTraceSink, TraceEvent, TraceSink
 
 __all__ = [
     "STRUCTLOG_AVAILABLE",
@@ -15,6 +15,7 @@ __all__ = [
     "configure_structured_logging",
     "get_structured_logger",
     "log_structured_event",
+    "CompositeTraceSink",
     "JsonlTraceSink",
     "NoOpTraceSink",
     "TraceEvent",

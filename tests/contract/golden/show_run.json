@@ -1,0 +1,30 @@
+{
+  "run_id": "run-show",
+  "job_id": "job-show",
+  "status": "completed",
+  "current_stage": "finalize_outputs",
+  "active_node": null,
+  "elapsed_seconds": 5.0,
+  "trace_path": "<trace_path>",
+  "recent_events": [
+    {
+      "timestamp": "2026-04-03T00:00:00+00:00",
+      "name": "run.started",
+      "message": "Run started",
+      "attributes": {
+        "job_id": "job-show"
+      }
+    },
+    {
+      "timestamp": "2026-04-03T00:00:05+00:00",
+      "name": "run.completed",
+      "message": "Run completed with status completed",
+      "attributes": {
+        "status": "completed"
+      }
+    }
+  ],
+  "transcription_providers": null,
+  "translation_variants": null,
+  "review_bundles": null
+}
