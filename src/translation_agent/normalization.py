@@ -96,7 +96,7 @@ def normalize_translation_candidate(candidate: TranslationCandidate) -> Translat
     provider_metadata = _normalized_child_metadata(metadata, "provider")
     provider_metadata["provider_id"] = _normalize_identifier(
         _metadata_string(provider_metadata, "provider_id"),
-        fallback="openai",
+        fallback="unknown-provider",
     )
     provider_metadata["provider_request_id"] = _normalize_optional_identifier(
         _metadata_string(provider_metadata, "provider_request_id")

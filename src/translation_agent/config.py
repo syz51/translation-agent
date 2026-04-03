@@ -19,6 +19,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_ENV_FILE = PROJECT_ROOT / ".env"
 _USE_DEFAULT_ENV_FILE = object()
 type TranscriptionProviderId = Literal["assemblyai", "speechmatics", "deepgram"]
+type LlmProviderId = Literal["gemini", "openai"]
 DEFAULT_TRANSCRIPTION_PROVIDERS: tuple[TranscriptionProviderId, ...] = (
     "assemblyai",
     "speechmatics",
@@ -29,6 +30,11 @@ _TRANSCRIPTION_PROVIDER_ENV_VARS: dict[TranscriptionProviderId, str] = {
     "assemblyai": "TA_ASSEMBLYAI_API_KEY",
     "speechmatics": "TA_SPEECHMATICS_API_KEY",
     "deepgram": "TA_DEEPGRAM_API_KEY",
+}
+_SUPPORTED_LLM_PROVIDER_IDS = frozenset({"gemini", "openai"})
+_LLM_PROVIDER_ENV_VARS: dict[LlmProviderId, str] = {
+    "gemini": "TA_GEMINI_API_KEY",
+    "openai": "TA_OPENAI_API_KEY",
 }
 
 
@@ -71,11 +77,16 @@ class Settings(BaseSettings):
     deepgram_api_key: str | None = None
     deepgram_base_url: str = "https://api.deepgram.com/v1/listen"
     deepgram_utterance_split_seconds: float = Field(default=0.8, ge=0.2, le=3.0)
+    translation_provider: LlmProviderId = "gemini"
+    gemini_api_key: str | None = None
+    gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai/"
     openai_api_key: str | None = None
-    openai_base_url: str = "https://api.openai.com/v1/responses"
+    openai_base_url: str | None = None
     default_source_language: str = "en"
     default_target_language: str = "zh"
-    translation_model_id: str = "gpt-5.4-mini"
+    translation_model_id: str = "gemini-3-flash"
+    reasoning_provider: LlmProviderId = "openai"
+    reasoning_model_id: str = "gpt-5.4"
     translation_prompt_version: str = "phase-3-v1"
     transcription_max_workers: int | None = Field(default=None, ge=1, le=16)
     translation_candidate_max_workers: int = Field(default=2, ge=1, le=16)
@@ -313,8 +324,19 @@ def validate_provider_configuration(settings: Settings) -> str | None:
         for provider_id in transcription_providers
         if not provider_api_keys[provider_id]
     ]
-    if not settings.openai_api_key:
-        missing.append("TA_OPENAI_API_KEY")
+    translation_provider_error = _missing_llm_provider_env_var(
+        settings,
+        provider_id=settings.translation_provider,
+    )
+    if translation_provider_error is not None:
+        missing.append(translation_provider_error)
+    if _reasoning_provider_enabled(settings):
+        reasoning_provider_error = _missing_llm_provider_env_var(
+            settings,
+            provider_id=settings.reasoning_provider,
+        )
+        if reasoning_provider_error is not None:
+            missing.append(reasoning_provider_error)
     if missing:
         return f"real adapter mode requires {', '.join(missing)}"
     return None
@@ -378,3 +400,48 @@ def _configured_transcription_provider_count(configured: str | tuple[str, ...] |
     if configured is None:
         return len(DEFAULT_TRANSCRIPTION_PROVIDERS)
     return max(1, len(_normalized_transcription_provider_tokens(configured)))
+
+
+def llm_provider_api_key(settings: Settings, provider_id: LlmProviderId) -> str | None:
+    """Return the configured API key for the selected LLM provider."""
+
+    if provider_id == "gemini":
+        return settings.gemini_api_key
+    return settings.openai_api_key
+
+
+def llm_provider_base_url(settings: Settings, provider_id: LlmProviderId) -> str | None:
+    """Return the configured base URL for the selected LLM provider."""
+
+    if provider_id == "gemini":
+        return settings.gemini_base_url
+    return settings.openai_base_url
+
+
+def llm_provider_base_url_source(settings: Settings, provider_id: LlmProviderId) -> str:
+    """Describe where the active provider base URL was sourced from."""
+
+    if provider_id == "gemini":
+        return "TA_GEMINI_BASE_URL" if "gemini_base_url" in settings.model_fields_set else "default"
+    if settings.openai_base_url:
+        return "TA_OPENAI_BASE_URL"
+    return "openai-sdk-default"
+
+
+def _missing_llm_provider_env_var(
+    settings: Settings,
+    *,
+    provider_id: LlmProviderId,
+) -> str | None:
+    if provider_id not in _SUPPORTED_LLM_PROVIDER_IDS:  # pragma: no cover - defensive
+        raise RuntimeError(f"unsupported LLM provider: {provider_id}")
+    if llm_provider_api_key(settings, provider_id):
+        return None
+    return _LLM_PROVIDER_ENV_VARS[provider_id]
+
+
+def _reasoning_provider_enabled(settings: Settings) -> bool:
+    """Keep reasoning credential validation dormant until a live adapter exists."""
+
+    del settings
+    return False
