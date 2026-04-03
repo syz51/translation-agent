@@ -450,17 +450,37 @@ The review payload includes:
 - `run_id`
 - `job_id`
 - `status`
+- `review_mode="exception_only"`
 - `review_required_stage`
+- `recommended_candidate_id`
+- `flagged_spans`
+- `auto_accepted_span_count`
+- `blocking_span_count`
+- `warning_span_count`
 - `summary`
 - ranked translation candidates
-- span-aligned `review_spans` records keyed by `source_span_id`
-- optional `draft_resolution` for save/resume
+- compatibility `review_spans` records keyed by `source_span_id`
+- optional `draft_resolution` for auto-save resume
 - additive legacy `review_diffs` cards ordered for compatibility only
 - source transcript provenance per candidate
 - transcript disagreement and investigation summary
 - preview paths for rendered translation and transcript artifacts
 
-Each `review_spans[*]` record includes:
+Each `flagged_spans[*]` record includes:
+
+- `source_span_id`
+- `time_range`
+- `source_excerpt`
+- `blocking`
+- `severity`
+- `issue_summary`
+- `recommended_variant_id`
+- `variants`
+- `selected_variant_id`
+- `edited_text`
+- `acknowledged`
+
+Each compatibility `review_spans[*]` record includes:
 
 - `source_span_id`
 - `start_ms`
@@ -472,6 +492,7 @@ Each `review_spans[*]` record includes:
 - `evidence_summary`
 - `source_excerpt`
 - `transcript_provenance_options`
+- `recommended_variant_id`
 - `variants`
 - `current_draft_decision`
 
@@ -491,12 +512,15 @@ Each `review_diffs[*]` card includes:
 - `right_candidate`
 
 `review_diffs` is now legacy and should not be treated as the primary TUI contract.
-Interactive `review-job` launches a Textual app that reviews one span at a time, saves resumable
-draft decisions, and finalizes a synthetic human-reviewed `TranslationCandidate`. The current TUI
-uses Textual's themed command-palette surface, a tabbed span workspace, and toast notifications
-instead of the earlier flat terminal layout.
+Interactive `review-job` launches a single compare workspace that opens on the first flagged span,
+shows machine recommendation first, auto-saves every selection or edit, keeps the editor collapsed
+until `Edit span`, blocks publish only on unresolved blocking spans, and routes rejection through a
+structured reason picker.
 
 ### `approve-review --json`
+
+`approve-review` remains a compatibility alias for automations that want to publish by naming a
+single base candidate. The operator-facing TUI no longer exposes this command directly.
 
 The approval payload includes:
 

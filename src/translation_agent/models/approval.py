@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Annotated, Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from .base import ContractModel
 
@@ -61,9 +61,18 @@ class ReviewDraftSpanDecision(ContractModel):
     source_span_id: NonEmptyStr
     selected_base_variant_id: str | None = None
     edited_text: str | None = None
+    acknowledged: bool = False
     resolution_status: Literal["unresolved", "resolved"] = "unresolved"
     dirty: bool = False
     reviewer_note: str = ""
+
+    @model_validator(mode="after")
+    def _sync_acknowledged_state(self) -> ReviewDraftSpanDecision:
+        if self.acknowledged and self.resolution_status != "resolved":
+            self.resolution_status = "resolved"
+        elif not self.acknowledged and self.resolution_status == "resolved":
+            self.acknowledged = True
+        return self
 
 
 class ReviewDraftResolution(ContractModel):

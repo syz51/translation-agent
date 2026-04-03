@@ -198,18 +198,22 @@ uv run translation-agent review-job <run-id> --json
 uv run translation-agent approve-review <run-id> --candidate-id <candidate-id> --json
 ```
 
-`review-job` now has two operator surfaces:
+`review-job` now defaults to an exception-only operator flow:
 
-- `--json` returns ranked translation candidates, span-level `review_spans`, an optional
-  resumable `draft_resolution`, and legacy `review_diffs` for backward compatibility
-- interactive mode launches a Textual 8 TUI with a themed, tabbed review surface, toast
-  notifications, and the built-in command palette on `Ctrl+P`; operators still review one aligned
-  span at a time, pick a base variant with number keys, lightly edit the chosen text, save a
-  resumable draft, and finalize a synthetic human-reviewed translation candidate
+- `--json` returns the primary `flagged_spans` contract, `review_mode="exception_only"`,
+  machine recommendation counts, compatibility `review_spans`, optional resumable
+  `draft_resolution`, and legacy `review_diffs`
+- interactive mode launches a single compare workspace that shows only flagged spans, keeps the
+  source excerpt fixed at the top, places candidate variants side by side, auto-saves every
+  selection or edit, and exposes only `Publish` and `Reject` as final outcomes
 
-Interactive review is now span-centric. `approve-review` remains available as a legacy convenience
-path that auto-resolves every span to one base candidate and still publishes a synthetic reviewed
-translation artifact instead of promoting the selected machine candidate wholesale.
+Most runs should auto-publish without opening `review-job`. Human review now opens only when
+machine adjudication still leaves a real blocker such as no surviving candidate, no machine winner,
+an unresolved blocking contradiction, or an investigation timeout.
+
+`approve-review` and `resolve-review` remain available as legacy automation and compatibility
+surfaces. They still map to the internal supervision enums and still publish a synthetic reviewed
+translation artifact instead of promoting a machine candidate wholesale.
 
 The public result payload contains:
 

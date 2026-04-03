@@ -1828,7 +1828,7 @@ def test_cli_resume_translation_review_auto_non_tty_prints_resume_instructions(
 
 
 @pytest.mark.unit
-def test_review_job_json_exposes_review_spans_and_legacy_review_diffs(
+def test_review_job_json_exposes_exception_only_review_contract_and_legacy_review_diffs(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -1849,7 +1849,9 @@ def test_review_job_json_exposes_review_spans_and_legacy_review_diffs(
     payload = json.loads(capsys.readouterr().out)
     candidate = payload["candidates"][0]
     assert exit_code == 0
+    assert payload["review_mode"] == "exception_only"
     assert payload["review_required_stage"] == "translation"
+    assert payload["recommended_candidate_id"] is not None
     assert payload["candidate_count"] >= 1
     assert candidate["source_transcript_candidate_id"]
     assert candidate["source_transcript"]["provider_id"] in {
@@ -1866,11 +1868,21 @@ def test_review_job_json_exposes_review_spans_and_legacy_review_diffs(
     assert contradiction["evidence_text"]
     assert contradiction["time_range"]
     assert payload["human_review_summary"]["contradiction_count"] >= 1
+    assert payload["flagged_spans"]
+    flagged_span = payload["flagged_spans"][0]
+    assert flagged_span["source_span_id"]
+    assert flagged_span["recommended_variant_id"]
+    assert flagged_span["selected_variant_id"]
+    assert isinstance(flagged_span["acknowledged"], bool)
+    assert payload["blocking_span_count"] >= 1
+    assert payload["warning_span_count"] >= 0
+    assert payload["auto_accepted_span_count"] >= 0
     assert payload["review_spans"]
     review_span = payload["review_spans"][0]
     assert review_span["source_span_id"]
     assert review_span["variants"]
     assert review_span["current_draft_decision"]["selected_base_variant_id"]
+    assert "acknowledged" in review_span["current_draft_decision"]
     assert review_span["transcript_provenance_options"]
     assert payload["review_diffs"]
     review_diff = payload["review_diffs"][0]

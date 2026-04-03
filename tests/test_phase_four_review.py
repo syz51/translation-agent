@@ -619,6 +619,20 @@ Escalate?: yes
     assert outcome.investigation_payload is not None
 
 
+def test_adjudicate_reviews_escalates_when_no_translation_candidate_survives() -> None:
+    outcome = adjudicate_reviews(
+        candidates=(),
+        reviews=(),
+        context=_adjudication_context(stage="translation", candidate_ids=()),
+    )
+
+    assert outcome.decision_mode == "human_review"
+    assert outcome.human_review_required is True
+    assert outcome.winner_candidate_id is None
+    assert outcome.investigation_payload is not None
+    assert outcome.investigation_payload["status"] == "unresolved"
+
+
 def test_adjudicate_reviews_keeps_single_transcript_candidate_on_reduced_confidence_path() -> None:
     candidate = _transcript_candidate("candidate-a", "Hello world from the workflow skeleton.")
     reviews = (
@@ -676,7 +690,7 @@ def test_phase_four_workflow_routes_translation_escalation_to_stronger_adjudicat
     assert blob_store.exists(_artifact_path("investigations", "translation.json"))
 
 
-def test_phase_four_workflow_routes_transcript_escalation_to_human_review(
+def test_phase_four_workflow_defers_transcript_escalation_to_translation_review(
     tmp_path: Path,
 ) -> None:
     final_state, run_store, blob_store = _run_workflow(tmp_path, scenario="transcript_escalation")

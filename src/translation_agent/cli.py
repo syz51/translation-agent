@@ -92,7 +92,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     review_parser = subparsers.add_parser(
         "review-job",
-        help="Inspect a pending translation review and optionally finalize a winner",
+        help="Open the exception-only flagged-span compare tool for a pending translation review",
     )
     review_parser.add_argument("run_id")
     review_parser.add_argument("--json", action="store_true", dest="as_json")
@@ -130,7 +130,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     approve_parser = subparsers.add_parser(
         "approve-review",
-        help="Finalize a pending translation review with one winning candidate",
+        help="Compatibility surface: publish a pending review by choosing one base candidate",
     )
     approve_parser.add_argument("run_id")
     approve_parser.add_argument("--candidate-id", required=True)
@@ -140,7 +140,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     resolve_parser = subparsers.add_parser(
         "resolve-review",
-        help="Resolve a pending translation review with graded human supervision",
+        help="Compatibility surface: resolve a pending review with internal supervision enums",
     )
     resolve_parser.add_argument("run_id")
     resolve_parser.add_argument(
