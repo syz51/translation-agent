@@ -14,6 +14,7 @@ from .approval import (
     TranslationFeedbackStats,
 )
 from .artifacts import AudioArtifact, PublishContext, PublishedArtifacts
+from .assets import AssetContext, AssetContextInput, AssetRelation
 from .evaluation import (
     AssetRecord,
     EvaluatedRunReport,
@@ -38,6 +39,7 @@ from .memory import (
     MemoryBundle,
     MemoryConsolidation,
     MemoryEntry,
+    MemoryEvidenceEvent,
     MemoryQuery,
     MemoryScopeKind,
     MemoryWrite,
@@ -70,6 +72,9 @@ from .translation import TranslationCandidate
 __all__ = [
     "AdjudicationContext",
     "AdjudicationScorecard",
+    "AssetContext",
+    "AssetContextInput",
+    "AssetRelation",
     "AssetRecord",
     "AudioArtifact",
     "CandidatePreference",
@@ -88,6 +93,7 @@ __all__ = [
     "MemoryBundle",
     "MemoryConsolidation",
     "MemoryEntry",
+    "MemoryEvidenceEvent",
     "MemoryQuery",
     "MemoryScopeKind",
     "MemoryWrite",

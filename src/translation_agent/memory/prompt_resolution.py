@@ -208,6 +208,8 @@ class ProposalBackedPromptResolver:
 
         if hasattr(self._proposal_store, "list_prompt_evolution_proposals"):
             query_store = cast(_ProposalQueryStore, self._proposal_store)
+            scope_kind = None if pair_scope else compatibility.scope_kind
+            scope_key = None if pair_scope else compatibility.scope_key
             matched.extend(
                 proposal
                 for proposal in query_store.list_prompt_evolution_proposals(
@@ -218,8 +220,8 @@ class ProposalBackedPromptResolver:
                     source_language=compatibility.source_language,
                     prompt_variant_id=compatibility.prompt_variant_id,
                     base_prompt_version=compatibility.base_prompt_version,
-                    scope_kind=compatibility.scope_kind,
-                    scope_key=compatibility.scope_key,
+                    scope_kind=scope_kind,
+                    scope_key=scope_key,
                     media_key=None,
                 )
                 if _proposal_matches(
@@ -347,9 +349,10 @@ def _proposal_matches(
     media_key: str | None,
     pair_scope: bool,
 ) -> bool:
-    if proposal.compatibility != compatibility:
-        return False
     if proposal.compatibility is None:
+        return False
+    promoted_pair_match = pair_scope and _matches_promoted_pair_scope(proposal, compatibility)
+    if not promoted_pair_match and proposal.compatibility != compatibility:
         return False
     if proposal.compatibility.scope_kind == "asset":
         return False
@@ -360,9 +363,34 @@ def _proposal_matches(
             if legacy_status not in {None, "promoted"}:
                 return False
     proposal_media_key = proposal.metadata.get("media_key")
+    if promoted_pair_match:
+        return True
     if isinstance(proposal_media_key, str) and proposal_media_key.strip():
         return proposal_media_key == media_key
     return True
+
+
+def _matches_promoted_pair_scope(
+    proposal: PromptEvolutionProposal,
+    compatibility: PromptCompatibilityTuple,
+) -> bool:
+    if proposal.promotion_status != "promoted":
+        legacy_status = proposal.metadata.get("promotion_status")
+        if legacy_status not in {None, "promoted"}:
+            return False
+    promoted_scope_kind = proposal.metadata.get("promoted_scope_kind")
+    promoted_scope_key = proposal.metadata.get("promoted_scope_key")
+    return (
+        proposal.compatibility is not None
+        and proposal.compatibility.prompt_family == compatibility.prompt_family
+        and proposal.compatibility.model_id == compatibility.model_id
+        and proposal.compatibility.prompt_variant_id == compatibility.prompt_variant_id
+        and proposal.compatibility.base_prompt_version == compatibility.base_prompt_version
+        and proposal.compatibility.source_language == compatibility.source_language
+        and proposal.compatibility.target_language == compatibility.target_language
+        and promoted_scope_kind == compatibility.scope_kind
+        and promoted_scope_key == compatibility.scope_key
+    )
 
 
 def _proposal_refs(proposal: PromptEvolutionProposal) -> tuple[str, ...]:

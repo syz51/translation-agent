@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from collections.abc import Mapping
 from contextlib import AbstractContextManager
@@ -11,11 +12,16 @@ from pathlib import Path
 from typing import Any, Protocol, cast
 
 from translation_agent.models import (
+    AssetContext,
     AssetRecord,
+    AssetRelation,
     FinalTranscriptDecision,
     FinalTranslationDecision,
     HistoricalRunLink,
     HumanReviewResolutionRecord,
+    MemoryEntry,
+    MemoryEvidenceEvent,
+    MemoryQuery,
     MemoryWriteBatch,
     PromptEvolutionProposal,
     TranscriptCandidate,
@@ -24,6 +30,12 @@ from translation_agent.models import (
     TranslationFeedbackStats,
 )
 from translation_agent.models.review import ReviewStage
+from translation_agent.search_index import (
+    EMBEDDING_MODEL_ID,
+    embedding_metadata_for_entry,
+    embedding_metadata_for_query,
+    serialize_embedding,
+)
 
 from .decisions import DecisionStore
 from .memory_batches import MemoryBatchStore
@@ -39,6 +51,7 @@ from .runs import (
 )
 
 _UNSET = object()
+_SQL_TOKEN_RE = re.compile(r"\w+", re.UNICODE)
 _POSTGRES_SINGLETON_UPSERT_SQL = {
     "transcript_decisions": """
         INSERT INTO transcript_decisions (job_id, decision_json, created_at, updated_at)
@@ -331,6 +344,26 @@ _POSTGRES_ASSET_SELECT_SQL = {
     "asset_id": "SELECT asset_json FROM asset_records WHERE asset_id = %s",
     "media_fingerprint": "SELECT asset_json FROM asset_records WHERE media_fingerprint = %s",
 }
+_POSTGRES_ASSET_CONTEXT_SELECT_SQL = (
+    "SELECT context_json FROM asset_context_records WHERE media_key = %s"
+)
+_POSTGRES_ASSET_CONTEXT_LIST_SQL = (
+    "SELECT context_json FROM asset_context_records ORDER BY media_key ASC"
+)
+_POSTGRES_ASSET_RELATION_LIST_SQL = """
+    SELECT relation_json
+    FROM asset_relations
+    WHERE src_media_key = %s OR dst_media_key = %s
+    ORDER BY relation_kind ASC, relation_id ASC
+"""
+_POSTGRES_MEMORY_ENTRY_SELECT_SQL = "SELECT entry_json FROM memory_entries WHERE memory_id = %s"
+_POSTGRES_MEMORY_ENTRY_LIST_SQL = "SELECT entry_json FROM memory_entries ORDER BY memory_id ASC"
+_POSTGRES_MEMORY_DEDUPE_SELECT_SQL = "SELECT memory_id FROM memory_entries WHERE dedupe_key = %s"
+_POSTGRES_MEMORY_ENTRY_INDEX_SELECT_SQL = """
+    SELECT memory_id, entry_json, dedupe_key, embedding_json
+    FROM memory_entries
+    ORDER BY updated_at ASC, memory_id ASC
+"""
 _POSTGRES_PROPOSAL_LIST_SQL = """
     SELECT proposal_json
     FROM prompt_evolution_proposals
@@ -351,6 +384,26 @@ _SQLITE_ASSET_SELECT_SQL = {
     "asset_id": "SELECT asset_json FROM asset_records WHERE asset_id = ?",
     "media_fingerprint": "SELECT asset_json FROM asset_records WHERE media_fingerprint = ?",
 }
+_SQLITE_ASSET_CONTEXT_SELECT_SQL = (
+    "SELECT context_json FROM asset_context_records WHERE media_key = ?"
+)
+_SQLITE_ASSET_CONTEXT_LIST_SQL = (
+    "SELECT context_json FROM asset_context_records ORDER BY media_key ASC"
+)
+_SQLITE_ASSET_RELATION_LIST_SQL = """
+    SELECT relation_json
+    FROM asset_relations
+    WHERE src_media_key = ? OR dst_media_key = ?
+    ORDER BY relation_kind ASC, relation_id ASC
+"""
+_SQLITE_MEMORY_ENTRY_SELECT_SQL = "SELECT entry_json FROM memory_entries WHERE memory_id = ?"
+_SQLITE_MEMORY_ENTRY_LIST_SQL = "SELECT entry_json FROM memory_entries ORDER BY memory_id ASC"
+_SQLITE_MEMORY_DEDUPE_SELECT_SQL = "SELECT memory_id FROM memory_entries WHERE dedupe_key = ?"
+_SQLITE_MEMORY_ENTRY_INDEX_SELECT_SQL = """
+    SELECT memory_id, entry_json, dedupe_key, embedding_json
+    FROM memory_entries
+    ORDER BY updated_at ASC, memory_id ASC
+"""
 _SQLITE_PROPOSAL_LIST_SQL = """
     SELECT proposal_json
     FROM prompt_evolution_proposals
@@ -442,6 +495,33 @@ class OperationalStore(DecisionStore, MemoryBatchStore, Protocol):
     def get_asset(self, media_key: str) -> AssetRecord | None: ...
 
     def save_asset_record(self, asset: AssetRecord) -> AssetRecord: ...
+
+    def get_asset_context(self, media_key: str) -> AssetContext | None: ...
+
+    def list_asset_contexts(self) -> list[AssetContext]: ...
+
+    def save_asset_context(self, asset_context: AssetContext) -> AssetContext: ...
+
+    def save_asset_relation(self, relation: AssetRelation) -> AssetRelation: ...
+
+    def list_asset_relations(self, media_key: str) -> list[AssetRelation]: ...
+
+    def put_memory_entry(self, entry: MemoryEntry, *, dedupe_key: str | None = None) -> bool: ...
+
+    def get_memory_entry(self, memory_id: str) -> MemoryEntry | None: ...
+
+    def list_memory_entries(self) -> list[MemoryEntry]: ...
+
+    def search_memory_entries(
+        self,
+        query: MemoryQuery,
+        *,
+        limit: int,
+    ) -> list[tuple[MemoryEntry, float]]: ...
+
+    def backfill_memory_embeddings(self, *, limit: int | None = None) -> int: ...
+
+    def save_memory_evidence_event(self, event: MemoryEvidenceEvent) -> MemoryEvidenceEvent: ...
 
     def upsert_historical_run_link(self, link: HistoricalRunLink) -> None: ...
 
@@ -975,6 +1055,382 @@ class PostgresOperationalStore(PostgresRunStore):
 
     def save_asset_record(self, asset: AssetRecord) -> AssetRecord:
         return _PostgresAssetResolver(self._conn).save(asset)
+
+    def get_asset_context(self, media_key: str) -> AssetContext | None:
+        row = self._conn.execute(_POSTGRES_ASSET_CONTEXT_SELECT_SQL, (media_key,)).fetchone()
+        if row is None:
+            return None
+        return AssetContext.model_validate(_decode_db_json(row["context_json"]))
+
+    def list_asset_contexts(self) -> list[AssetContext]:
+        rows = self._conn.execute(_POSTGRES_ASSET_CONTEXT_LIST_SQL).fetchall()
+        return [AssetContext.model_validate(_decode_db_json(row["context_json"])) for row in rows]
+
+    def save_asset_context(self, asset_context: AssetContext) -> AssetContext:
+        now = _utc_now()
+        payload = asset_context.model_copy(update={"updated_at": datetime.now(UTC)}).model_dump(
+            mode="json"
+        )
+        with self._conn.transaction():
+            self._conn.execute(
+                """
+                INSERT INTO asset_context_records (
+                    media_key,
+                    context_json,
+                    canonical_title,
+                    series_id,
+                    franchise_id,
+                    channel_id,
+                    content_type,
+                    style_profile_id,
+                    metadata_confidence,
+                    created_at,
+                    updated_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (media_key) DO UPDATE SET
+                    context_json = EXCLUDED.context_json,
+                    canonical_title = EXCLUDED.canonical_title,
+                    series_id = EXCLUDED.series_id,
+                    franchise_id = EXCLUDED.franchise_id,
+                    channel_id = EXCLUDED.channel_id,
+                    content_type = EXCLUDED.content_type,
+                    style_profile_id = EXCLUDED.style_profile_id,
+                    metadata_confidence = EXCLUDED.metadata_confidence,
+                    updated_at = EXCLUDED.updated_at
+                """,
+                (
+                    asset_context.media_key,
+                    _encode_json(payload),
+                    asset_context.canonical_title,
+                    asset_context.series_id,
+                    asset_context.franchise_id,
+                    asset_context.channel_id,
+                    asset_context.content_type,
+                    asset_context.style_profile_id,
+                    asset_context.metadata_confidence,
+                    now,
+                    now,
+                ),
+            )
+        saved = self.get_asset_context(asset_context.media_key)
+        if saved is None:
+            raise RuntimeError(f"asset context {asset_context.media_key} was not persisted")
+        return saved
+
+    def save_asset_relation(self, relation: AssetRelation) -> AssetRelation:
+        now = _utc_now()
+        with self._conn.transaction():
+            self._conn.execute(
+                """
+                INSERT INTO asset_relations (
+                    relation_id,
+                    src_media_key,
+                    dst_media_key,
+                    relation_kind,
+                    confidence,
+                    relation_json,
+                    created_at,
+                    updated_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (relation_id) DO UPDATE SET
+                    src_media_key = EXCLUDED.src_media_key,
+                    dst_media_key = EXCLUDED.dst_media_key,
+                    relation_kind = EXCLUDED.relation_kind,
+                    confidence = EXCLUDED.confidence,
+                    relation_json = EXCLUDED.relation_json,
+                    updated_at = EXCLUDED.updated_at
+                """,
+                (
+                    relation.relation_id,
+                    relation.src_media_key,
+                    relation.dst_media_key,
+                    relation.relation_kind,
+                    relation.confidence,
+                    _encode_json(relation.model_dump(mode="json")),
+                    now,
+                    now,
+                ),
+            )
+        return relation
+
+    def list_asset_relations(self, media_key: str) -> list[AssetRelation]:
+        rows = self._conn.execute(
+            _POSTGRES_ASSET_RELATION_LIST_SQL,
+            (media_key, media_key),
+        ).fetchall()
+        return [AssetRelation.model_validate(_decode_db_json(row["relation_json"])) for row in rows]
+
+    def put_memory_entry(self, entry: MemoryEntry, *, dedupe_key: str | None = None) -> bool:
+        if dedupe_key is not None:
+            existing = self._conn.execute(
+                _POSTGRES_MEMORY_DEDUPE_SELECT_SQL,
+                (dedupe_key,),
+            ).fetchone()
+            if existing is not None:
+                return False
+        embedding_model_id, embedding, search_document = embedding_metadata_for_entry(entry)
+        with self._conn.transaction():
+            self._conn.execute(
+                """
+                INSERT INTO memory_entries (
+                    memory_id,
+                    entry_json,
+                    dedupe_key,
+                    scope_kind,
+                    scope_key,
+                    series_id,
+                    franchise_id,
+                    content_type,
+                    style_profile_id,
+                    promotion_status,
+                    lifecycle_status,
+                    validation_status,
+                    typed_metadata,
+                    search_document,
+                    embedding_model_id,
+                    embedding_json,
+                    embedding_updated_at,
+                    created_at,
+                    updated_at
+                ) VALUES (
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    to_tsvector('simple', %s),
+                    %s,
+                    %s::jsonb,
+                    %s,
+                    %s,
+                    %s
+                )
+                ON CONFLICT (memory_id) DO UPDATE SET
+                    entry_json = EXCLUDED.entry_json,
+                    dedupe_key = EXCLUDED.dedupe_key,
+                    scope_kind = EXCLUDED.scope_kind,
+                    scope_key = EXCLUDED.scope_key,
+                    series_id = EXCLUDED.series_id,
+                    franchise_id = EXCLUDED.franchise_id,
+                    content_type = EXCLUDED.content_type,
+                    style_profile_id = EXCLUDED.style_profile_id,
+                    promotion_status = EXCLUDED.promotion_status,
+                    lifecycle_status = EXCLUDED.lifecycle_status,
+                    validation_status = EXCLUDED.validation_status,
+                    typed_metadata = EXCLUDED.typed_metadata,
+                    search_document = EXCLUDED.search_document,
+                    embedding_model_id = EXCLUDED.embedding_model_id,
+                    embedding_json = EXCLUDED.embedding_json,
+                    embedding_updated_at = EXCLUDED.embedding_updated_at,
+                    updated_at = EXCLUDED.updated_at
+                """,
+                (
+                    entry.memory_id,
+                    _encode_json(entry.model_dump(mode="json")),
+                    dedupe_key,
+                    entry.scope_kind,
+                    entry.scope_key,
+                    entry.series_id,
+                    entry.franchise_id,
+                    entry.content_type,
+                    entry.style_profile_id,
+                    entry.promotion_status,
+                    entry.lifecycle_status,
+                    entry.validation_status,
+                    _encode_json(
+                        {
+                            **entry.typed_metadata,
+                            "embedding": embedding,
+                            "embedding_model_id": embedding_model_id,
+                        }
+                    ),
+                    search_document,
+                    embedding_model_id,
+                    serialize_embedding(embedding),
+                    _isoformat_timestamp(entry.updated_at or datetime.now(UTC)),
+                    _isoformat_timestamp(entry.updated_at or datetime.now(UTC)),
+                    _isoformat_timestamp(entry.updated_at or datetime.now(UTC)),
+                ),
+            )
+        return True
+
+    def get_memory_entry(self, memory_id: str) -> MemoryEntry | None:
+        row = self._conn.execute(_POSTGRES_MEMORY_ENTRY_SELECT_SQL, (memory_id,)).fetchone()
+        if row is None:
+            return None
+        return MemoryEntry.model_validate(_decode_db_json(row["entry_json"]))
+
+    def list_memory_entries(self) -> list[MemoryEntry]:
+        rows = self._conn.execute(_POSTGRES_MEMORY_ENTRY_LIST_SQL).fetchall()
+        return [MemoryEntry.model_validate(_decode_db_json(row["entry_json"])) for row in rows]
+
+    def search_memory_entries(
+        self,
+        query: MemoryQuery,
+        *,
+        limit: int,
+    ) -> list[tuple[MemoryEntry, float]]:
+        search_document = _sql_search_document(query)
+        channel_id = query.asset_context.channel_id if query.asset_context is not None else None
+        channel_filter = json.dumps({"channel_id": channel_id}) if channel_id is not None else None
+        params: list[object] = [
+            _memory_scope_payload(query),
+            search_document,
+            search_document,
+            query.series_id,
+            query.series_id,
+            query.franchise_id,
+            query.franchise_id,
+            query.content_type,
+            query.content_type,
+            query.style_profile_id,
+            query.style_profile_id,
+            channel_filter,
+            channel_filter,
+            max(limit, 1),
+        ]
+        sql = """
+            WITH candidate_scopes AS (
+                SELECT scope_kind, scope_key
+                FROM jsonb_to_recordset(%s::jsonb) AS scope(scope_kind text, scope_key text)
+            )
+            SELECT
+                entry_json,
+                embedding_json,
+                LEAST(
+                    1.0,
+                    COALESCE(ts_rank_cd(search_document, websearch_to_tsquery('simple', %s)), 0.0)
+                    + GREATEST(similarity(COALESCE(entry_json->>'content', ''), %s), 0.0) * 0.45
+                    + CASE WHEN %s::text IS NOT NULL AND series_id = %s::text THEN 0.15 ELSE 0 END
+                    + CASE
+                        WHEN %s::text IS NOT NULL AND franchise_id = %s::text THEN 0.12
+                        ELSE 0
+                    END
+                    + CASE
+                        WHEN %s::text IS NOT NULL AND content_type = %s::text THEN 0.08
+                        ELSE 0
+                    END
+                    + CASE
+                        WHEN %s::text IS NOT NULL AND style_profile_id = %s::text THEN 0.08
+                        ELSE 0
+                    END
+                    + CASE
+                        WHEN %s::jsonb IS NOT NULL AND typed_metadata @> %s::jsonb THEN 0.08
+                        ELSE 0
+                    END
+                ) AS recall_score
+            FROM memory_entries
+            WHERE lifecycle_status = 'active'
+              AND EXISTS (
+                    SELECT 1
+                    FROM candidate_scopes
+                    WHERE candidate_scopes.scope_kind = memory_entries.scope_kind
+                      AND candidate_scopes.scope_key = memory_entries.scope_key
+              )
+            ORDER BY recall_score DESC, updated_at DESC, memory_id ASC
+            LIMIT %s
+        """
+        rows = self._conn.execute(sql, tuple(params)).fetchall()
+        return [
+            (
+                _entry_with_runtime_embedding(
+                    MemoryEntry.model_validate(_decode_db_json(row["entry_json"])),
+                    row["embedding_json"],
+                ),
+                float(row["recall_score"] or 0.0),
+            )
+            for row in rows
+        ]
+
+    def backfill_memory_embeddings(self, *, limit: int | None = None) -> int:
+        rows = self._conn.execute(_POSTGRES_MEMORY_ENTRY_INDEX_SELECT_SQL).fetchall()
+        updated = 0
+        for row in rows[:limit] if limit is not None else rows:
+            entry = MemoryEntry.model_validate(_decode_db_json(row["entry_json"]))
+            embedding_model_id, embedding, search_document = embedding_metadata_for_entry(entry)
+            with self._conn.transaction():
+                self._conn.execute(
+                    """
+                    UPDATE memory_entries
+                    SET typed_metadata = %s,
+                        search_document = to_tsvector('simple', %s),
+                        embedding_model_id = %s,
+                        embedding_json = %s::jsonb,
+                        embedding_updated_at = %s,
+                        updated_at = %s
+                    WHERE memory_id = %s
+                    """,
+                    (
+                        _encode_json(
+                            {
+                                **entry.typed_metadata,
+                                "embedding": embedding,
+                                "embedding_model_id": embedding_model_id,
+                            }
+                        ),
+                        search_document,
+                        embedding_model_id,
+                        serialize_embedding(embedding),
+                        _isoformat_timestamp(entry.updated_at or datetime.now(UTC)),
+                        _isoformat_timestamp(entry.updated_at or datetime.now(UTC)),
+                        entry.memory_id,
+                    ),
+                )
+            updated += 1
+        return updated
+
+    def save_memory_evidence_event(self, event: MemoryEvidenceEvent) -> MemoryEvidenceEvent:
+        now = _utc_now()
+        with self._conn.transaction():
+            self._conn.execute(
+                """
+                INSERT INTO memory_evidence_events (
+                    event_id,
+                    memory_id,
+                    event_kind,
+                    run_id,
+                    job_id,
+                    media_key,
+                    stage,
+                    source_ref,
+                    event_json,
+                    created_at,
+                    updated_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (event_id) DO UPDATE SET
+                    memory_id = EXCLUDED.memory_id,
+                    event_kind = EXCLUDED.event_kind,
+                    run_id = EXCLUDED.run_id,
+                    job_id = EXCLUDED.job_id,
+                    media_key = EXCLUDED.media_key,
+                    stage = EXCLUDED.stage,
+                    source_ref = EXCLUDED.source_ref,
+                    event_json = EXCLUDED.event_json,
+                    updated_at = EXCLUDED.updated_at
+                """,
+                (
+                    event.event_id,
+                    event.memory_id,
+                    event.event_kind,
+                    event.run_id,
+                    event.job_id,
+                    event.media_key,
+                    event.stage,
+                    event.source_ref,
+                    _encode_json(event.model_dump(mode="json")),
+                    now,
+                    now,
+                ),
+            )
+        return event
 
     def upsert_historical_run_link(self, link: HistoricalRunLink) -> None:
         now = _utc_now()
@@ -1548,6 +2004,359 @@ class SQLiteOperationalStore(AbstractContextManager["SQLiteOperationalStore"]):
     def save_asset_record(self, asset: AssetRecord) -> AssetRecord:
         return _SQLiteAssetResolver(self._conn).save(asset)
 
+    def get_asset_context(self, media_key: str) -> AssetContext | None:
+        row = self._conn.execute(_SQLITE_ASSET_CONTEXT_SELECT_SQL, (media_key,)).fetchone()
+        if row is None:
+            return None
+        return AssetContext.model_validate(_decode_sqlite_json(row["context_json"]))
+
+    def list_asset_contexts(self) -> list[AssetContext]:
+        rows = self._conn.execute(_SQLITE_ASSET_CONTEXT_LIST_SQL).fetchall()
+        return [
+            AssetContext.model_validate(_decode_sqlite_json(row["context_json"])) for row in rows
+        ]
+
+    def save_asset_context(self, asset_context: AssetContext) -> AssetContext:
+        now = _utc_now()
+        payload = asset_context.model_copy(update={"updated_at": datetime.now(UTC)}).model_dump(
+            mode="json"
+        )
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO asset_context_records (
+                    media_key,
+                    context_json,
+                    canonical_title,
+                    series_id,
+                    franchise_id,
+                    channel_id,
+                    content_type,
+                    style_profile_id,
+                    metadata_confidence,
+                    created_at,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(media_key) DO UPDATE SET
+                    context_json = excluded.context_json,
+                    canonical_title = excluded.canonical_title,
+                    series_id = excluded.series_id,
+                    franchise_id = excluded.franchise_id,
+                    channel_id = excluded.channel_id,
+                    content_type = excluded.content_type,
+                    style_profile_id = excluded.style_profile_id,
+                    metadata_confidence = excluded.metadata_confidence,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    asset_context.media_key,
+                    _encode_sqlite_json(payload),
+                    asset_context.canonical_title,
+                    asset_context.series_id,
+                    asset_context.franchise_id,
+                    asset_context.channel_id,
+                    asset_context.content_type,
+                    asset_context.style_profile_id,
+                    asset_context.metadata_confidence,
+                    now,
+                    now,
+                ),
+            )
+        saved = self.get_asset_context(asset_context.media_key)
+        if saved is None:
+            raise RuntimeError(f"asset context {asset_context.media_key} was not persisted")
+        return saved
+
+    def save_asset_relation(self, relation: AssetRelation) -> AssetRelation:
+        now = _utc_now()
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO asset_relations (
+                    relation_id,
+                    src_media_key,
+                    dst_media_key,
+                    relation_kind,
+                    confidence,
+                    relation_json,
+                    created_at,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(relation_id) DO UPDATE SET
+                    src_media_key = excluded.src_media_key,
+                    dst_media_key = excluded.dst_media_key,
+                    relation_kind = excluded.relation_kind,
+                    confidence = excluded.confidence,
+                    relation_json = excluded.relation_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    relation.relation_id,
+                    relation.src_media_key,
+                    relation.dst_media_key,
+                    relation.relation_kind,
+                    relation.confidence,
+                    _encode_sqlite_json(relation.model_dump(mode="json")),
+                    now,
+                    now,
+                ),
+            )
+        return relation
+
+    def list_asset_relations(self, media_key: str) -> list[AssetRelation]:
+        rows = self._conn.execute(
+            _SQLITE_ASSET_RELATION_LIST_SQL,
+            (media_key, media_key),
+        ).fetchall()
+        return [
+            AssetRelation.model_validate(_decode_sqlite_json(row["relation_json"])) for row in rows
+        ]
+
+    def put_memory_entry(self, entry: MemoryEntry, *, dedupe_key: str | None = None) -> bool:
+        if dedupe_key is not None:
+            existing = self._conn.execute(
+                _SQLITE_MEMORY_DEDUPE_SELECT_SQL,
+                (dedupe_key,),
+            ).fetchone()
+            if existing is not None:
+                return False
+        embedding_model_id, embedding, search_document = embedding_metadata_for_entry(entry)
+        now = _isoformat_timestamp(entry.updated_at or datetime.now(UTC))
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO memory_entries (
+                    memory_id,
+                    entry_json,
+                    dedupe_key,
+                    scope_kind,
+                    scope_key,
+                    series_id,
+                    franchise_id,
+                    content_type,
+                    style_profile_id,
+                    promotion_status,
+                    lifecycle_status,
+                    validation_status,
+                    typed_metadata,
+                    search_document,
+                    embedding_model_id,
+                    embedding_json,
+                    embedding_updated_at,
+                    created_at,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(memory_id) DO UPDATE SET
+                    entry_json = excluded.entry_json,
+                    dedupe_key = excluded.dedupe_key,
+                    scope_kind = excluded.scope_kind,
+                    scope_key = excluded.scope_key,
+                    series_id = excluded.series_id,
+                    franchise_id = excluded.franchise_id,
+                    content_type = excluded.content_type,
+                    style_profile_id = excluded.style_profile_id,
+                    promotion_status = excluded.promotion_status,
+                    lifecycle_status = excluded.lifecycle_status,
+                    validation_status = excluded.validation_status,
+                    typed_metadata = excluded.typed_metadata,
+                    search_document = excluded.search_document,
+                    embedding_model_id = excluded.embedding_model_id,
+                    embedding_json = excluded.embedding_json,
+                    embedding_updated_at = excluded.embedding_updated_at,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    entry.memory_id,
+                    _encode_sqlite_json(entry.model_dump(mode="json")),
+                    dedupe_key,
+                    entry.scope_kind,
+                    entry.scope_key,
+                    entry.series_id,
+                    entry.franchise_id,
+                    entry.content_type,
+                    entry.style_profile_id,
+                    entry.promotion_status,
+                    entry.lifecycle_status,
+                    entry.validation_status,
+                    _encode_sqlite_json(
+                        {
+                            **entry.typed_metadata,
+                            "embedding": embedding,
+                            "embedding_model_id": embedding_model_id,
+                        }
+                    ),
+                    search_document,
+                    embedding_model_id,
+                    serialize_embedding(embedding),
+                    now,
+                    now,
+                    now,
+                ),
+            )
+        return True
+
+    def get_memory_entry(self, memory_id: str) -> MemoryEntry | None:
+        row = self._conn.execute(_SQLITE_MEMORY_ENTRY_SELECT_SQL, (memory_id,)).fetchone()
+        if row is None:
+            return None
+        return MemoryEntry.model_validate(_decode_sqlite_json(row["entry_json"]))
+
+    def list_memory_entries(self) -> list[MemoryEntry]:
+        rows = self._conn.execute(_SQLITE_MEMORY_ENTRY_LIST_SQL).fetchall()
+        return [MemoryEntry.model_validate(_decode_sqlite_json(row["entry_json"])) for row in rows]
+
+    def search_memory_entries(
+        self,
+        query: MemoryQuery,
+        *,
+        limit: int,
+    ) -> list[tuple[MemoryEntry, float]]:
+        search_document = _sql_search_document(query)
+        channel_id = query.asset_context.channel_id if query.asset_context is not None else None
+        params: list[object] = [
+            _memory_scope_payload(query),
+            f"%{search_document}%",
+            query.series_id,
+            query.series_id,
+            query.franchise_id,
+            query.franchise_id,
+            query.content_type,
+            query.content_type,
+            query.style_profile_id,
+            query.style_profile_id,
+            channel_id,
+            channel_id,
+            max(limit, 1),
+        ]
+        sql = """
+            WITH candidate_scopes(scope_kind, scope_key) AS (
+                SELECT
+                    json_extract(value, '$.scope_kind'),
+                    json_extract(value, '$.scope_key')
+                FROM json_each(?)
+            )
+            SELECT
+                entry_json,
+                embedding_json,
+                MIN(
+                    1.0,
+                    CASE WHEN search_document LIKE ? THEN 0.55 ELSE 0 END
+                    + CASE WHEN ? IS NOT NULL AND series_id = ? THEN 0.15 ELSE 0 END
+                    + CASE WHEN ? IS NOT NULL AND franchise_id = ? THEN 0.12 ELSE 0 END
+                    + CASE WHEN ? IS NOT NULL AND content_type = ? THEN 0.08 ELSE 0 END
+                    + CASE WHEN ? IS NOT NULL AND style_profile_id = ? THEN 0.08 ELSE 0 END
+                    + CASE
+                        WHEN ? IS NOT NULL AND instr(COALESCE(typed_metadata, ''), ?) > 0
+                        THEN 0.08
+                        ELSE 0
+                    END
+                ) AS recall_score
+            FROM memory_entries
+            WHERE lifecycle_status = 'active'
+              AND EXISTS (
+                    SELECT 1
+                    FROM candidate_scopes
+                    WHERE candidate_scopes.scope_kind = memory_entries.scope_kind
+                      AND candidate_scopes.scope_key = memory_entries.scope_key
+              )
+            ORDER BY recall_score DESC, updated_at DESC, memory_id ASC
+            LIMIT ?
+        """
+        rows = self._conn.execute(sql, tuple(params)).fetchall()
+        return [
+            (
+                _entry_with_runtime_embedding(
+                    MemoryEntry.model_validate(_decode_sqlite_json(row["entry_json"])),
+                    row["embedding_json"],
+                ),
+                float(row["recall_score"] or 0.0),
+            )
+            for row in rows
+        ]
+
+    def backfill_memory_embeddings(self, *, limit: int | None = None) -> int:
+        rows = self._conn.execute(_SQLITE_MEMORY_ENTRY_INDEX_SELECT_SQL).fetchall()
+        updated = 0
+        for row in rows[:limit] if limit is not None else rows:
+            entry = MemoryEntry.model_validate(_decode_sqlite_json(row["entry_json"]))
+            embedding_model_id, embedding, search_document = embedding_metadata_for_entry(entry)
+            timestamp = _isoformat_timestamp(entry.updated_at or datetime.now(UTC))
+            with self._conn:
+                self._conn.execute(
+                    """
+                    UPDATE memory_entries
+                    SET typed_metadata = ?,
+                        search_document = ?,
+                        embedding_model_id = ?,
+                        embedding_json = ?,
+                        embedding_updated_at = ?,
+                        updated_at = ?
+                    WHERE memory_id = ?
+                    """,
+                    (
+                        _encode_sqlite_json(
+                            {
+                                **entry.typed_metadata,
+                                "embedding": embedding,
+                                "embedding_model_id": embedding_model_id,
+                            }
+                        ),
+                        search_document,
+                        embedding_model_id,
+                        serialize_embedding(embedding),
+                        timestamp,
+                        timestamp,
+                        entry.memory_id,
+                    ),
+                )
+            updated += 1
+        return updated
+
+    def save_memory_evidence_event(self, event: MemoryEvidenceEvent) -> MemoryEvidenceEvent:
+        now = _utc_now()
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO memory_evidence_events (
+                    event_id,
+                    memory_id,
+                    event_kind,
+                    run_id,
+                    job_id,
+                    media_key,
+                    stage,
+                    source_ref,
+                    event_json,
+                    created_at,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(event_id) DO UPDATE SET
+                    memory_id = excluded.memory_id,
+                    event_kind = excluded.event_kind,
+                    run_id = excluded.run_id,
+                    job_id = excluded.job_id,
+                    media_key = excluded.media_key,
+                    stage = excluded.stage,
+                    source_ref = excluded.source_ref,
+                    event_json = excluded.event_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    event.event_id,
+                    event.memory_id,
+                    event.event_kind,
+                    event.run_id,
+                    event.job_id,
+                    event.media_key,
+                    event.stage,
+                    event.source_ref,
+                    _encode_sqlite_json(event.model_dump(mode="json")),
+                    now,
+                    now,
+                ),
+            )
+        return event
+
     def upsert_historical_run_link(self, link: HistoricalRunLink) -> None:
         now = _utc_now()
         existing_row = self._conn.execute(
@@ -1921,6 +2730,97 @@ class SQLiteOperationalStore(AbstractContextManager["SQLiteOperationalStore"]):
             CREATE INDEX IF NOT EXISTS idx_asset_records_media_fingerprint
             ON asset_records(media_fingerprint);
 
+            CREATE TABLE IF NOT EXISTS asset_context_records (
+                media_key TEXT PRIMARY KEY REFERENCES asset_records(media_key) ON DELETE CASCADE,
+                context_json TEXT NOT NULL,
+                canonical_title TEXT,
+                series_id TEXT,
+                franchise_id TEXT,
+                channel_id TEXT,
+                content_type TEXT,
+                style_profile_id TEXT,
+                metadata_confidence TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_asset_context_records_series
+            ON asset_context_records(series_id);
+
+            CREATE INDEX IF NOT EXISTS idx_asset_context_records_franchise
+            ON asset_context_records(franchise_id);
+
+            CREATE TABLE IF NOT EXISTS asset_relations (
+                relation_id TEXT PRIMARY KEY,
+                src_media_key TEXT NOT NULL REFERENCES asset_records(media_key) ON DELETE CASCADE,
+                dst_media_key TEXT NOT NULL REFERENCES asset_records(media_key) ON DELETE CASCADE,
+                relation_kind TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                relation_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_asset_relations_src_kind
+            ON asset_relations(src_media_key, relation_kind);
+
+            CREATE INDEX IF NOT EXISTS idx_asset_relations_dst_kind
+            ON asset_relations(dst_media_key, relation_kind);
+
+            CREATE TABLE IF NOT EXISTS memory_entries (
+                memory_id TEXT PRIMARY KEY,
+                entry_json TEXT NOT NULL,
+                dedupe_key TEXT UNIQUE,
+                scope_kind TEXT,
+                scope_key TEXT,
+                series_id TEXT,
+                franchise_id TEXT,
+                content_type TEXT,
+                style_profile_id TEXT,
+                promotion_status TEXT NOT NULL,
+                lifecycle_status TEXT NOT NULL,
+                validation_status TEXT NOT NULL,
+                typed_metadata TEXT NOT NULL DEFAULT '{}',
+                search_document TEXT NOT NULL DEFAULT '',
+                embedding_model_id TEXT,
+                embedding_json TEXT NOT NULL DEFAULT '[]',
+                embedding_updated_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_memory_entries_scope
+            ON memory_entries(scope_kind, scope_key);
+
+            CREATE INDEX IF NOT EXISTS idx_memory_entries_series
+            ON memory_entries(series_id);
+
+            CREATE INDEX IF NOT EXISTS idx_memory_entries_franchise
+            ON memory_entries(franchise_id);
+
+            CREATE INDEX IF NOT EXISTS idx_memory_entries_content_type
+            ON memory_entries(content_type);
+
+            CREATE INDEX IF NOT EXISTS idx_memory_entries_style_profile
+            ON memory_entries(style_profile_id);
+
+            CREATE TABLE IF NOT EXISTS memory_evidence_events (
+                event_id TEXT PRIMARY KEY,
+                memory_id TEXT NOT NULL REFERENCES memory_entries(memory_id) ON DELETE CASCADE,
+                event_kind TEXT NOT NULL,
+                run_id TEXT,
+                job_id TEXT,
+                media_key TEXT,
+                stage TEXT,
+                source_ref TEXT,
+                event_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_memory_evidence_events_memory_id
+            ON memory_evidence_events(memory_id, created_at);
+
             CREATE TABLE IF NOT EXISTS historical_run_links (
                 run_id TEXT PRIMARY KEY,
                 media_key TEXT NOT NULL REFERENCES asset_records(media_key) ON DELETE CASCADE,
@@ -2232,6 +3132,62 @@ class _SQLiteAssetResolver:
         if row is None:
             return None
         return AssetRecord.model_validate(_decode_sqlite_json(row["asset_json"]))
+
+
+def _sql_search_document(query: MemoryQuery) -> str:
+    query_embedding_document = embedding_metadata_for_query(query)[1]
+    tokens = [match.group(0) for match in _SQL_TOKEN_RE.finditer(query_embedding_document)]
+    if not tokens:
+        return "memory"
+    return " ".join(tokens[:24])
+
+
+def _memory_scope_payload(query: MemoryQuery) -> str:
+    return json.dumps(
+        [
+            {"scope_kind": scope_kind, "scope_key": scope_key}
+            for scope_kind, scope_key in _memory_scope_pairs(query)
+        ]
+    )
+
+
+def _memory_scope_pairs(query: MemoryQuery) -> list[tuple[str, str]]:
+    scopes: list[tuple[str, str]] = []
+    if query.media_key is not None:
+        scopes.append(("asset", query.media_key))
+    if query.series_id is not None:
+        scopes.append(("series", query.series_id))
+    for speaker_id in dict.fromkeys(query.speaker_ids):
+        scopes.append(("speaker_cluster", speaker_id))
+    if query.franchise_id is not None:
+        scopes.append(("franchise", query.franchise_id))
+    if query.asset_context is not None and query.asset_context.channel_id is not None:
+        scopes.append(("channel", query.asset_context.channel_id))
+    scopes.extend(
+        [
+            (
+                "project_pair",
+                f"{query.job.tenant_id}::{query.job.project_id}::{query.job.source_language}::{query.job.target_language}",
+            ),
+            ("pair", f"{query.job.source_language}::{query.job.target_language}"),
+            ("source_language", query.job.source_language),
+            ("target_language", query.job.target_language),
+            ("global", "global"),
+        ]
+    )
+    return scopes
+
+
+def _entry_with_runtime_embedding(entry: MemoryEntry, embedding_payload: object) -> MemoryEntry:
+    return entry.model_copy(
+        update={
+            "typed_metadata": {
+                **entry.typed_metadata,
+                "embedding": embedding_payload,
+                "embedding_model_id": EMBEDDING_MODEL_ID,
+            }
+        }
+    )
 
 
 def _resolve_asset_record(

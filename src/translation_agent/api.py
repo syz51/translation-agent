@@ -9,7 +9,12 @@ from pathlib import Path
 from typing import Any, Literal
 from uuid import uuid4
 
-from translation_agent.config import Settings, load_settings, validate_environment
+from translation_agent.config import (
+    Settings,
+    load_settings,
+    sanitize_db_target,
+    validate_environment,
+)
 from translation_agent.errors import exception_error_payload
 from translation_agent.graph import (
     GraphState,
@@ -22,6 +27,8 @@ from translation_agent.graph import (
 )
 from translation_agent.media_identity import compute_media_fingerprint
 from translation_agent.models import (
+    AssetContext,
+    AssetContextInput,
     AudioArtifact,
     FinalTranscriptDecision,
     HistoricalRunLink,
@@ -84,6 +91,7 @@ class RunJobRequest:
     requested_by: str = "system@local"
     profile_ref: str | None = "profiles/default"
     asset_id: str | None = None
+    asset_context: AssetContextInput | None = None
     reference_transcript_source: str | None = None
     reference_transcript_format: Literal["srt"] | None = None
     reference_mode: Literal["none", "evaluate_and_regenerate"] = "none"
@@ -125,6 +133,13 @@ class ConvertTranslationJsonToSrtResult:
     candidate_id: str
     language: str
     subtitle_count: int
+
+
+@dataclass(slots=True)
+class MemoryEmbeddingBackfillResult:
+    updated_entries: int
+    state_backend: str
+    state_db_target: str
 
 
 @dataclass(slots=True)
@@ -203,6 +218,13 @@ def run_job(
             source_language=source_language,
             target_language=target_language,
         )
+        asset_context = _resolved_asset_context(
+            asset.media_key,
+            request.asset_context,
+            existing=run_store.get_asset_context(asset.media_key),
+        )
+        if asset_context is not None:
+            run_store.save_asset_context(asset_context)
         job = JobContext(
             job_id=job_id,
             tenant_id=request.tenant_id,
@@ -216,6 +238,7 @@ def run_job(
             asset_id=asset.asset_id,
             media_fingerprint=asset.media_fingerprint,
             media_key=asset.media_key,
+            asset_context=asset_context,
             reference_transcript_source=normalized_reference_source,
             reference_transcript_format=reference_transcript_format,
             reference_mode=request.reference_mode,
@@ -1176,6 +1199,29 @@ def convert_translation_json_to_srt(
     )
 
 
+def backfill_memory_embeddings(
+    *,
+    settings: Settings | None = None,
+    limit: int | None = None,
+) -> MemoryEmbeddingBackfillResult:
+    """Refresh deterministic memory embeddings and lexical search documents."""
+
+    settings = settings or load_settings()
+    validation = validate_environment(settings)
+    if not validation.ok:
+        message = validation.state_db_error or "invalid runtime configuration"
+        raise RuntimeError(message)
+    with _open_operational_store(settings) as run_store:
+        updated_entries = run_store.backfill_memory_embeddings(limit=limit)
+    return MemoryEmbeddingBackfillResult(
+        updated_entries=updated_entries,
+        state_backend="postgres" if settings.state_db_dsn else "sqlite",
+        state_db_target=sanitize_db_target(
+            settings.state_db_dsn if settings.state_db_dsn else settings.state_db_path
+        ),
+    )
+
+
 def _dict_payload(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
@@ -1212,6 +1258,10 @@ def _job_context_from_run(
         asset_id=_normalized_optional_identifier(input_data.get("asset_id")),
         media_fingerprint=_normalized_optional_identifier(input_data.get("media_fingerprint")),
         media_key=str(input_data.get("media_key") or f"source-ref:{run_record.run_id}"),
+        asset_context=_asset_context_from_payload(
+            input_data.get("media_key"),
+            request_payload.get("asset_context"),
+        ),
         reference_transcript_source=_normalized_optional_identifier(
             request_payload.get("reference_transcript_source")
         ),
@@ -1638,6 +1688,9 @@ def _serialize_request(
         "requested_by": request.requested_by,
         "profile_ref": request.profile_ref,
         "asset_id": request.asset_id,
+        "asset_context": request.asset_context.model_dump(mode="json")
+        if request.asset_context is not None
+        else None,
         "reference_transcript_source": request.reference_transcript_source,
         "reference_transcript_format": _resolved_reference_transcript_format(request),
         "reference_mode": request.reference_mode,
@@ -1713,6 +1766,43 @@ def _normalized_optional_identifier(value: str | None) -> str | None:
         return None
     normalized = value.strip()
     return normalized or None
+
+
+def _asset_context_from_payload(
+    media_key: object,
+    payload: object,
+) -> AssetContext | None:
+    if not isinstance(media_key, str) or not media_key:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return AssetContext.model_validate({"media_key": media_key, **payload})
+
+
+def _resolved_asset_context(
+    media_key: str,
+    request_asset_context: AssetContextInput | None,
+    *,
+    existing: AssetContext | None,
+) -> AssetContext | None:
+    if request_asset_context is None:
+        return existing
+    update = request_asset_context.model_dump(mode="python")
+    if existing is None:
+        return AssetContext(media_key=media_key, **update)
+    merged = existing.model_dump(mode="python")
+    for key, value in update.items():
+        if value is None:
+            continue
+        if isinstance(value, tuple):
+            merged[key] = tuple(dict.fromkeys((*merged.get(key, ()), *value)))
+            continue
+        if isinstance(value, dict):
+            merged[key] = {**merged.get(key, {}), **value}
+            continue
+        merged[key] = value
+    merged["updated_at"] = datetime.now(UTC)
+    return AssetContext.model_validate(merged)
 
 
 def _default_output_path(blob_root: Path, state: GraphState) -> Path | None:

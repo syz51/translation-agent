@@ -38,10 +38,12 @@ from translation_agent.memory import (
     MemoryConsolidationBackend,
     MemoryRecallBackend,
     MemoryStagingBackend,
+    OperationalStoreLongTermMemoryStore,
     PromptEvolutionBackend,
     PromptResolver,
     ProposalBackedPromptResolver,
 )
+from translation_agent.memory.recall import MemoryEntryStore
 from translation_agent.models import (
     AudioArtifact,
     FinalTranscriptDecision,
@@ -467,7 +469,7 @@ def build_phase_two_runtime(
 ) -> WorkflowRuntime:
     """Construct the default dry-run runtime used by the public entrypoints."""
 
-    memory_store = BlobBackedLongTermMemoryStore(blob_store)
+    memory_store = _memory_store_for_runtime(run_store=run_store, blob_store=blob_store)
     resolved_decision_store = decision_store or _decision_store_for_run_store(run_store)
     resolved_memory_batch_store = memory_batch_store or _memory_batch_store_for_run_store(run_store)
     return WorkflowRuntime(
@@ -585,7 +587,7 @@ def build_phase_three_runtime(
         retry_policy=retry_policy,
     )
 
-    memory_store = BlobBackedLongTermMemoryStore(blob_store)
+    memory_store = _memory_store_for_runtime(run_store=run_store, blob_store=blob_store)
     resolved_decision_store = decision_store or _decision_store_for_run_store(run_store)
     resolved_memory_batch_store = memory_batch_store or _memory_batch_store_for_run_store(run_store)
     return WorkflowRuntime(
@@ -761,6 +763,13 @@ def _blob_root(blob_store: BlobStore) -> str | None:
     if root is None:
         return None
     return str(root)
+
+
+def _memory_store_for_runtime(*, run_store: RunStore, blob_store: BlobStore) -> MemoryEntryStore:
+    required_methods = ("put_memory_entry", "get_memory_entry", "list_memory_entries")
+    if all(hasattr(run_store, method) for method in required_methods):
+        return OperationalStoreLongTermMemoryStore(run_store)  # type: ignore[arg-type]
+    return BlobBackedLongTermMemoryStore(blob_store)
 
 
 def _decision_store_for_run_store(run_store: RunStore) -> DecisionStore:

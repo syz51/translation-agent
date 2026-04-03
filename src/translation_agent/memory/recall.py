@@ -9,7 +9,7 @@ import unicodedata
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from hashlib import sha256
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
 
 from translation_agent.models import (
     MemoryBundle,
@@ -18,11 +18,23 @@ from translation_agent.models import (
     MemoryScopeKind,
     ProviderCaveat,
 )
+from translation_agent.search_index import (
+    cosine_similarity,
+    deserialize_embedding,
+    embedding_metadata_for_query,
+)
 from translation_agent.storage import BlobStore
+
+if TYPE_CHECKING:
+    from translation_agent.storage.operational import OperationalStore
 
 _TOKEN_RE = re.compile(r"\w+", re.UNICODE)
 _SCOPE_ORDER: tuple[MemoryScopeKind, ...] = (
     "asset",
+    "series",
+    "speaker_cluster",
+    "franchise",
+    "channel",
     "project_pair",
     "pair",
     "source_language",
@@ -31,6 +43,10 @@ _SCOPE_ORDER: tuple[MemoryScopeKind, ...] = (
 )
 _SCOPE_WEIGHTS = {
     "asset": 1.0,
+    "series": 0.97,
+    "speaker_cluster": 0.95,
+    "franchise": 0.92,
+    "channel": 0.9,
     "project_pair": 0.9,
     "pair": 0.75,
     "source_language": 0.55,
@@ -161,6 +177,33 @@ class BlobBackedLongTermMemoryStore:
         )
 
 
+class OperationalStoreLongTermMemoryStore:
+    """Operational-store-backed long-term memory repository."""
+
+    def __init__(self, store: OperationalStore) -> None:
+        self._store = store
+
+    def put_entry(self, entry: MemoryEntry, *, dedupe_key: str | None = None) -> bool:
+        return self._store.put_memory_entry(entry, dedupe_key=dedupe_key)
+
+    def get_entry(self, memory_id: str) -> MemoryEntry | None:
+        return self._store.get_memory_entry(memory_id)
+
+    def list_entries(self) -> list[MemoryEntry]:
+        return self._store.list_memory_entries()
+
+    def search_memory_entries(
+        self,
+        query: MemoryQuery,
+        *,
+        limit: int,
+    ) -> list[tuple[MemoryEntry, float]]:
+        search = getattr(self._store, "search_memory_entries", None)
+        if callable(search):
+            return cast("list[tuple[MemoryEntry, float]]", search(query, limit=limit))
+        return [(entry, 0.0) for entry in self._store.list_memory_entries()]
+
+
 @runtime_checkable
 class MemoryEntryStore(Protocol):
     """Minimal persistence contract for long-term memory entries."""
@@ -170,6 +213,18 @@ class MemoryEntryStore(Protocol):
     def get_entry(self, memory_id: str) -> MemoryEntry | None: ...
 
     def list_entries(self) -> list[MemoryEntry]: ...
+
+
+@runtime_checkable
+class HybridMemoryEntryStore(MemoryEntryStore, Protocol):
+    """Optional SQL-backed prefilter contract."""
+
+    def search_memory_entries(
+        self,
+        query: MemoryQuery,
+        *,
+        limit: int,
+    ) -> list[tuple[MemoryEntry, float]]: ...
 
 
 @runtime_checkable
@@ -188,16 +243,33 @@ class LongTermMemoryRecallBackend:
     def recall_memory(self, query: MemoryQuery) -> MemoryBundle:
         caps = _caps_for_stage(query.stage)
         allowed_kinds = set(caps)
+        query_embedding, _ = embedding_metadata_for_query(query)
         buckets: dict[MemoryScopeKind, list[tuple[float, datetime, str, MemoryEntry]]] = {
             scope_kind: [] for scope_kind in _SCOPE_ORDER
         }
 
-        for entry in self._store.list_entries():
+        search_limit = max(query.max_items * 8, 32)
+        candidates = (
+            self._store.search_memory_entries(query, limit=search_limit)
+            if isinstance(self._store, HybridMemoryEntryStore)
+            else [(entry, 0.0) for entry in self._store.list_entries()]
+        )
+        for entry, store_score in candidates:
             if not _eligible(entry, query, allowed_kinds):
                 continue
             updated_at = entry.updated_at or datetime.fromtimestamp(0, tz=UTC)
             buckets[entry.scope_kind or "global"].append(
-                (_ranking_score(entry, query), updated_at, entry.memory_id, entry)
+                (
+                    _ranking_score(
+                        entry,
+                        query,
+                        store_score=store_score,
+                        query_embedding=query_embedding,
+                    ),
+                    updated_at,
+                    entry.memory_id,
+                    entry,
+                )
             )
 
         counts = {kind: 0 for kind in caps}
@@ -254,6 +326,15 @@ def _scope_compatible(entry: MemoryEntry, query: MemoryQuery) -> bool:
     scope_kind = entry.scope_kind
     if scope_kind == "asset":
         return query.media_key is not None and entry.scope_key == query.media_key
+    if scope_kind == "series":
+        return query.series_id is not None and entry.scope_key == query.series_id
+    if scope_kind == "speaker_cluster":
+        return bool(query.speaker_ids) and entry.scope_key in set(query.speaker_ids)
+    if scope_kind == "franchise":
+        return query.franchise_id is not None and entry.scope_key == query.franchise_id
+    if scope_kind == "channel":
+        channel_id = query.asset_context.channel_id if query.asset_context is not None else None
+        return channel_id is not None and entry.scope_key == channel_id
     if scope_kind == "project_pair":
         return entry.scope_key == project_pair_scope_key(query)
     if scope_kind == "pair":
@@ -308,21 +389,30 @@ def build_scope_key(
     return "global"
 
 
-def _ranking_score(entry: MemoryEntry, query: MemoryQuery) -> float:
+def _ranking_score(
+    entry: MemoryEntry,
+    query: MemoryQuery,
+    *,
+    store_score: float = 0.0,
+    query_embedding: list[float] | None = None,
+) -> float:
     scope_weight = _SCOPE_WEIGHTS.get(entry.scope_kind or "global", 0.0)
     subtype_weight = _SUBTYPE_WEIGHTS.get(entry.memory_subtype, 0.6)
     metadata_match = _metadata_match_score(entry, query)
     semantic_relevance = _semantic_relevance(query.query_text, entry.content)
     lexical_relevance = _lexical_relevance(query.query_text, entry.content)
+    embedding_relevance = _embedding_relevance(entry, query_embedding)
     evidence_score = _evidence_score(entry)
     quality_score = float(entry.score or 0.5)
     recency_score = _recency_score(entry)
     return round(
-        0.32 * scope_weight
-        + 0.13 * subtype_weight
-        + 0.18 * metadata_match
-        + 0.12 * semantic_relevance
+        0.24 * scope_weight
+        + 0.10 * subtype_weight
+        + 0.16 * metadata_match
+        + 0.10 * semantic_relevance
         + 0.05 * lexical_relevance
+        + 0.10 * embedding_relevance
+        + 0.10 * store_score
         + 0.10 * evidence_score
         + 0.05 * quality_score
         + 0.05 * recency_score,
@@ -431,9 +521,46 @@ def _metadata_match_score(entry: MemoryEntry, query: MemoryQuery) -> float:
     filters = 0
     matches = 0.0
     metadata = entry.metadata
+    query_asset_context = query.asset_context
     if query.media_key is not None:
         filters += 1
         if metadata.get("media_key") == query.media_key or entry.scope_key == query.media_key:
+            matches += 1.0
+    if query.series_id is not None:
+        filters += 1
+        if entry.series_id == query.series_id:
+            matches += 1.0
+    if query.franchise_id is not None:
+        filters += 1
+        if entry.franchise_id == query.franchise_id:
+            matches += 1.0
+    if query.speaker_ids:
+        filters += 1
+        if set(query.speaker_ids) & set(entry.speaker_ids):
+            matches += 1.0
+    if query.content_type is not None:
+        filters += 1
+        if entry.content_type == query.content_type:
+            matches += 1.0
+    if query.topic_tags:
+        filters += 1
+        if set(query.topic_tags) & set(entry.topic_tags):
+            matches += 1.0
+    if query.style_profile_id is not None:
+        filters += 1
+        if entry.style_profile_id == query.style_profile_id:
+            matches += 1.0
+    if query.entity_keys:
+        filters += 1
+        if set(query.entity_keys) & set(entry.entity_keys):
+            matches += 1.0
+    if query.term_keys:
+        filters += 1
+        if set(query.term_keys) & set(entry.term_keys):
+            matches += 1.0
+    if query_asset_context is not None and query_asset_context.channel_id is not None:
+        filters += 1
+        if entry.typed_metadata.get("channel_id") == query_asset_context.channel_id:
             matches += 1.0
     if query.provider_ids:
         filters += 1
@@ -493,6 +620,21 @@ def _metadata_match_score(entry: MemoryEntry, query: MemoryQuery) -> float:
         return 0.0
     exact_bonus = 0.15 if matches == filters else 0.0
     return round(min(1.0, matches / filters + exact_bonus), 6)
+
+
+def _embedding_relevance(
+    entry: MemoryEntry,
+    query_embedding: list[float] | None,
+) -> float:
+    if not query_embedding:
+        return 0.0
+    payload = entry.typed_metadata.get("embedding")
+    if payload is None:
+        return 0.0
+    embedding = deserialize_embedding(payload)
+    if not embedding:
+        return 0.0
+    return cosine_similarity(query_embedding, embedding)
 
 
 def _tokens(value: str) -> list[str]:

@@ -77,7 +77,8 @@ uv run translation-agent validate-config --json
 What `docker compose up --build` now does:
 
 - loads repo-root `.env`
-- starts Postgres 18 on port `55432`
+- builds and starts Postgres 18 with `pg_trgm` and `pgvector` available on port `55432`
+- stores Postgres 18 data in the version-compatible `/var/lib/postgresql` volume layout
 - runs `translation-agent migrate-db` automatically after Postgres is healthy
 - keeps an `app` container alive with the repo mounted, a Linux virtualenv cached in a named volume, and `validate-config` already checked
 

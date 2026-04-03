@@ -16,6 +16,7 @@ from translation_agent.api import (
     RunJobRequest,
     RunJobResult,
     approve_review,
+    backfill_memory_embeddings,
     convert_translation_json_to_srt,
     get_run_status,
     list_runs,
@@ -69,6 +70,13 @@ def build_parser() -> argparse.ArgumentParser:
     convert_parser.add_argument("source")
     convert_parser.add_argument("--output")
     convert_parser.add_argument("--json", action="store_true", dest="as_json")
+
+    embedding_parser = subparsers.add_parser(
+        "backfill-memory-embeddings",
+        help="Refresh deterministic memory embeddings and lexical recall documents",
+    )
+    embedding_parser.add_argument("--limit", type=int)
+    embedding_parser.add_argument("--json", action="store_true", dest="as_json")
 
     run_parser = subparsers.add_parser("run-job", help="Execute the local dry-run workflow")
     run_parser.add_argument("source")
@@ -254,6 +262,17 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print(result.output_path)
             print(f"subtitles: {result.subtitle_count}")
+        return 0
+
+    if args.command == "backfill-memory-embeddings":
+        settings = load_settings()
+        result = backfill_memory_embeddings(settings=settings, limit=args.limit)
+        payload = asdict(result)
+        if args.as_json:
+            print(json.dumps(payload))
+        else:
+            print(f"updated_entries: {result.updated_entries}")
+            print(f"{result.state_backend}: {result.state_db_target}")
         return 0
 
     if args.command == "run-job":
