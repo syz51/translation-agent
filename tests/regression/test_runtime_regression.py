@@ -285,6 +285,7 @@ def _real_settings(**overrides: Any) -> Settings:
         "assemblyai_api_key": "test-assemblyai-key",  # pragma: allowlist secret
         "speechmatics_api_key": "test-speechmatics-key",  # pragma: allowlist secret
         "deepgram_api_key": "test-deepgram-key",  # pragma: allowlist secret
+        "gemini_api_key": "test-gemini-key",  # pragma: allowlist secret
         "openai_api_key": "test-openai-key",  # pragma: allowlist secret
     }
     defaults.update(overrides)
@@ -299,6 +300,7 @@ def _configure_real_mode_env(
     assemblyai_api_key: str | None = None,
     speechmatics_api_key: str | None = None,
     deepgram_api_key: str | None = None,
+    gemini_api_key: str | None = None,
     openai_api_key: str | None = None,
 ) -> None:
     monkeypatch.setenv("TA_DATA_DIR", str(tmp_path / "runtime"))
@@ -314,6 +316,7 @@ def _configure_real_mode_env(
         ("TA_ASSEMBLYAI_API_KEY", assemblyai_api_key),
         ("TA_SPEECHMATICS_API_KEY", speechmatics_api_key),
         ("TA_DEEPGRAM_API_KEY", deepgram_api_key),
+        ("TA_GEMINI_API_KEY", gemini_api_key),
         ("TA_OPENAI_API_KEY", openai_api_key),
     ):
         if value is None:
@@ -420,6 +423,7 @@ class FailingTranscriptionAdapter:
 
 
 class StaticTranslationAdapter:
+    provider_id = "gemini"
     model_id = "gpt-5.4-mini"
 
     def __init__(self, *, blob_store: LocalBlobStore) -> None:
@@ -439,7 +443,7 @@ class StaticTranslationAdapter:
             request_context.job,
             "raw",
             "provider-payloads",
-            f"openai-{prompt_variant_id}.json",
+            f"translation-{self.provider_id}-{prompt_variant_id}.json",
         )
         self._blob_store.put_bytes(
             raw_response_ref,
@@ -473,7 +477,7 @@ class StaticTranslationAdapter:
             full_text=text,
             raw_response_ref=raw_response_ref,
             normalization_version="raw",
-            metadata={},
+            metadata={"provider": {"provider_id": self.provider_id}},
         )
 
 
@@ -509,7 +513,7 @@ def test_real_mode_assemblyai_only_selector_validates_with_minimal_credentials_r
         tmp_path,
         transcription_providers="assemblyai",
         assemblyai_api_key="assembly",  # pragma: allowlist secret
-        openai_api_key="openai",  # pragma: allowlist secret
+        gemini_api_key="gemini",  # pragma: allowlist secret
     )
 
     result = validate_environment(load_settings(env_file=None))
@@ -529,7 +533,7 @@ def test_real_mode_subset_selector_normalizes_case_and_preserves_order_regressio
         transcription_providers=" ASSEMBLYAI , deepgram ",
         assemblyai_api_key="assembly",  # pragma: allowlist secret
         deepgram_api_key="deepgram",  # pragma: allowlist secret
-        openai_api_key="openai",  # pragma: allowlist secret
+        gemini_api_key="gemini",  # pragma: allowlist secret
     )
     settings = load_settings(env_file=None)
     monkeypatch.setattr(
@@ -581,7 +585,7 @@ def test_real_mode_selector_rejects_invalid_provider_inputs_regression(
         transcription_providers=configured_value,
         assemblyai_api_key="assembly",  # pragma: allowlist secret
         deepgram_api_key="deepgram",  # pragma: allowlist secret
-        openai_api_key="openai",  # pragma: allowlist secret
+        gemini_api_key="gemini",  # pragma: allowlist secret
     )
 
     result = validate_environment(load_settings(env_file=None))

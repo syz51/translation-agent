@@ -36,14 +36,16 @@ The repo supports two execution modes.
 | Mode | How it is selected | What it uses | Best for |
 | --- | --- | --- | --- |
 | `fake` | default | deterministic fake adapters and scenario-driven outputs | local development, docs examples, fast tests |
-| `real` | `TA_ADAPTER_MODE=real` | `ffmpeg`, a selectable subset of AssemblyAI, Speechmatics, and Deepgram, plus the OpenAI Responses API | real provider integration |
+| `real` | `TA_ADAPTER_MODE=real` | `ffmpeg`, a selectable subset of AssemblyAI, Speechmatics, and Deepgram, plus a role-based translation runtime that defaults to Gemini via the OpenAI-compatible API | real provider integration |
 
 Notes:
 
 - fake mode requires no provider credentials
 - real mode defaults to all three transcription providers when `TA_TRANSCRIPTION_PROVIDERS` is unset
 - real mode optionally supports a comma-separated transcription-provider subset via `TA_TRANSCRIPTION_PROVIDERS`
-- real mode credential requirements depend on the selected transcription providers and still always require `TA_OPENAI_API_KEY`
+- real mode credential requirements depend on the selected transcription providers plus the selected translation provider
+- real mode translation defaults to `TA_TRANSLATION_PROVIDER=gemini` with `TA_TRANSLATION_MODEL_ID=gemini-3-flash`
+- real mode also exposes a reasoning profile that defaults to `TA_REASONING_PROVIDER=openai` with `TA_REASONING_MODEL_ID=gpt-5.4`, but review and adjudication still run deterministically in this pass
 - real mode is currently gated behind the LangGraph Python 3.14 compatibility check unless `TA_ALLOW_LANGGRAPH_PY314_WARNING=1` is set
 - fake mode still writes the full run record, trace, blob artifacts, scorecards, memory batches, consolidations, and prompt-evolution proposals
 
@@ -96,7 +98,7 @@ export TA_ADAPTER_MODE=real
 export TA_ASSEMBLYAI_API_KEY=...
 export TA_SPEECHMATICS_API_KEY=...
 export TA_DEEPGRAM_API_KEY=...
-export TA_OPENAI_API_KEY=...
+export TA_GEMINI_API_KEY=...
 export TA_ALLOW_LANGGRAPH_PY314_WARNING=1
 uv run translation-agent validate-config --json
 ```
@@ -105,13 +107,26 @@ If the LangGraph compatibility warning disappears in a future dependency update,
 
 `TA_TRANSCRIPTION_PROVIDERS` is optional in real mode. If it is unset, the runtime behaves exactly as before and uses `assemblyai,speechmatics,deepgram`. If it is set, real mode uses exactly the selected non-empty subset in the configured order.
 
+Gemini-first translation defaults:
+
+```bash
+export TA_ADAPTER_MODE=real
+export TA_ASSEMBLYAI_API_KEY=...
+export TA_SPEECHMATICS_API_KEY=...
+export TA_DEEPGRAM_API_KEY=...
+export TA_GEMINI_API_KEY=...
+export TA_ALLOW_LANGGRAPH_PY314_WARNING=1
+uv run translation-agent validate-config --json
+uv run translation-agent run-job /absolute/path/to/input.mp4 --job-id demo-gemini
+```
+
 AssemblyAI-only:
 
 ```bash
 export TA_ADAPTER_MODE=real
 export TA_TRANSCRIPTION_PROVIDERS=assemblyai
 export TA_ASSEMBLYAI_API_KEY=...
-export TA_OPENAI_API_KEY=...
+export TA_GEMINI_API_KEY=...
 export TA_ALLOW_LANGGRAPH_PY314_WARNING=1
 uv run translation-agent validate-config --json
 uv run translation-agent run-job /absolute/path/to/input.mp4 --job-id demo-real
@@ -122,6 +137,19 @@ AssemblyAI + Deepgram:
 ```bash
 export TA_ADAPTER_MODE=real
 export TA_TRANSCRIPTION_PROVIDERS=assemblyai,deepgram
+export TA_ASSEMBLYAI_API_KEY=...
+export TA_DEEPGRAM_API_KEY=...
+export TA_GEMINI_API_KEY=...
+export TA_ALLOW_LANGGRAPH_PY314_WARNING=1
+uv run translation-agent validate-config --json
+```
+
+OpenAI translation override:
+
+```bash
+export TA_ADAPTER_MODE=real
+export TA_TRANSLATION_PROVIDER=openai
+export TA_TRANSLATION_MODEL_ID=gpt-5.4-mini
 export TA_ASSEMBLYAI_API_KEY=...
 export TA_DEEPGRAM_API_KEY=...
 export TA_OPENAI_API_KEY=...
@@ -318,10 +346,16 @@ The settings model accepts more fields than most users need. These are the ones 
 | `TA_ASSEMBLYAI_API_KEY` | AssemblyAI credential for real mode |
 | `TA_SPEECHMATICS_API_KEY` | Speechmatics credential for real mode |
 | `TA_DEEPGRAM_API_KEY` | Deepgram credential for real mode |
-| `TA_OPENAI_API_KEY` | OpenAI credential for real mode |
+| `TA_TRANSLATION_PROVIDER` | translation provider for real mode: `gemini` or `openai` |
+| `TA_TRANSLATION_MODEL_ID` | translation model ID for real mode; defaults to `gemini-3-flash` |
+| `TA_REASONING_PROVIDER` | configured reasoning provider profile; defaults to `openai` |
+| `TA_REASONING_MODEL_ID` | configured reasoning model profile; defaults to `gpt-5.4` |
+| `TA_GEMINI_API_KEY` | Gemini credential for real-mode translation when `TA_TRANSLATION_PROVIDER=gemini` |
+| `TA_GEMINI_BASE_URL` | Gemini OpenAI-compatible base URL override |
+| `TA_OPENAI_API_KEY` | OpenAI credential for real-mode translation when `TA_TRANSLATION_PROVIDER=openai`, and for future live reasoning integrations |
+| `TA_OPENAI_BASE_URL` | OpenAI-compatible base URL override for OpenAI-backed translation or future reasoning adapters |
 | `TA_DEFAULT_SOURCE_LANGUAGE` | default source language for API and CLI runs when omitted |
 | `TA_DEFAULT_TARGET_LANGUAGE` | default target language for API and CLI runs when omitted |
-| `TA_TRANSLATION_MODEL_ID` | translation model ID for real mode |
 | `TA_TRANSLATION_PROMPT_VERSION` | translation prompt version recorded in outputs |
 
 The settings model also exposes `TA_WORKSPACE_DIR`, `TA_LOG_LEVEL`, `TA_EMIT_CONSOLE_LOGS`, and provider base URL overrides. At the moment those are configuration surface area, but the repo’s behavior is primarily driven by the variables listed above.

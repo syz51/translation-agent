@@ -15,7 +15,7 @@ from .assemblyai import AssemblyAITranscriptionAdapter
 from .common import AdapterError, RetryPolicy
 from .deepgram import DeepgramTranscriptionAdapter
 from .ffmpeg import FFmpegAudioExtractionAdapter
-from .openai_translation import OpenAITranslationAdapter
+from .openai_translation import ChatCompletionTranslationAdapter, OpenAITranslationAdapter
 from .speechmatics import SpeechmaticsTranscriptionAdapter
 
 
@@ -45,6 +45,7 @@ class TranscriptionAdapter(Protocol):
 class TranslationAdapter(Protocol):
     """Stable translation boundary returning canonical translation candidates."""
 
+    provider_id: str
     model_id: str
 
     def generate_translation(
@@ -94,6 +95,7 @@ __all__ = [
     "AssemblyAITranscriptionAdapter",
     "AudioBytesExtractionAdapter",
     "AudioExtractionAdapter",
+    "ChatCompletionTranslationAdapter",
     "DeepgramTranscriptionAdapter",
     "FFmpegAudioExtractionAdapter",
     "OpenAITranslationAdapter",
