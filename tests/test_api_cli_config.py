@@ -14,6 +14,7 @@ from translation_agent.api import (
     RunJobResult,
     _failure_details,
     _final_status,
+    list_runs,
     resume_translation,
     review_job,
     run_job,
@@ -615,6 +616,106 @@ def test_cli_run_job_json_includes_default_output_path(
 
 
 @pytest.mark.unit
+def test_cli_list_runs_plain_output_reports_summary_lines(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("TA_DATA_DIR", str(tmp_path / "runtime"))
+    monkeypatch.delenv("TA_STATE_DB_DSN", raising=False)
+
+    with SQLiteOperationalStore(tmp_path / "runtime" / "state.sqlite3") as store:
+        store.create_run(
+            run_id="run-older",
+            status="completed",
+            input_data={"job_id": "job-older", "source": "older.wav"},
+            created_at="2026-04-01T00:00:00+00:00",
+        )
+        store.create_run(
+            run_id="run-newer",
+            status="failed",
+            input_data={"job_id": "job-newer", "source": "newer.wav"},
+            created_at="2026-04-02T00:00:00+00:00",
+        )
+
+    exit_code = main(["list-runs"])
+
+    lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
+    assert exit_code == 0
+    assert lines == [
+        (
+            "run-newer status=failed job_id=job-newer created_at=2026-04-02T00:00:00+00:00 "
+            "source=newer.wav"
+        ),
+        (
+            "run-older status=completed job_id=job-older created_at=2026-04-01T00:00:00+00:00 "
+            "source=older.wav"
+        ),
+    ]
+
+
+@pytest.mark.unit
+def test_cli_list_runs_json_returns_persisted_records(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("TA_DATA_DIR", str(tmp_path / "runtime"))
+    monkeypatch.delenv("TA_STATE_DB_DSN", raising=False)
+
+    with SQLiteOperationalStore(tmp_path / "runtime" / "state.sqlite3") as store:
+        store.create_run(
+            run_id="run-older",
+            tenant_id="tenant-local",
+            project_id="project-local",
+            status="completed",
+            input_data={"job_id": "job-older", "source": "older.wav"},
+            metadata={"kind": "test"},
+            created_at="2026-04-01T00:00:00+00:00",
+        )
+        store.create_run(
+            run_id="run-newer",
+            tenant_id="tenant-local",
+            project_id="project-local",
+            status="failed",
+            input_data={"job_id": "job-newer", "source": "newer.wav"},
+            metadata={"kind": "test"},
+            created_at="2026-04-02T00:00:00+00:00",
+        )
+
+    exit_code = main(["list-runs", "--json"])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert payload == [
+        {
+            "run_id": "run-newer",
+            "tenant_id": "tenant-local",
+            "project_id": "project-local",
+            "status": "failed",
+            "created_at": "2026-04-02T00:00:00+00:00",
+            "updated_at": "2026-04-02T00:00:00+00:00",
+            "input_data": {"job_id": "job-newer", "source": "newer.wav"},
+            "output_data": None,
+            "metadata": {"kind": "test"},
+            "error": None,
+        },
+        {
+            "run_id": "run-older",
+            "tenant_id": "tenant-local",
+            "project_id": "project-local",
+            "status": "completed",
+            "created_at": "2026-04-01T00:00:00+00:00",
+            "updated_at": "2026-04-01T00:00:00+00:00",
+            "input_data": {"job_id": "job-older", "source": "older.wav"},
+            "output_data": None,
+            "metadata": {"kind": "test"},
+            "error": None,
+        },
+    ]
+
+
+@pytest.mark.unit
 def test_cli_run_job_plain_output_reports_failure_details(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1007,6 +1108,36 @@ def test_run_job_persists_transcription_provider_errors(
             },
         ],
     }
+
+
+@pytest.mark.unit
+def test_list_runs_returns_reverse_chronological_records(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("TA_DATA_DIR", str(tmp_path / "runtime"))
+    monkeypatch.delenv("TA_STATE_DB_DSN", raising=False)
+
+    state_db_path = tmp_path / "runtime" / "state.sqlite3"
+    with SQLiteOperationalStore(state_db_path) as store:
+        store.create_run(
+            run_id="run-older",
+            status="completed",
+            input_data={"job_id": "job-older", "source": "older.wav"},
+            created_at="2026-04-01T00:00:00+00:00",
+        )
+        store.create_run(
+            run_id="run-newer",
+            status="failed",
+            input_data={"job_id": "job-newer", "source": "newer.wav"},
+            created_at="2026-04-02T00:00:00+00:00",
+        )
+
+    records = list_runs()
+
+    assert [record.run_id for record in records] == ["run-newer", "run-older"]
+    assert [record.status for record in records] == ["failed", "completed"]
+    assert records[0].input_data == {"job_id": "job-newer", "source": "newer.wav"}
 
 
 @pytest.mark.unit

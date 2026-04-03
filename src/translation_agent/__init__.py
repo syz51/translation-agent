@@ -5,6 +5,7 @@ from translation_agent.api import (
     RunJobRequest,
     RunJobResult,
     convert_translation_json_to_srt,
+    list_runs,
     run_job,
 )
 from translation_agent.replay import (
@@ -20,6 +21,7 @@ __all__ = [
     "RunJobRequest",
     "RunJobResult",
     "convert_translation_json_to_srt",
+    "list_runs",
     "replay_adjudication",
     "run_job",
 ]

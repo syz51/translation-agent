@@ -15,6 +15,7 @@ from translation_agent.api import (
     RunJobRequest,
     approve_review,
     convert_translation_json_to_srt,
+    list_runs,
     resume_translation,
     review_job,
     run_job,
@@ -36,6 +37,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     migrate_parser = subparsers.add_parser("migrate-db", help="Apply Postgres migrations")
     migrate_parser.add_argument("--revision", default="head")
+
+    list_runs_parser = subparsers.add_parser("list-runs", help="List persisted workflow runs")
+    list_runs_parser.add_argument("--json", action="store_true", dest="as_json")
 
     convert_parser = subparsers.add_parser(
         "convert-json-to-srt",
@@ -149,6 +153,16 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         upgrade_database(settings.state_db_dsn, revision=args.revision)
         print(f"migrated {sanitize_db_target(settings.state_db_dsn)} to {args.revision}")
+        return 0
+
+    if args.command == "list-runs":
+        settings = load_settings()
+        records = list_runs(settings=settings)
+        payload = [asdict(record) for record in records]
+        if args.as_json:
+            print(json.dumps(_json_ready(payload)))
+        else:
+            _print_run_listing(payload)
         return 0
 
     if args.command == "convert-json-to-srt":
@@ -552,6 +566,28 @@ def _should_enter_interactive_review(*, mode: str) -> bool:
 
 def _has_tty() -> bool:
     return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def _print_run_listing(records: list[dict[str, Any]]) -> None:
+    if not records:
+        print("no runs found")
+        return
+    for record in records:
+        input_data = record.get("input_data")
+        job_id = None
+        source = None
+        if isinstance(input_data, dict):
+            job_id = input_data.get("job_id")
+            source = input_data.get("source")
+        line = (
+            f"{record['run_id']} "
+            f"status={record['status']} "
+            f"job_id={job_id or '-'} "
+            f"created_at={record['created_at']}"
+        )
+        if source:
+            line = f"{line} source={source}"
+        print(line)
 
 
 def _json_ready(value: Any) -> Any:

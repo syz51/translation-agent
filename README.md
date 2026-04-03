@@ -148,6 +148,17 @@ It verifies:
 - provider credentials are present for the selected real-mode providers when `TA_ADAPTER_MODE=real`
 - real mode is allowed by the current LangGraph compatibility gate
 
+### `list-runs`
+
+```bash
+uv run translation-agent list-runs
+uv run translation-agent list-runs --json
+```
+
+This command lists persisted runs in reverse chronological order. Plain output prints one compact
+summary line per run. JSON output returns full persisted run records, including any stored
+`input_data`, `output_data`, `metadata`, and `error` payloads.
+
 ### `run-job`
 
 ```bash
@@ -214,7 +225,7 @@ or `candidates/translations/*.json` into `.srt`. It does not accept the summary 
 ## Python API
 
 ```python
-from translation_agent.api import RunJobRequest, run_job
+from translation_agent.api import RunJobRequest, list_runs, run_job
 
 result = run_job(
     RunJobRequest(
@@ -229,9 +240,10 @@ result = run_job(
 
 print(result.status)
 print(result.trace_path)
+print([record.run_id for record in list_runs()])
 ```
 
-The API validates configuration first, persists a request manifest, creates a run record, executes the workflow, writes a JSONL trace, and returns the run summary.
+The API validates configuration first, persists a request manifest, creates a run record, executes the workflow, writes a JSONL trace, and returns the run summary. `list_runs()` reads persisted `RunRecord` items newest-first from the operational store.
 
 ## Artifact Layout
 

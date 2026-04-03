@@ -7,6 +7,7 @@
 `translation_agent.cli` exposes:
 
 - `translation-agent validate-config [--json]`
+- `translation-agent list-runs [--json]`
 - `translation-agent run-job <source> [--job-id <id>] [--source-language <code>] [--target-language <code>] [--json]`
 
 ### Python API
@@ -15,6 +16,7 @@
 
 - `RunJobRequest`
 - `RunJobResult`
+- `list_runs()`
 - `run_job()`
 
 These are the stable entrypoints other tooling should build against.
@@ -405,6 +407,21 @@ The CLI contract includes:
 - `provider_config_ok`
 - `provider_config_error`
 - `state_db_error`
+
+### `list-runs --json`
+
+The CLI payload is a reverse-chronological array of persisted `RunRecord` objects. Each item includes:
+
+- `run_id`
+- `tenant_id`
+- `project_id`
+- `status`
+- `created_at`
+- `updated_at`
+- `input_data`
+- `output_data`
+- `metadata`
+- `error`
 
 ### `run-job --json`
 

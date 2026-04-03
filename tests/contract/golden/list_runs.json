@@ -1,0 +1,36 @@
+[
+  {
+    "created_at": "2026-04-02T00:00:00+00:00",
+    "error": null,
+    "input_data": {
+      "job_id": "job-newer",
+      "source": "newer.wav"
+    },
+    "metadata": {
+      "kind": "contract"
+    },
+    "output_data": null,
+    "project_id": "project-local",
+    "run_id": "run-newer",
+    "status": "failed",
+    "tenant_id": "tenant-local",
+    "updated_at": "2026-04-02T00:00:00+00:00"
+  },
+  {
+    "created_at": "2026-04-01T00:00:00+00:00",
+    "error": null,
+    "input_data": {
+      "job_id": "job-older",
+      "source": "older.wav"
+    },
+    "metadata": {
+      "kind": "contract"
+    },
+    "output_data": null,
+    "project_id": "project-local",
+    "run_id": "run-older",
+    "status": "completed",
+    "tenant_id": "tenant-local",
+    "updated_at": "2026-04-01T00:00:00+00:00"
+  }
+]

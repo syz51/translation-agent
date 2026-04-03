@@ -43,6 +43,7 @@ from translation_agent.observability.tracing import JsonlTraceSink, TraceEvent
 from translation_agent.review_flow import approve_translation_review, build_review_payload
 from translation_agent.storage import (
     PostgresOperationalStore,
+    RunRecord,
     SQLiteOperationalStore,
     job_path,
     operational_job_key,
@@ -108,6 +109,14 @@ class ResumedTranscriptState:
     final_transcript_candidate_id: str | None
     final_transcript_decision_ref: str | None
     routing_facts: tuple[RoutingFact, ...]
+
+
+def list_runs(settings: Settings | None = None) -> list[RunRecord]:
+    """List persisted workflow runs in reverse chronological order."""
+
+    settings = settings or load_settings()
+    with _open_operational_store(settings) as run_store:
+        return run_store.list_runs()
 
 
 def run_job(request: RunJobRequest, settings: Settings | None = None) -> RunJobResult:

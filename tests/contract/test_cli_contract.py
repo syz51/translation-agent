@@ -59,6 +59,44 @@ def test_cli_run_job_json_contract(
     assert record is not None
 
 
+@pytest.mark.integration
+def test_cli_list_runs_json_contract(
+    migrated_postgres_dsn: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    runtime_dir = tmp_path / "runtime"
+    monkeypatch.setenv("TA_DATA_DIR", str(runtime_dir))
+    monkeypatch.setenv("TA_STATE_DB_DSN", migrated_postgres_dsn)
+
+    with PostgresRunStore(migrated_postgres_dsn) as store:
+        store.create_run(
+            run_id="run-older",
+            tenant_id="tenant-local",
+            project_id="project-local",
+            status="completed",
+            input_data={"job_id": "job-older", "source": "older.wav"},
+            metadata={"kind": "contract"},
+            created_at="2026-04-01T00:00:00+00:00",
+        )
+        store.create_run(
+            run_id="run-newer",
+            tenant_id="tenant-local",
+            project_id="project-local",
+            status="failed",
+            input_data={"job_id": "job-newer", "source": "newer.wav"},
+            metadata={"kind": "contract"},
+            created_at="2026-04-02T00:00:00+00:00",
+        )
+
+    exit_code = main(["list-runs", "--json"])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert payload == _load_golden("list_runs.json")
+
+
 def test_convert_json_to_srt_json_contract(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
