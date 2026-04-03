@@ -55,6 +55,7 @@ def adjudicate_transcript(state: GraphState, runtime: WorkflowRuntime) -> dict[s
             state,
             stage="adjudicate_transcript",
             candidate_ids=state.transcript_candidate_ids,
+            provider_ids=tuple(candidate.provider_id for candidate in candidates),
         )
     )
     context = AdjudicationContext(
@@ -239,6 +240,18 @@ def adjudicate_translation(state: GraphState, runtime: WorkflowRuntime) -> dict[
             state,
             stage="adjudicate_translation",
             candidate_ids=state.translation_candidate_ids,
+            provider_ids=tuple(
+                transcript.provider_id
+                for transcript in select_transcript_candidates(
+                    runtime,
+                    job=state.job,
+                    candidate_ids=tuple(
+                        candidate.source_transcript_candidate_id or "" for candidate in candidates
+                    ),
+                )
+            ),
+            prompt_variant_ids=tuple(candidate.prompt_variant_id for candidate in candidates),
+            model_ids=tuple(candidate.model_id for candidate in candidates),
         )
     )
     context = AdjudicationContext(
@@ -252,6 +265,12 @@ def adjudicate_translation(state: GraphState, runtime: WorkflowRuntime) -> dict[
             memory_bundle=adjudication_memory,
         ),
         content_risk_class=content_risk_class_for_scenario(runtime.scenario),
+        ranking_priors=_translation_candidate_ranking_priors(
+            runtime=runtime,
+            candidates=candidates,
+            adjudication_memory=adjudication_memory,
+            state=state,
+        ),
     )
     memory_ref = write_model_artifact(
         runtime,
@@ -523,4 +542,101 @@ def _bounded_provider_prior(stats: Any) -> float:
     recent_boost = min(float(getattr(stats, "recent_approved_outcomes_30d", 0)) * 0.01, 0.05)
     volume_boost = min(float(getattr(stats, "total_approved_outcomes", 0)) * 0.01, 0.05)
     rate_boost = min(float(getattr(stats, "indirect_approval_rate", 0.0)) * 0.12, 0.15)
-    return round(min(0.25, recent_boost + volume_boost + rate_boost), 4)
+    hard_boost = min(float(getattr(stats, "hard_positive_score", 0.0)) * 0.02, 0.08)
+    soft_boost = min(float(getattr(stats, "soft_positive_score", 0.0)) * 0.03, 0.06)
+    negative_penalty = min(float(getattr(stats, "negative_feedback_score", 0.0)) * 0.03, 0.12)
+    return round(
+        min(0.25, recent_boost + volume_boost + rate_boost + hard_boost + soft_boost)
+        - negative_penalty,
+        4,
+    )
+
+
+def _translation_candidate_ranking_priors(
+    *,
+    runtime: WorkflowRuntime,
+    candidates,
+    adjudication_memory,
+    state: GraphState,
+) -> dict[str, float]:
+    getter = getattr(runtime.decision_store, "get_translation_feedback_stats", None)
+    if not callable(getter):
+        return {}
+    priors: dict[str, float] = {}
+    transcript_by_id = {
+        transcript.candidate_id: transcript
+        for transcript in select_transcript_candidates(
+            runtime,
+            job=state.job,
+            candidate_ids=tuple(
+                candidate.source_transcript_candidate_id or "" for candidate in candidates
+            ),
+        )
+    }
+    for candidate in candidates:
+        transcript = transcript_by_id.get(candidate.source_transcript_candidate_id or "")
+        provider_id = transcript.provider_id if transcript is not None else "unknown-provider"
+        combo_key = "::".join(
+            (
+                state.job.source_language,
+                state.job.target_language,
+                provider_id,
+                candidate.model_id,
+                candidate.prompt_variant_id,
+                candidate.prompt_version,
+            )
+        )
+        stats = getter(combo_key)
+        prior = 0.0
+        if stats is not None:
+            prior = _bounded_translation_prior(stats)
+        prior += _procedural_memory_prior(adjudication_memory.procedural_memory, combo_key)
+        if prior != 0.0:
+            priors[candidate.candidate_id] = max(-0.25, min(0.25, round(prior, 4)))
+    return priors
+
+
+def _bounded_translation_prior(stats: Any) -> float:
+    pairwise_signal = min(
+        max(
+            (
+                float(getattr(stats, "pairwise_win_score", 0.0))
+                - float(getattr(stats, "pairwise_loss_score", 0.0))
+            )
+            * 0.05,
+            -0.18,
+        ),
+        0.18,
+    )
+    approval_signal = min(float(getattr(stats, "approved_good_count", 0)) * 0.02, 0.08) + min(
+        float(getattr(stats, "approved_best_available_count", 0)) * 0.01,
+        0.04,
+    )
+    rejection_penalty = min(float(getattr(stats, "rejected_all_count", 0)) * 0.03, 0.12)
+    failure_penalty = min(
+        sum(float(value) for value in getattr(stats, "failure_tag_counts", {}).values()) * 0.01,
+        0.08,
+    )
+    return round(
+        max(
+            -0.25,
+            min(0.25, pairwise_signal + approval_signal - rejection_penalty - failure_penalty),
+        ),
+        4,
+    )
+
+
+def _procedural_memory_prior(procedural_memory, combo_key: str) -> float:
+    prior = 0.0
+    for entry in procedural_memory:
+        if entry.metadata.get("combo_key") == combo_key:
+            strength = str(entry.metadata.get("supervision_strength") or "")
+            if strength == "strong":
+                prior += 0.03
+            elif strength == "soft":
+                prior += 0.015
+            elif strength == "negative":
+                prior -= 0.02
+        elif entry.metadata.get("category") == "anti_pattern":
+            prior -= 0.005
+    return round(prior, 4)

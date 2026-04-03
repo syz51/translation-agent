@@ -456,7 +456,7 @@ def build_phase_two_runtime(
         memory_staging_backend=DeterministicMemoryStagingBackend(),
         memory_consolidation_backend=DeterministicMemoryConsolidationBackend(memory_store),
         prompt_evolution_backend=DeterministicPromptEvolutionBackend(),
-        prompt_resolver=ProposalBackedPromptResolver(blob_store),
+        prompt_resolver=ProposalBackedPromptResolver(run_store, blob_store),
         parallelism=_default_parallelism_policy(provider_count=3),
         source_artifact_ref=source_artifact_ref,
         scenario=scenario,
@@ -577,7 +577,7 @@ def build_phase_three_runtime(
         memory_staging_backend=DeterministicMemoryStagingBackend(),
         memory_consolidation_backend=DeterministicMemoryConsolidationBackend(memory_store),
         prompt_evolution_backend=DeterministicPromptEvolutionBackend(),
-        prompt_resolver=ProposalBackedPromptResolver(blob_store),
+        prompt_resolver=ProposalBackedPromptResolver(run_store, blob_store),
         parallelism=_settings_parallelism_policy(
             settings,
             provider_count=len(transcription_adapters),

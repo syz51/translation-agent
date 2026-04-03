@@ -153,6 +153,7 @@ def publish_outputs(state: GraphState, runtime: WorkflowRuntime) -> tuple[Publis
         final_transcript_ref=transcript_ref,
         final_translation_ref=translation_ref,
         recoverable_translation_failure_ref=translation_failure_ref,
+        resolution_refs=_artifact_refs(state.resolution_ref),
         approval_refs=_artifact_refs(state.approval_ref),
         learning_refs=learning_refs,
         scorecard_refs=(scorecard_ref,),
@@ -238,6 +239,10 @@ def _scorecard_payload(
         "job_id": state.job.job_id,
         "human_review_required": state.human_review_required,
         "review_required_stage": state.review_required_stage,
+        "resolution_ref": state.resolution_ref,
+        "resolution_kind": state.resolution_kind,
+        "failure_tags": list(state.failure_tags),
+        "residual_failure_tags": list(state.residual_failure_tags),
         "approval_ref": state.approval_ref,
         "approved_candidate_id": state.approved_candidate_id,
         "approved_source_transcript_candidate_id": state.approved_source_transcript_candidate_id,
@@ -283,6 +288,10 @@ def _export_payload(
         "source_language": state.job.source_language,
         "target_language": state.job.target_language,
         "review_required_stage": state.review_required_stage,
+        "resolution_ref": state.resolution_ref,
+        "resolution_kind": state.resolution_kind,
+        "failure_tags": list(state.failure_tags),
+        "residual_failure_tags": list(state.residual_failure_tags),
         "approval_ref": state.approval_ref,
         "approved_candidate_id": state.approved_candidate_id,
         "approved_source_transcript_candidate_id": state.approved_source_transcript_candidate_id,
@@ -360,6 +369,8 @@ def _translation_failure_reasons(state: GraphState) -> list[str]:
 def _delivery_status(state: GraphState) -> str:
     if state.approval_ref is not None:
         return "completed_after_human_review"
+    if state.resolution_kind == "rejected_all":
+        return "rejected_after_human_review"
     if state.translation_failed:
         return "translation_failed"
     if state.human_review_required:

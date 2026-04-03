@@ -152,7 +152,7 @@ def scoped_memory_bundle(
         glossary=memory_bundle.glossary[:2],
         rules=memory_bundle.rules[:2],
         episodic_memory=memory_bundle.episodic_memory[:1],
-        procedural_memory=(),
+        procedural_memory=memory_bundle.procedural_memory[:2],
         provider_caveats=memory_bundle.provider_caveats if stage == "transcript" else (),
     )
 
@@ -167,7 +167,7 @@ def adjudication_memory_bundle(
         glossary=memory_bundle.glossary[:1],
         rules=memory_bundle.rules[:1],
         episodic_memory=memory_bundle.episodic_memory[:1],
-        procedural_memory=(),
+        procedural_memory=memory_bundle.procedural_memory[:1],
         provider_caveats=memory_bundle.provider_caveats if stage == "transcript" else (),
     )
 
@@ -185,6 +185,7 @@ def build_review_prompt(
         f"rules={len(context.memory_bundle.rules)}",
         f"semantic={len(context.memory_bundle.semantic_memory)}",
         f"episodic={len(context.memory_bundle.episodic_memory)}",
+        f"procedural={len(context.memory_bundle.procedural_memory)}",
     ]
     lines = [
         f"Stage: {context.stage}",
@@ -198,6 +199,12 @@ def build_review_prompt(
     ]
     if final_transcript_ref is not None:
         lines.append(f"Final Transcript Ref: {final_transcript_ref}")
+    anti_patterns = [
+        entry.content for entry in context.memory_bundle.procedural_memory if entry.content.strip()
+    ]
+    if anti_patterns:
+        lines.append("Recurring anti-patterns to check:")
+        lines.extend(f"- {entry}" for entry in anti_patterns[:3])
     return "\n".join(lines)
 
 

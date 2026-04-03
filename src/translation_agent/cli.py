@@ -16,6 +16,7 @@ from translation_agent.api import (
     approve_review,
     convert_translation_json_to_srt,
     list_runs,
+    resolve_review,
     resume_transcription,
     resume_translation,
     review_job,
@@ -117,6 +118,27 @@ def build_parser() -> argparse.ArgumentParser:
     approve_parser.add_argument("--approved-by")
     approve_parser.add_argument("--note")
     approve_parser.add_argument("--json", action="store_true", dest="as_json")
+
+    resolve_parser = subparsers.add_parser(
+        "resolve-review",
+        help="Resolve a pending translation review with graded human supervision",
+    )
+    resolve_parser.add_argument("run_id")
+    resolve_parser.add_argument(
+        "--resolution",
+        required=True,
+        choices=["approved_good", "approved_best_available", "rejected_all"],
+    )
+    resolve_parser.add_argument("--candidate-id")
+    resolve_parser.add_argument(
+        "--failure-tag",
+        action="append",
+        dest="failure_tags",
+        default=[],
+    )
+    resolve_parser.add_argument("--approved-by")
+    resolve_parser.add_argument("--note")
+    resolve_parser.add_argument("--json", action="store_true", dest="as_json")
     return parser
 
 
@@ -335,6 +357,36 @@ def main(argv: list[str] | None = None) -> int:
             )
             print(f"approval_ref: {payload['approval_ref']}")
             print(f"default_output_path: {payload['default_output_path']}")
+        return 0
+
+    if args.command == "resolve-review":
+        settings = load_settings()
+        payload = resolve_review(
+            args.run_id,
+            resolution=args.resolution,
+            candidate_id=args.candidate_id,
+            failure_tags=tuple(args.failure_tags),
+            approved_by=args.approved_by,
+            note=args.note,
+            settings=settings,
+        )
+        if args.as_json:
+            print(json.dumps(_json_ready(payload)))
+        else:
+            print(payload["run_id"])
+            print(payload["status"])
+            print(f"resolution_kind: {payload['resolution_kind']}")
+            print(f"resolution_ref: {payload['resolution_ref']}")
+            if payload.get("approval_ref") is not None:
+                print(f"approval_ref: {payload['approval_ref']}")
+            if payload.get("approved_candidate_id") is not None:
+                print(f"approved_candidate_id: {payload['approved_candidate_id']}")
+            if payload.get("default_output_path") is not None:
+                print(f"default_output_path: {payload['default_output_path']}")
+            if payload.get("failure_tags"):
+                failure_tags = payload["failure_tags"]
+                if isinstance(failure_tags, list):
+                    print("failure_tags: " + ", ".join(str(tag) for tag in failure_tags))
         return 0
 
     parser.error(f"unsupported command: {args.command}")
