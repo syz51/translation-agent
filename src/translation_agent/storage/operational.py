@@ -15,11 +15,13 @@ from translation_agent.models import (
     FinalTranscriptDecision,
     FinalTranslationDecision,
     HistoricalRunLink,
+    HumanReviewResolutionRecord,
     MemoryWriteBatch,
     PromptEvolutionProposal,
     TranscriptCandidate,
     TranscriptProviderQualityStats,
     TranslationCandidate,
+    TranslationFeedbackStats,
 )
 from translation_agent.models.review import ReviewStage
 
@@ -86,6 +88,83 @@ _POSTGRES_PROVIDER_STATS_SELECT_SQL = """
     SELECT stats_json
     FROM transcript_provider_quality_stats
     WHERE provider_id = %s AND source_language = %s AND target_language = %s
+"""
+_POSTGRES_HUMAN_RESOLUTION_UPSERT_SQL = """
+    INSERT INTO human_review_resolutions (
+        run_id,
+        job_id,
+        resolution_json,
+        resolution_kind,
+        source_language,
+        target_language,
+        transcript_provider_id,
+        model_id,
+        prompt_variant_id,
+        prompt_version,
+        combo_key,
+        resolved_at,
+        created_at,
+        updated_at
+    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    ON CONFLICT (run_id) DO UPDATE SET
+        job_id = EXCLUDED.job_id,
+        resolution_json = EXCLUDED.resolution_json,
+        resolution_kind = EXCLUDED.resolution_kind,
+        source_language = EXCLUDED.source_language,
+        target_language = EXCLUDED.target_language,
+        transcript_provider_id = EXCLUDED.transcript_provider_id,
+        model_id = EXCLUDED.model_id,
+        prompt_variant_id = EXCLUDED.prompt_variant_id,
+        prompt_version = EXCLUDED.prompt_version,
+        combo_key = EXCLUDED.combo_key,
+        resolved_at = EXCLUDED.resolved_at,
+        updated_at = EXCLUDED.updated_at
+"""
+_POSTGRES_HUMAN_RESOLUTION_SELECT_SQL = """
+    SELECT resolution_json
+    FROM human_review_resolutions
+    WHERE run_id = %s
+"""
+_POSTGRES_HUMAN_RESOLUTION_LIST_SQL = """
+    SELECT resolution_json
+    FROM human_review_resolutions
+    WHERE (%s IS NULL OR resolution_kind = %s)
+      AND (%s IS NULL OR source_language = %s)
+      AND (%s IS NULL OR target_language = %s)
+      AND (%s IS NULL OR transcript_provider_id = %s)
+      AND (%s IS NULL OR model_id = %s)
+      AND (%s IS NULL OR prompt_variant_id = %s)
+      AND (%s IS NULL OR prompt_version = %s)
+      AND (%s IS NULL OR combo_key = %s)
+    ORDER BY resolved_at ASC, run_id ASC
+"""
+_POSTGRES_TRANSLATION_FEEDBACK_UPSERT_SQL = """
+    INSERT INTO translation_feedback_stats (
+        combo_key,
+        stats_json,
+        source_language,
+        target_language,
+        transcript_provider_id,
+        model_id,
+        prompt_variant_id,
+        prompt_version,
+        created_at,
+        updated_at
+    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    ON CONFLICT (combo_key) DO UPDATE SET
+        stats_json = EXCLUDED.stats_json,
+        source_language = EXCLUDED.source_language,
+        target_language = EXCLUDED.target_language,
+        transcript_provider_id = EXCLUDED.transcript_provider_id,
+        model_id = EXCLUDED.model_id,
+        prompt_variant_id = EXCLUDED.prompt_variant_id,
+        prompt_version = EXCLUDED.prompt_version,
+        updated_at = EXCLUDED.updated_at
+"""
+_POSTGRES_TRANSLATION_FEEDBACK_SELECT_SQL = """
+    SELECT stats_json
+    FROM translation_feedback_stats
+    WHERE combo_key = %s
 """
 _SQLITE_CANDIDATE_UPSERT_SQL = {
     "transcript_candidates": """
@@ -156,6 +235,83 @@ _SQLITE_PROVIDER_STATS_SELECT_SQL = """
     SELECT stats_json
     FROM transcript_provider_quality_stats
     WHERE provider_id = ? AND source_language = ? AND target_language = ?
+"""
+_SQLITE_HUMAN_RESOLUTION_UPSERT_SQL = """
+    INSERT INTO human_review_resolutions (
+        run_id,
+        job_id,
+        resolution_json,
+        resolution_kind,
+        source_language,
+        target_language,
+        transcript_provider_id,
+        model_id,
+        prompt_variant_id,
+        prompt_version,
+        combo_key,
+        resolved_at,
+        created_at,
+        updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(run_id) DO UPDATE SET
+        job_id = excluded.job_id,
+        resolution_json = excluded.resolution_json,
+        resolution_kind = excluded.resolution_kind,
+        source_language = excluded.source_language,
+        target_language = excluded.target_language,
+        transcript_provider_id = excluded.transcript_provider_id,
+        model_id = excluded.model_id,
+        prompt_variant_id = excluded.prompt_variant_id,
+        prompt_version = excluded.prompt_version,
+        combo_key = excluded.combo_key,
+        resolved_at = excluded.resolved_at,
+        updated_at = excluded.updated_at
+"""
+_SQLITE_HUMAN_RESOLUTION_SELECT_SQL = """
+    SELECT resolution_json
+    FROM human_review_resolutions
+    WHERE run_id = ?
+"""
+_SQLITE_HUMAN_RESOLUTION_LIST_SQL = """
+    SELECT resolution_json
+    FROM human_review_resolutions
+    WHERE (? IS NULL OR resolution_kind = ?)
+      AND (? IS NULL OR source_language = ?)
+      AND (? IS NULL OR target_language = ?)
+      AND (? IS NULL OR transcript_provider_id = ?)
+      AND (? IS NULL OR model_id = ?)
+      AND (? IS NULL OR prompt_variant_id = ?)
+      AND (? IS NULL OR prompt_version = ?)
+      AND (? IS NULL OR combo_key = ?)
+    ORDER BY resolved_at ASC, run_id ASC
+"""
+_SQLITE_TRANSLATION_FEEDBACK_UPSERT_SQL = """
+    INSERT INTO translation_feedback_stats (
+        combo_key,
+        stats_json,
+        source_language,
+        target_language,
+        transcript_provider_id,
+        model_id,
+        prompt_variant_id,
+        prompt_version,
+        created_at,
+        updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(combo_key) DO UPDATE SET
+        stats_json = excluded.stats_json,
+        source_language = excluded.source_language,
+        target_language = excluded.target_language,
+        transcript_provider_id = excluded.transcript_provider_id,
+        model_id = excluded.model_id,
+        prompt_variant_id = excluded.prompt_variant_id,
+        prompt_version = excluded.prompt_version,
+        updated_at = excluded.updated_at
+"""
+_SQLITE_TRANSLATION_FEEDBACK_SELECT_SQL = """
+    SELECT stats_json
+    FROM translation_feedback_stats
+    WHERE combo_key = ?
 """
 _SQLITE_LIST_SQL = {
     "transcript_candidates": (
@@ -324,6 +480,27 @@ class OperationalStore(DecisionStore, MemoryBatchStore, Protocol):
         source_language: str,
         target_language: str,
     ) -> TranscriptProviderQualityStats | None: ...
+
+    def save_human_review_resolution(self, resolution: HumanReviewResolutionRecord) -> None: ...
+
+    def get_human_review_resolution(self, run_id: str) -> HumanReviewResolutionRecord | None: ...
+
+    def list_human_review_resolutions(
+        self,
+        *,
+        resolution_kind: str | None = None,
+        source_language: str | None = None,
+        target_language: str | None = None,
+        transcript_provider_id: str | None = None,
+        model_id: str | None = None,
+        prompt_variant_id: str | None = None,
+        prompt_version: str | None = None,
+        combo_key: str | None = None,
+    ) -> list[HumanReviewResolutionRecord]: ...
+
+    def save_translation_feedback_stats(self, stats: TranslationFeedbackStats) -> None: ...
+
+    def get_translation_feedback_stats(self, combo_key: str) -> TranslationFeedbackStats | None: ...
 
 
 class PostgresOperationalStore(PostgresRunStore):
@@ -628,31 +805,26 @@ class PostgresOperationalStore(PostgresRunStore):
         media_key: str | None = None,
     ) -> list[PromptEvolutionProposal]:
         status = _normalized_proposal_status(status)
-        rows = self._conn.execute(
-            _POSTGRES_PROPOSAL_LIST_SQL,
-            (
-                status,
-                status,
-                prompt_family,
-                prompt_family,
-                target_model_id,
-                target_model_id,
-                target_language,
-                target_language,
-                source_language,
-                source_language,
-                prompt_variant_id,
-                prompt_variant_id,
-                base_prompt_version,
-                base_prompt_version,
-                scope_kind,
-                scope_kind,
-                scope_key,
-                scope_key,
-                media_key,
-                media_key,
-            ),
-        ).fetchall()
+        query = ["SELECT proposal_json FROM prompt_evolution_proposals WHERE 1=1"]
+        params: list[Any] = []
+        for column, value in (
+            ("status", status),
+            ("prompt_family", prompt_family),
+            ("target_model_id", target_model_id),
+            ("target_language", target_language),
+            ("source_language", source_language),
+            ("prompt_variant_id", prompt_variant_id),
+            ("base_prompt_version", base_prompt_version),
+            ("scope_kind", scope_kind),
+            ("scope_key", scope_key),
+            ("media_key", media_key),
+        ):
+            if value is None:
+                continue
+            query.append(f"AND {column} = %s")
+            params.append(value)
+        query.append("ORDER BY proposal_id ASC")
+        rows = self._conn.execute(" ".join(query), tuple(params)).fetchall()
         return [
             PromptEvolutionProposal.model_validate(_decode_db_json(row["proposal_json"]))
             for row in rows
@@ -687,6 +859,95 @@ class PostgresOperationalStore(PostgresRunStore):
         if row is None:
             return None
         return TranscriptProviderQualityStats.model_validate(_decode_db_json(row["stats_json"]))
+
+    def save_human_review_resolution(self, resolution: HumanReviewResolutionRecord) -> None:
+        now = _utc_now()
+        with self._conn.transaction():
+            self._conn.execute(
+                _POSTGRES_HUMAN_RESOLUTION_UPSERT_SQL,
+                (
+                    resolution.run_id,
+                    resolution.job_id,
+                    _encode_json(resolution.model_dump(mode="json")),
+                    resolution.resolution_kind,
+                    resolution.source_language,
+                    resolution.target_language,
+                    resolution.transcript_provider_id,
+                    resolution.model_id,
+                    resolution.prompt_variant_id,
+                    resolution.prompt_version,
+                    resolution.combo_key,
+                    resolution.resolved_at,
+                    now,
+                    now,
+                ),
+            )
+
+    def get_human_review_resolution(self, run_id: str) -> HumanReviewResolutionRecord | None:
+        row = self._conn.execute(_POSTGRES_HUMAN_RESOLUTION_SELECT_SQL, (run_id,)).fetchone()
+        if row is None:
+            return None
+        return HumanReviewResolutionRecord.model_validate(_decode_db_json(row["resolution_json"]))
+
+    def list_human_review_resolutions(
+        self,
+        *,
+        resolution_kind: str | None = None,
+        source_language: str | None = None,
+        target_language: str | None = None,
+        transcript_provider_id: str | None = None,
+        model_id: str | None = None,
+        prompt_variant_id: str | None = None,
+        prompt_version: str | None = None,
+        combo_key: str | None = None,
+    ) -> list[HumanReviewResolutionRecord]:
+        query = ["SELECT resolution_json FROM human_review_resolutions WHERE 1=1"]
+        params: list[Any] = []
+        for column, value in (
+            ("resolution_kind", resolution_kind),
+            ("source_language", source_language),
+            ("target_language", target_language),
+            ("transcript_provider_id", transcript_provider_id),
+            ("model_id", model_id),
+            ("prompt_variant_id", prompt_variant_id),
+            ("prompt_version", prompt_version),
+            ("combo_key", combo_key),
+        ):
+            if value is None:
+                continue
+            query.append(f"AND {column} = %s")
+            params.append(value)
+        query.append("ORDER BY resolved_at ASC, run_id ASC")
+        rows = self._conn.execute(" ".join(query), tuple(params)).fetchall()
+        return [
+            HumanReviewResolutionRecord.model_validate(_decode_db_json(row["resolution_json"]))
+            for row in rows
+        ]
+
+    def save_translation_feedback_stats(self, stats: TranslationFeedbackStats) -> None:
+        now = _utc_now()
+        with self._conn.transaction():
+            self._conn.execute(
+                _POSTGRES_TRANSLATION_FEEDBACK_UPSERT_SQL,
+                (
+                    stats.combo_key,
+                    _encode_json(stats.model_dump(mode="json")),
+                    stats.source_language,
+                    stats.target_language,
+                    stats.transcript_provider_id,
+                    stats.model_id,
+                    stats.prompt_variant_id,
+                    stats.prompt_version,
+                    now,
+                    now,
+                ),
+            )
+
+    def get_translation_feedback_stats(self, combo_key: str) -> TranslationFeedbackStats | None:
+        row = self._conn.execute(_POSTGRES_TRANSLATION_FEEDBACK_SELECT_SQL, (combo_key,)).fetchone()
+        if row is None:
+            return None
+        return TranslationFeedbackStats.model_validate(_decode_db_json(row["stats_json"]))
 
     def resolve_asset(
         self,
@@ -1447,6 +1708,100 @@ class SQLiteOperationalStore(AbstractContextManager["SQLiteOperationalStore"]):
             return None
         return TranscriptProviderQualityStats.model_validate(_decode_sqlite_json(row["stats_json"]))
 
+    def save_human_review_resolution(self, resolution: HumanReviewResolutionRecord) -> None:
+        now = _utc_now()
+        with self._conn:
+            self._conn.execute(
+                _SQLITE_HUMAN_RESOLUTION_UPSERT_SQL,
+                (
+                    resolution.run_id,
+                    resolution.job_id,
+                    _encode_sqlite_json(resolution.model_dump(mode="json")),
+                    resolution.resolution_kind,
+                    resolution.source_language,
+                    resolution.target_language,
+                    resolution.transcript_provider_id,
+                    resolution.model_id,
+                    resolution.prompt_variant_id,
+                    resolution.prompt_version,
+                    resolution.combo_key,
+                    resolution.resolved_at.isoformat(),
+                    now,
+                    now,
+                ),
+            )
+
+    def get_human_review_resolution(self, run_id: str) -> HumanReviewResolutionRecord | None:
+        row = self._conn.execute(_SQLITE_HUMAN_RESOLUTION_SELECT_SQL, (run_id,)).fetchone()
+        if row is None:
+            return None
+        return HumanReviewResolutionRecord.model_validate(
+            _decode_sqlite_json(row["resolution_json"])
+        )
+
+    def list_human_review_resolutions(
+        self,
+        *,
+        resolution_kind: str | None = None,
+        source_language: str | None = None,
+        target_language: str | None = None,
+        transcript_provider_id: str | None = None,
+        model_id: str | None = None,
+        prompt_variant_id: str | None = None,
+        prompt_version: str | None = None,
+        combo_key: str | None = None,
+    ) -> list[HumanReviewResolutionRecord]:
+        rows = self._conn.execute(
+            _SQLITE_HUMAN_RESOLUTION_LIST_SQL,
+            (
+                resolution_kind,
+                resolution_kind,
+                source_language,
+                source_language,
+                target_language,
+                target_language,
+                transcript_provider_id,
+                transcript_provider_id,
+                model_id,
+                model_id,
+                prompt_variant_id,
+                prompt_variant_id,
+                prompt_version,
+                prompt_version,
+                combo_key,
+                combo_key,
+            ),
+        ).fetchall()
+        return [
+            HumanReviewResolutionRecord.model_validate(_decode_sqlite_json(row["resolution_json"]))
+            for row in rows
+        ]
+
+    def save_translation_feedback_stats(self, stats: TranslationFeedbackStats) -> None:
+        now = _utc_now()
+        with self._conn:
+            self._conn.execute(
+                _SQLITE_TRANSLATION_FEEDBACK_UPSERT_SQL,
+                (
+                    stats.combo_key,
+                    _encode_sqlite_json(stats.model_dump(mode="json")),
+                    stats.source_language,
+                    stats.target_language,
+                    stats.transcript_provider_id,
+                    stats.model_id,
+                    stats.prompt_variant_id,
+                    stats.prompt_version,
+                    now,
+                    now,
+                ),
+            )
+
+    def get_translation_feedback_stats(self, combo_key: str) -> TranslationFeedbackStats | None:
+        row = self._conn.execute(_SQLITE_TRANSLATION_FEEDBACK_SELECT_SQL, (combo_key,)).fetchone()
+        if row is None:
+            return None
+        return TranslationFeedbackStats.model_validate(_decode_sqlite_json(row["stats_json"]))
+
     def _bootstrap_schema(self) -> None:
         self._conn.executescript(
             """
@@ -1599,6 +1954,58 @@ class SQLiteOperationalStore(AbstractContextManager["SQLiteOperationalStore"]):
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY (provider_id, source_language, target_language)
+            );
+
+            CREATE TABLE IF NOT EXISTS human_review_resolutions (
+                run_id TEXT PRIMARY KEY,
+                job_id TEXT NOT NULL,
+                resolution_json TEXT NOT NULL,
+                resolution_kind TEXT NOT NULL,
+                source_language TEXT NOT NULL,
+                target_language TEXT NOT NULL,
+                transcript_provider_id TEXT,
+                model_id TEXT,
+                prompt_variant_id TEXT,
+                prompt_version TEXT,
+                combo_key TEXT,
+                resolved_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_human_review_resolutions_lookup
+            ON human_review_resolutions(
+                resolution_kind,
+                source_language,
+                target_language,
+                transcript_provider_id,
+                model_id,
+                prompt_variant_id,
+                prompt_version,
+                combo_key
+            );
+
+            CREATE TABLE IF NOT EXISTS translation_feedback_stats (
+                combo_key TEXT PRIMARY KEY,
+                stats_json TEXT NOT NULL,
+                source_language TEXT NOT NULL,
+                target_language TEXT NOT NULL,
+                transcript_provider_id TEXT NOT NULL,
+                model_id TEXT NOT NULL,
+                prompt_variant_id TEXT NOT NULL,
+                prompt_version TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_translation_feedback_stats_lookup
+            ON translation_feedback_stats(
+                source_language,
+                target_language,
+                transcript_provider_id,
+                model_id,
+                prompt_variant_id,
+                prompt_version
             );
             """
         )

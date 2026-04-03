@@ -1,9 +1,14 @@
 """Canonical models package."""
 
 from .approval import (
+    FailureTag,
     HumanApprovalRecord,
+    HumanReviewedCandidateContext,
+    HumanReviewResolutionRecord,
+    HumanSupervisionKind,
     TranscriptApprovalLearningEvent,
     TranscriptProviderQualityStats,
+    TranslationFeedbackStats,
 )
 from .artifacts import AudioArtifact, PublishContext, PublishedArtifacts
 from .evaluation import (
@@ -66,10 +71,14 @@ __all__ = [
     "EvaluatedRunReport",
     "EvaluationFailure",
     "EvaluationReport",
+    "FailureTag",
     "FinalTranscriptDecision",
     "FinalTranslationDecision",
     "HistoricalRunLink",
     "HumanApprovalRecord",
+    "HumanReviewedCandidateContext",
+    "HumanReviewResolutionRecord",
+    "HumanSupervisionKind",
     "JobContext",
     "MemoryBundle",
     "MemoryConsolidation",
@@ -105,6 +114,7 @@ __all__ = [
     "TranscriptMismatchSpan",
     "TranscriptCandidate",
     "TranscriptProviderQualityStats",
+    "TranslationFeedbackStats",
     "TranslationScore",
     "TranslationCandidate",
 ]

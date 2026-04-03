@@ -43,7 +43,11 @@ from translation_agent.observability.events import (
     log_structured_event,
 )
 from translation_agent.observability.tracing import JsonlTraceSink, TraceEvent
-from translation_agent.review_flow import approve_translation_review, build_review_payload
+from translation_agent.review_flow import (
+    approve_translation_review,
+    build_review_payload,
+    resolve_translation_review,
+)
 from translation_agent.storage import (
     PostgresOperationalStore,
     RunRecord,
@@ -90,6 +94,10 @@ class RunJobResult:
     failure_summary: str | None = None
     failure_reasons: tuple[str, ...] = ()
     review_required_stage: str | None = None
+    resolution_ref: str | None = None
+    resolution_kind: str | None = None
+    failure_tags: tuple[str, ...] = ()
+    residual_failure_tags: tuple[str, ...] = ()
     approval_ref: str | None = None
     approved_candidate_id: str | None = None
     approved_source_transcript_candidate_id: str | None = None
@@ -326,6 +334,10 @@ def run_job(request: RunJobRequest, settings: Settings | None = None) -> RunJobR
                 "evaluation_report_ref": final_state.evaluation_report_ref,
                 "regenerated_translation_draft_ref": final_state.regenerated_translation_draft_ref,
                 "improvement_proposal_refs": list(final_state.improvement_proposal_refs),
+                "resolution_ref": final_state.resolution_ref,
+                "resolution_kind": final_state.resolution_kind,
+                "failure_tags": list(final_state.failure_tags),
+                "residual_failure_tags": list(final_state.residual_failure_tags),
                 "approval_ref": final_state.approval_ref,
                 "approved_candidate_id": final_state.approved_candidate_id,
                 "approved_source_transcript_candidate_id": (
@@ -376,6 +388,10 @@ def run_job(request: RunJobRequest, settings: Settings | None = None) -> RunJobR
         failure_summary=failure_summary,
         failure_reasons=failure_reasons,
         review_required_stage=final_state.review_required_stage,
+        resolution_ref=final_state.resolution_ref,
+        resolution_kind=final_state.resolution_kind,
+        failure_tags=final_state.failure_tags,
+        residual_failure_tags=final_state.residual_failure_tags,
         approval_ref=final_state.approval_ref,
         approved_candidate_id=final_state.approved_candidate_id,
         approved_source_transcript_candidate_id=final_state.approved_source_transcript_candidate_id,
@@ -619,6 +635,10 @@ def resume_translation(
                 "evaluation_report_ref": final_state.evaluation_report_ref,
                 "regenerated_translation_draft_ref": final_state.regenerated_translation_draft_ref,
                 "improvement_proposal_refs": list(final_state.improvement_proposal_refs),
+                "resolution_ref": final_state.resolution_ref,
+                "resolution_kind": final_state.resolution_kind,
+                "failure_tags": list(final_state.failure_tags),
+                "residual_failure_tags": list(final_state.residual_failure_tags),
                 "approval_ref": final_state.approval_ref,
                 "approved_candidate_id": final_state.approved_candidate_id,
                 "approved_source_transcript_candidate_id": (
@@ -671,6 +691,10 @@ def resume_translation(
         failure_summary=failure_summary,
         failure_reasons=failure_reasons,
         review_required_stage=final_state.review_required_stage,
+        resolution_ref=final_state.resolution_ref,
+        resolution_kind=final_state.resolution_kind,
+        failure_tags=final_state.failure_tags,
+        residual_failure_tags=final_state.residual_failure_tags,
         approval_ref=final_state.approval_ref,
         approved_candidate_id=final_state.approved_candidate_id,
         approved_source_transcript_candidate_id=final_state.approved_source_transcript_candidate_id,
@@ -926,6 +950,10 @@ def resume_transcription(
                 "evaluation_report_ref": final_state.evaluation_report_ref,
                 "regenerated_translation_draft_ref": final_state.regenerated_translation_draft_ref,
                 "improvement_proposal_refs": list(final_state.improvement_proposal_refs),
+                "resolution_ref": final_state.resolution_ref,
+                "resolution_kind": final_state.resolution_kind,
+                "failure_tags": list(final_state.failure_tags),
+                "residual_failure_tags": list(final_state.residual_failure_tags),
                 "approval_ref": final_state.approval_ref,
                 "approved_candidate_id": final_state.approved_candidate_id,
                 "approved_source_transcript_candidate_id": (
@@ -980,6 +1008,10 @@ def resume_transcription(
         failure_summary=failure_summary,
         failure_reasons=failure_reasons,
         review_required_stage=final_state.review_required_stage,
+        resolution_ref=final_state.resolution_ref,
+        resolution_kind=final_state.resolution_kind,
+        failure_tags=final_state.failure_tags,
+        residual_failure_tags=final_state.residual_failure_tags,
         approval_ref=final_state.approval_ref,
         approved_candidate_id=final_state.approved_candidate_id,
         approved_source_transcript_candidate_id=final_state.approved_source_transcript_candidate_id,
@@ -1019,6 +1051,33 @@ def approve_review(
         return approve_translation_review(
             run_id,
             candidate_id=candidate_id,
+            approved_by=approved_by,
+            note=note,
+            store=store,
+            blob_store=blob_store,
+        )
+
+
+def resolve_review(
+    run_id: str,
+    *,
+    resolution: str,
+    candidate_id: str | None = None,
+    failure_tags: tuple[str, ...] = (),
+    approved_by: str | None = None,
+    note: str | None = None,
+    settings: Settings | None = None,
+) -> dict[str, object]:
+    """Resolve a persisted translation review with graded human supervision."""
+
+    settings = settings or load_settings()
+    blob_store = LocalBlobStore(settings.blob_dir)
+    with _open_operational_store(settings) as store:
+        return resolve_translation_review(
+            run_id,
+            resolution_kind=resolution,  # type: ignore[arg-type]
+            candidate_id=candidate_id,
+            failure_tags=failure_tags,  # type: ignore[arg-type]
             approved_by=approved_by,
             note=note,
             store=store,

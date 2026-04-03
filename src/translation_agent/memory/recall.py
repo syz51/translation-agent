@@ -28,8 +28,15 @@ _SCOPE_ORDER: tuple[MemoryScopeKind, ...] = (
     "target_language",
     "global",
 )
-_REVIEW_CAPS = {"glossary": 2, "rule": 2, "semantic": 4, "episodic": 1}
-_ADJUDICATION_CAPS = {"glossary": 1, "rule": 1, "semantic": 2, "episodic": 1}
+_REVIEW_CAPS = {"glossary": 2, "rule": 2, "semantic": 4, "episodic": 1, "procedural": 2}
+_ADJUDICATION_CAPS = {
+    "glossary": 1,
+    "rule": 1,
+    "semantic": 2,
+    "episodic": 1,
+    "procedural": 1,
+}
+_GENERATION_CAPS = {"rule": 2, "procedural": 2}
 
 
 @dataclass(slots=True)
@@ -196,7 +203,7 @@ class LongTermMemoryRecallBackend:
             episodic_memory=tuple(entry for entry in ordered if entry.kind == "episodic"),
             glossary=tuple(entry for entry in ordered if entry.kind == "glossary"),
             rules=tuple(entry for entry in ordered if entry.kind == "rule"),
-            procedural_memory=(),
+            procedural_memory=tuple(entry for entry in ordered if entry.kind == "procedural"),
             provider_caveats=(_default_provider_caveat(),),
         )
 
@@ -261,14 +268,16 @@ def build_scope_key(
 
 
 def _bucket_score(entry: MemoryEntry, query: MemoryQuery) -> float:
+    metadata_match = _metadata_match_score(entry, query)
     semantic_relevance = _semantic_relevance(query.query_text, entry.content)
     lexical_relevance = _lexical_relevance(query.query_text, entry.content)
     quality_score = float(entry.score or 0.5)
     recency_score = _recency_score(entry)
     return round(
-        0.55 * semantic_relevance
-        + 0.20 * lexical_relevance
-        + 0.15 * quality_score
+        0.45 * metadata_match
+        + 0.25 * semantic_relevance
+        + 0.10 * lexical_relevance
+        + 0.10 * quality_score
         + 0.10 * recency_score,
         6,
     )
@@ -318,6 +327,12 @@ def _fact_key(entry: MemoryEntry) -> str:
         category_key = _normalize_text(category) if isinstance(category, str) else ""
         content_key = sha256(_normalize_text(entry.content).encode("utf-8")).hexdigest()
         return f"semantic:{category_key}:{content_key}"
+    if entry.kind == "procedural":
+        combo_key = entry.metadata.get("combo_key")
+        if isinstance(combo_key, str) and combo_key.strip():
+            return f"procedural:{combo_key}"
+        content_key = sha256(_normalize_text(entry.content).encode("utf-8")).hexdigest()
+        return f"procedural:{content_key}"
     event_id = entry.metadata.get("event_id") or entry.metadata.get("batch_id") or entry.memory_id
     return f"episodic:{event_id}"
 
@@ -330,9 +345,43 @@ def _bundle_kind(kind: str) -> str:
 
 def _caps_for_stage(stage: str) -> dict[str, int]:
     lowered = stage.casefold()
+    if "generate_translation" in lowered or "translation_generation" in lowered:
+        return dict(_GENERATION_CAPS)
     if "adjudicat" in lowered:
         return dict(_ADJUDICATION_CAPS)
     return dict(_REVIEW_CAPS)
+
+
+def _metadata_match_score(entry: MemoryEntry, query: MemoryQuery) -> float:
+    filters = 0
+    matches = 0.0
+    metadata = entry.metadata
+    if query.media_key is not None:
+        filters += 1
+        if metadata.get("media_key") == query.media_key:
+            matches += 1.0
+    if query.provider_ids:
+        filters += 1
+        if metadata.get("transcript_provider_id") in set(query.provider_ids):
+            matches += 1.0
+    if query.prompt_variant_ids:
+        filters += 1
+        if metadata.get("prompt_variant_id") in set(query.prompt_variant_ids):
+            matches += 1.0
+    if query.model_ids:
+        filters += 1
+        if metadata.get("model_id") in set(query.model_ids):
+            matches += 1.0
+    if query.failure_tags:
+        filters += 1
+        entry_tags = metadata.get("failure_tags")
+        if isinstance(entry_tags, (list, tuple, set)):
+            if set(query.failure_tags) & {str(tag) for tag in entry_tags}:
+                matches += 1.0
+    if filters == 0:
+        return 0.0
+    exact_bonus = 0.15 if matches == filters else 0.0
+    return round(min(1.0, matches / filters + exact_bonus), 6)
 
 
 def _tokens(value: str) -> list[str]:

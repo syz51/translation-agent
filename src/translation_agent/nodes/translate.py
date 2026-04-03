@@ -10,6 +10,7 @@ from translation_agent.graph.runtime import WorkflowRuntime
 from translation_agent.graph.state import GraphState, RoutingFact
 from translation_agent.models import RequestContext, TranscriptCandidate, TranslationCandidate
 from translation_agent.nodes.common import (
+    build_memory_query,
     build_request_context,
     raw_translation_candidate_key,
     select_transcript_candidates,
@@ -54,6 +55,21 @@ def generate_translation_candidates(
 
     for transcript in candidates:
         for prompt_variant_id in PROMPT_VARIANTS:
+            guidance_bundle = runtime.memory_recall_backend.recall_memory(
+                build_memory_query(
+                    state,
+                    stage="generate_translation_guidance",
+                    candidate_ids=(transcript.candidate_id,),
+                    provider_ids=(transcript.provider_id,),
+                    prompt_variant_ids=(prompt_variant_id,),
+                    model_ids=(runtime.translation_adapter.model_id,),
+                )
+            )
+            historical_instructions = tuple(
+                entry.content
+                for entry in (*guidance_bundle.rules, *guidance_bundle.procedural_memory)
+                if entry.content.strip()
+            )[:4]
             resolved_prompt = runtime.prompt_resolver.resolve_translation_prompt(
                 base_prompt_version=getattr(
                     runtime.translation_adapter,
@@ -74,6 +90,7 @@ def generate_translation_candidates(
                     "metadata": {
                         **request_context.metadata,
                         "resolved_translation_prompt": resolved_prompt.model_dump(mode="json"),
+                        "historical_translation_instructions": list(historical_instructions),
                     }
                 }
             )

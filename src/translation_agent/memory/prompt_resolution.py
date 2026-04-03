@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from hashlib import sha256
 from typing import Protocol, cast, runtime_checkable
 
@@ -58,8 +59,11 @@ class PromptResolver(Protocol):
 class ProposalBackedPromptResolver:
     """Apply exact-match active proposals and deterministic canary overlays."""
 
-    def __init__(self, proposal_store: object | None = None) -> None:
+    def __init__(
+        self, proposal_store: object | None = None, blob_store: object | None = None
+    ) -> None:
         self._proposal_store = proposal_store
+        self._blob_store = blob_store
 
     def resolve_translation_prompt(
         self,
@@ -84,11 +88,19 @@ class ProposalBackedPromptResolver:
             scope_kind=scope_kind,  # type: ignore[arg-type]
             scope_key=scope_key or f"{source_language}::{target_language}",
         )
+        self._promote_proposed_if_needed(
+            compatibility=compatibility,
+            media_key=media_key,
+        )
         active_proposals = self._matching_proposals(
-            compatibility=compatibility, status="active", media_key=media_key
+            compatibility=compatibility,
+            status="active",
+            media_key=media_key,
         )
         canary_proposals = self._matching_proposals(
-            compatibility=compatibility, status="canary", media_key=media_key
+            compatibility=compatibility,
+            status="canary",
+            media_key=media_key,
         )
         selected: tuple[PromptEvolutionProposal, ...]
         resolution_mode = "control"
@@ -129,7 +141,11 @@ class ProposalBackedPromptResolver:
     ) -> tuple[PromptEvolutionProposal, ...]:
         matched: list[PromptEvolutionProposal] = []
         if self._proposal_store is None:
-            return ()
+            return self._matching_blob_proposals(
+                compatibility=compatibility,
+                status=status,
+                media_key=media_key,
+            )
 
         if hasattr(self._proposal_store, "list_prompt_evolution_proposals"):
             query_store = cast(_ProposalQueryStore, self._proposal_store)
@@ -145,41 +161,125 @@ class ProposalBackedPromptResolver:
                     base_prompt_version=compatibility.base_prompt_version,
                     scope_kind=compatibility.scope_kind,
                     scope_key=compatibility.scope_key,
-                    media_key=media_key,
+                    media_key=None,
                 )
-                if _proposal_matches(proposal, compatibility)
+                if _proposal_matches(proposal, compatibility, media_key=media_key)
             )
 
-        if (
-            media_key is not None
-            and hasattr(self._proposal_store, "list_keys")
-            and hasattr(self._proposal_store, "read_bytes")
+        for proposal in self._matching_blob_proposals(
+            compatibility=compatibility,
+            status=status,
+            media_key=media_key,
         ):
-            blob_store = cast(_BlobProposalStore, self._proposal_store)
-            keys = sorted(blob_store.list_keys(asset_path(media_key, "improvement-proposals")))
-            for key in keys:
-                proposal = PromptEvolutionProposal.model_validate_json(blob_store.read_bytes(key))
-                if proposal.status != status or not _proposal_matches(proposal, compatibility):
-                    continue
-                if all(existing.proposal_id != proposal.proposal_id for existing in matched):
-                    matched.append(
-                        proposal.model_copy(
-                            update={
-                                "metadata": {
-                                    **proposal.metadata,
-                                    "asset_proposal_ref": key,
-                                }
-                            }
-                        )
-                    )
+            if all(existing.proposal_id != proposal.proposal_id for existing in matched):
+                matched.append(proposal)
         return tuple(sorted(matched, key=lambda proposal: proposal.proposal_id))
+
+    def _matching_blob_proposals(
+        self,
+        *,
+        compatibility: PromptCompatibilityTuple,
+        status: str,
+        media_key: str | None,
+    ) -> tuple[PromptEvolutionProposal, ...]:
+        store = self._blob_store if self._blob_store is not None else self._proposal_store
+        if (
+            media_key is None
+            or store is None
+            or not hasattr(store, "list_keys")
+            or not hasattr(store, "read_bytes")
+        ):
+            return ()
+        blob_store = cast(_BlobProposalStore, store)
+        matched: list[PromptEvolutionProposal] = []
+        keys = sorted(blob_store.list_keys(asset_path(media_key, "improvement-proposals")))
+        for key in keys:
+            proposal = PromptEvolutionProposal.model_validate_json(blob_store.read_bytes(key))
+            if proposal.status != status or not _proposal_matches(
+                proposal, compatibility, media_key=media_key
+            ):
+                continue
+            matched.append(
+                proposal.model_copy(
+                    update={
+                        "metadata": {
+                            **proposal.metadata,
+                            "asset_proposal_ref": key,
+                        }
+                    }
+                )
+            )
+        return tuple(matched)
+
+    def _promote_proposed_if_needed(
+        self,
+        *,
+        compatibility: PromptCompatibilityTuple,
+        media_key: str | None,
+    ) -> None:
+        if self._proposal_store is None or not hasattr(
+            self._proposal_store, "save_prompt_evolution_proposal"
+        ):
+            return
+        if self._matching_proposals(
+            compatibility=compatibility, status="active", media_key=media_key
+        ):
+            return
+        if self._matching_proposals(
+            compatibility=compatibility, status="canary", media_key=media_key
+        ):
+            return
+        proposed = self._matching_proposals(
+            compatibility=compatibility,
+            status="proposed",
+            media_key=media_key,
+        )
+        proposed = tuple(
+            proposal
+            for proposal in proposed
+            if proposal.metadata.get("proposal_origin") == "human_review_feedback"
+        )
+        if not proposed:
+            return
+        updated = proposed[0].model_copy(update={"status": "canary"})
+        save = getattr(self._proposal_store, "save_prompt_evolution_proposal", None)
+        if callable(save):
+            save(updated)
+        self._persist_proposal_artifact(updated)
+
+    def _persist_proposal_artifact(self, proposal: PromptEvolutionProposal) -> None:
+        store = self._blob_store if self._blob_store is not None else self._proposal_store
+        if store is None or not hasattr(store, "put_bytes"):
+            return
+        proposal_ref = proposal.metadata.get("proposal_ref")
+        if not isinstance(proposal_ref, str) or not proposal_ref.strip():
+            media_key = proposal.metadata.get("media_key")
+            if not isinstance(media_key, str) or not media_key.strip():
+                return
+            proposal_ref = asset_path(
+                media_key, "improvement-proposals", f"{proposal.proposal_id}.json"
+            )
+        blob_store = cast(object, store)
+        getattr(blob_store, "put_bytes")(
+            proposal_ref,
+            (json.dumps(proposal.model_dump(mode="json"), indent=2, sort_keys=True) + "\n").encode(
+                "utf-8"
+            ),
+        )
 
 
 def _proposal_matches(
     proposal: PromptEvolutionProposal,
     compatibility: PromptCompatibilityTuple,
+    *,
+    media_key: str | None,
 ) -> bool:
-    return proposal.compatibility == compatibility
+    if proposal.compatibility != compatibility:
+        return False
+    proposal_media_key = proposal.metadata.get("media_key")
+    if isinstance(proposal_media_key, str) and proposal_media_key.strip():
+        return proposal_media_key == media_key
+    return True
 
 
 def _proposal_refs(proposal: PromptEvolutionProposal) -> tuple[str, ...]:

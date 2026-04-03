@@ -328,6 +328,7 @@ class ChatCompletionTranslationAdapter:
                                 resolved_prompt=request_context.metadata.get(
                                     "resolved_translation_prompt"
                                 ),
+                                historical_instructions=_historical_instructions(request_context),
                             ),
                         }
                     ],
@@ -585,6 +586,7 @@ def _system_prompt(
     target_language: str,
     prompt_variant_id: str,
     resolved_prompt: object | None = None,
+    historical_instructions: tuple[str, ...] = (),
 ) -> str:
     if prompt_variant_id == "variant-b":
         directive = "Preserve tone and idioms when they remain faithful."
@@ -603,6 +605,10 @@ def _system_prompt(
     )
     if instructions:
         prompt += " Additional approved guidance: " + " ".join(instructions)
+    if historical_instructions:
+        prompt += " Historical guidance from prior operator review: " + " ".join(
+            historical_instructions
+        )
     return prompt
 
 
@@ -620,6 +626,13 @@ def _resolved_prompt_payload(request_context: RequestContext) -> dict[str, Any]:
     if isinstance(payload, dict):
         return payload
     return {}
+
+
+def _historical_instructions(request_context: RequestContext) -> tuple[str, ...]:
+    payload = request_context.metadata.get("historical_translation_instructions")
+    if not isinstance(payload, list):
+        return ()
+    return tuple(item for item in payload if isinstance(item, str) and item.strip())
 
 
 def _user_prompt(chunk: _TranslationChunk) -> str:

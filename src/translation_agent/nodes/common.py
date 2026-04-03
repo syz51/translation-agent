@@ -45,14 +45,35 @@ def build_memory_query(
     *,
     stage: str,
     candidate_ids: tuple[str, ...],
+    provider_ids: tuple[str, ...] = (),
+    prompt_variant_ids: tuple[str, ...] = (),
+    model_ids: tuple[str, ...] = (),
+    failure_tags: tuple[str, ...] = (),
 ) -> MemoryQuery:
     """Create a deterministic recall request for review and adjudication nodes."""
 
+    query_parts = [
+        stage,
+        f"{state.job.source_language}->{state.job.target_language}",
+    ]
+    if provider_ids:
+        query_parts.append("providers:" + ",".join(sorted(dict.fromkeys(provider_ids))))
+    if prompt_variant_ids:
+        query_parts.append("variants:" + ",".join(sorted(dict.fromkeys(prompt_variant_ids))))
+    if model_ids:
+        query_parts.append("models:" + ",".join(sorted(dict.fromkeys(model_ids))))
+    if failure_tags:
+        query_parts.append("failure_tags:" + ",".join(sorted(dict.fromkeys(failure_tags))))
     return MemoryQuery(
         job=state.job,
         stage=stage,
-        query_text=f"{stage} dry-run context for {state.job.project_id}",
+        query_text=" | ".join(query_parts),
         candidate_ids=candidate_ids,
+        provider_ids=provider_ids,
+        prompt_variant_ids=prompt_variant_ids,
+        model_ids=model_ids,
+        failure_tags=failure_tags,
+        media_key=state.job.media_key,
     )
 
 
@@ -202,6 +223,10 @@ def translation_failure_key(job: JobContext) -> str:
 
 def approval_record_key(job: JobContext) -> str:
     return job_path(job, "approvals", "translation.json")
+
+
+def review_resolution_key(job: JobContext) -> str:
+    return job_path(job, "review-resolutions", "translation.json")
 
 
 def transcript_approval_learning_key(job: JobContext) -> str:

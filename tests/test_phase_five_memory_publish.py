@@ -581,6 +581,56 @@ def test_phase_five_prompt_evolution_uses_runtime_model_selection() -> None:
     assert proposal is None
 
 
+def test_phase_five_recall_returns_procedural_memory_for_generation_context() -> None:
+    store = InMemoryLongTermMemoryStore()
+    consolidation_backend = DeterministicMemoryConsolidationBackend(store)
+    recall_backend = LongTermMemoryRecallBackend(store)
+    consolidation_backend.consolidate_batch(
+        MemoryWriteBatch(
+            batch_id="batch-guidance",
+            job_id="job-guidance",
+            source_stage="translation_human_resolution",
+            procedural_writes=(
+                MemoryWrite(
+                    kind="procedural",
+                    content="Reject mixed-script junk and unresolved transliterations.",
+                    scope_kind="pair",
+                    scope_key="en::fr",
+                    metadata={
+                        "dedupe_key": "procedural:subtitle-gibberish",
+                        "failure_tags": ["subtitle_gibberish"],
+                        "prompt_variant_id": "variant-a",
+                        "model_id": "gpt-5.4-mini",
+                        "transcript_provider_id": "assemblyai",
+                    },
+                ),
+            ),
+            metadata={
+                "tenant_id": "tenant-a",
+                "project_id": "project-1",
+                "source_language": "en",
+                "target_language": "fr",
+            },
+        )
+    )
+
+    recalled = recall_backend.recall_memory(
+        MemoryQuery(
+            job=_job_context(job_id="job-generation"),
+            stage="generate_translation_guidance",
+            query_text="generate_translation_guidance | en->fr | providers:assemblyai",
+            provider_ids=("assemblyai",),
+            prompt_variant_ids=("variant-a",),
+            model_ids=("gpt-5.4-mini",),
+        )
+    )
+
+    assert recalled.rules == ()
+    assert [entry.content for entry in recalled.procedural_memory] == [
+        "Reject mixed-script junk and unresolved transliterations."
+    ]
+
+
 @pytest.mark.parametrize("bucket", ["medium", "high"])
 def test_phase_five_prompt_evolution_keeps_higher_disagreement_gated(bucket: str) -> None:
     backend = DeterministicPromptEvolutionBackend()
