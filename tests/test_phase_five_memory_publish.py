@@ -248,13 +248,12 @@ def test_phase_five_happy_path_publishes_audit_ready_outputs(tmp_path: Path) -> 
         _artifact_path("exports", "translation.json"),
     ]
     assert scorecard["memory_consolidation_refs"]
-    assert scorecard["prompt_evolution_refs"] == []
+    assert len(scorecard["prompt_evolution_refs"]) == 1
+    assert "project-pair-consolidation" in scorecard["prompt_evolution_refs"][0]
     assert len(subtitles.events) == 1
     assert subtitles.events[0].text == "Bonjour tout le monde depuis le workflow."
     assert "speaker-" not in subtitles.events[0].text
-    assert not any(
-        "/memory/prompt-evolution/" in ref for ref in final_state.published_artifact_refs
-    )
+    assert any("/memory/prompt-evolution/" in ref for ref in final_state.published_artifact_refs)
 
 
 def test_phase_five_memory_drain_preserves_batch_order_in_routing_and_manifest(

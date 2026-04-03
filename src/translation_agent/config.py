@@ -84,7 +84,7 @@ class Settings(BaseSettings):
     openai_base_url: str | None = None
     default_source_language: str = "en"
     default_target_language: str = "zh"
-    translation_model_id: str = "gemini-3-flash"
+    translation_model_id: str = "gemini-2.5-flash"
     reasoning_provider: LlmProviderId = "openai"
     reasoning_model_id: str = "gpt-5.4"
     translation_prompt_version: str = "phase-3-v1"

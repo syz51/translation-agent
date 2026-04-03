@@ -15,12 +15,14 @@ import pysubs2
 
 from translation_agent.graph.runtime import WorkflowRuntime
 from translation_agent.graph.state import GraphState, RoutingFact
+from translation_agent.memory.recall import build_scope_key
 from translation_agent.models import (
     AssetRecord,
     EvaluatedRunReport,
     EvaluationFailure,
     EvaluationReport,
     HistoricalRunLink,
+    PromotionGateOutcome,
     PromptChange,
     PromptCompatibilityTuple,
     PromptEvolutionProposal,
@@ -30,6 +32,7 @@ from translation_agent.models import (
     ReferenceTranscript,
     RegeneratedTranslationDraft,
     Segment,
+    StrongerGraderScore,
     TranscriptAlignmentReport,
     TranscriptCandidate,
     TranscriptMismatchSpan,
@@ -125,6 +128,17 @@ def run_reference_evaluation(state: GraphState, runtime: WorkflowRuntime) -> dic
         evaluated_runs,
         current_compatibility,
     )
+    canary_stronger_grader, control_stronger_grader = _stronger_grader_reports(
+        canary_metrics,
+        control_metrics,
+    )
+    gate_outcome = _evaluation_gate_outcome(
+        canary_metrics=canary_metrics,
+        control_metrics=control_metrics,
+        canary_stronger_grader=canary_stronger_grader,
+        control_stronger_grader=control_stronger_grader,
+        proposal_refs=proposal_refs,
+    )
     report = EvaluationReport(
         evaluation_id=f"evaluation-{state.run_id}",
         run_id=state.run_id,
@@ -142,6 +156,9 @@ def run_reference_evaluation(state: GraphState, runtime: WorkflowRuntime) -> dic
         failures=tuple(failures),
         canary_metrics=canary_metrics,
         control_metrics=control_metrics,
+        canary_stronger_grader=canary_stronger_grader,
+        control_stronger_grader=control_stronger_grader,
+        gate_outcome=gate_outcome,
         proposal_compatibility=(current_compatibility,)
         if current_compatibility is not None
         else (),
@@ -336,8 +353,14 @@ def _translation_link_updates(
             "translation_prompt_variant_id": None,
             "translation_base_prompt_version": None,
             "translation_effective_prompt_version": None,
-            "prompt_scope_kind": "pair",
-            "prompt_scope_key": f"{state.job.source_language}::{state.job.target_language}",
+            "prompt_scope_kind": "project_pair",
+            "prompt_scope_key": build_scope_key(
+                scope_kind="project_pair",
+                tenant_id=state.job.tenant_id,
+                project_id=state.job.project_id,
+                source_language=state.job.source_language,
+                target_language=state.job.target_language,
+            ),
             "prompt_resolution_mode": None,
             "prompt_proposal_id": None,
         }
@@ -353,8 +376,18 @@ def _translation_link_updates(
             resolver.get("base_prompt_version") or translation.prompt_version
         ),
         "translation_effective_prompt_version": translation.prompt_version,
-        "prompt_scope_kind": "pair",
-        "prompt_scope_key": f"{state.job.source_language}::{state.job.target_language}",
+        "prompt_scope_kind": str(resolver.get("scope_kind"))
+        if resolver.get("scope_kind")
+        else "project_pair",
+        "prompt_scope_key": str(resolver.get("scope_key"))
+        if resolver.get("scope_key")
+        else build_scope_key(
+            scope_kind="project_pair",
+            tenant_id=state.job.tenant_id,
+            project_id=state.job.project_id,
+            source_language=state.job.source_language,
+            target_language=state.job.target_language,
+        ),
         "prompt_resolution_mode": str(resolver.get("resolution_mode"))
         if resolver.get("resolution_mode")
         else "control",
@@ -674,7 +707,7 @@ def _persist_improvement_proposals(
             state,
             runtime,
             compatibility=current_compatibility,
-            patterns=tuple(sorted(set(recurring_patterns))),
+            patterns=tuple(sorted(set(current_patterns))),
             evidence_refs=evaluation_refs,
             status="proposed",
         )
@@ -735,10 +768,10 @@ def _generate_regenerated_draft(
         model_id=runtime.translation_adapter.model_id,
         source_language=state.job.source_language,
         target_language=state.job.target_language,
+        tenant_id=state.job.tenant_id,
+        project_id=state.job.project_id,
         media_key=state.job.media_key,
         run_id=state.run_id,
-        scope_kind="pair",
-        scope_key=f"{state.job.source_language}::{state.job.target_language}",
     )
     base_request_context = build_request_context(state, runtime)
     request_context = base_request_context.model_copy(
@@ -878,8 +911,14 @@ def _current_run_compatibility(
         base_prompt_version=str(base_prompt_version),
         source_language=state.job.source_language,
         target_language=state.job.target_language,
-        scope_kind="pair",
-        scope_key=f"{state.job.source_language}::{state.job.target_language}",
+        scope_kind="project_pair",
+        scope_key=build_scope_key(
+            scope_kind="project_pair",
+            tenant_id=state.job.tenant_id,
+            project_id=state.job.project_id,
+            source_language=state.job.source_language,
+            target_language=state.job.target_language,
+        ),
     )
 
 
@@ -934,6 +973,15 @@ def _build_prompt_proposal(
             for pattern in patterns
         ),
         evidence_refs=evidence_refs,
+        promotion_status="candidate",
+        gate_outcome=PromotionGateOutcome(
+            heuristic_gate_pass=False,
+            stronger_grader_pass=False,
+            human_support_pass=False,
+            material_disagreement=False,
+            eligible_for_pair_promotion=False,
+            quality_gate_status="pending",
+        ),
         metadata={
             "proposal_origin": "reference_evaluation",
             "source_language": state.job.source_language,
@@ -942,6 +990,8 @@ def _build_prompt_proposal(
             "failure_patterns": list(patterns),
             "scope_kind": compatibility.scope_kind,
             "scope_key": compatibility.scope_key,
+            "tenant_id": state.job.tenant_id,
+            "project_id": state.job.project_id,
         },
     )
 
@@ -1053,6 +1103,17 @@ def _update_canary_status(
     )
     if canary_metrics is None:
         return proposal
+    canary_stronger_grader, control_stronger_grader = _stronger_grader_reports(
+        canary_metrics,
+        control_metrics,
+    )
+    gate_outcome = _evaluation_gate_outcome(
+        canary_metrics=canary_metrics,
+        control_metrics=control_metrics,
+        canary_stronger_grader=canary_stronger_grader,
+        control_stronger_grader=control_stronger_grader,
+        proposal_refs=(proposal.proposal_id,),
+    )
     status = proposal.status
     rollback_reason = proposal.rollback_reason
     if control_metrics is not None:
@@ -1076,7 +1137,8 @@ def _update_canary_status(
             status = "rolled_back"
             rollback_reason = "canary underperformed control on quality or severe failures"
         elif (
-            canary_metrics.run_count >= 30
+            gate_outcome.material_disagreement is False
+            and canary_metrics.run_count >= 30
             and canary_metrics.primary_quality_score >= control_metrics.primary_quality_score + 0.02
             and canary_metrics.segment_coverage >= control_metrics.segment_coverage - 0.01
             and canary_metrics.entity_consistency >= control_metrics.entity_consistency - 0.01
@@ -1096,7 +1158,98 @@ def _update_canary_status(
             "control_run_count": control_metrics.run_count if control_metrics is not None else 0,
             "canary_metrics": canary_metrics,
             "control_metrics": control_metrics or ProposalAggregateMetrics(),
+            "canary_stronger_grader": canary_stronger_grader,
+            "control_stronger_grader": control_stronger_grader,
+            "gate_outcome": gate_outcome,
         }
+    )
+
+
+def _stronger_grader_reports(
+    canary_metrics: ProposalAggregateMetrics | None,
+    control_metrics: ProposalAggregateMetrics | None,
+) -> tuple[StrongerGraderScore | None, StrongerGraderScore | None]:
+    return _stronger_grader_score(canary_metrics), _stronger_grader_score(control_metrics)
+
+
+def _stronger_grader_score(
+    metrics: ProposalAggregateMetrics | None,
+) -> StrongerGraderScore | None:
+    if metrics is None:
+        return None
+    confidence = round(min(max(metrics.run_count / 10.0, 0.1), 0.99), 4)
+    score = round(
+        max(
+            min(
+                0.5 * metrics.primary_quality_score
+                + 0.2 * metrics.faithfulness_judge
+                + 0.15 * metrics.entity_consistency
+                + 0.15 * (1.0 - max(metrics.omission_risk, metrics.addition_risk)),
+                1.0,
+            ),
+            0.0,
+        ),
+        4,
+    )
+    return StrongerGraderScore(
+        grader_id="fixed-rubric-judge",
+        grader_version="v1",
+        score=score,
+        confidence=confidence,
+        notes=("fallback_stronger_grader",),
+        metadata={"preferred_backend": "COMET/XCOMET", "backend_used": "fixed-rubric-judge"},
+    )
+
+
+def _evaluation_gate_outcome(
+    *,
+    canary_metrics: ProposalAggregateMetrics | None,
+    control_metrics: ProposalAggregateMetrics | None,
+    canary_stronger_grader: StrongerGraderScore | None,
+    control_stronger_grader: StrongerGraderScore | None,
+    proposal_refs: tuple[str, ...],
+) -> PromotionGateOutcome:
+    heuristic_gate_pass = bool(
+        canary_metrics is not None
+        and (
+            control_metrics is None
+            or canary_metrics.primary_quality_score >= control_metrics.primary_quality_score
+        )
+        and (
+            control_metrics is None
+            or canary_metrics.severe_failure_bucket_rate
+            <= control_metrics.severe_failure_bucket_rate
+        )
+    )
+    stronger_grader_pass = bool(
+        canary_stronger_grader is not None
+        and (
+            control_stronger_grader is None
+            or canary_stronger_grader.score >= control_stronger_grader.score
+        )
+    )
+    material_disagreement = bool(heuristic_gate_pass) != bool(stronger_grader_pass)
+    notes = []
+    if proposal_refs:
+        notes.append("proposal_artifacts_attached")
+    if material_disagreement:
+        notes.append("heuristic_stronger_grader_disagreement")
+    quality_gate_status = (
+        "disagreed"
+        if material_disagreement
+        else "passed"
+        if heuristic_gate_pass and stronger_grader_pass
+        else "failed"
+    )
+    return PromotionGateOutcome(
+        heuristic_gate_pass=heuristic_gate_pass,
+        stronger_grader_pass=stronger_grader_pass,
+        human_support_pass=False,
+        rollback_signal_present=False,
+        material_disagreement=material_disagreement,
+        eligible_for_pair_promotion=False,
+        quality_gate_status=quality_gate_status,  # type: ignore[arg-type]
+        notes=tuple(notes),
     )
 
 

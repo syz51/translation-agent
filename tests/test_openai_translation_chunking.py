@@ -198,6 +198,80 @@ def test_openai_translation_adapter_chunks_requests_and_aggregates_results(
     ]
 
 
+def test_gemini_translation_adapter_uses_chat_completions_endpoint(
+    tmp_path: Path,
+) -> None:
+    blob_store = LocalBlobStore(tmp_path / "blobs")
+    transport = SequencedTransport(
+        [
+            _json_response(
+                {
+                    "id": "chatcmpl-1",
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "full_text": "Bonjour alpha Bonjour beta Bonjour gamma",
+                                        "segments": [
+                                            {"segment_id": "seg-1", "target_text": "Bonjour alpha"},
+                                            {"segment_id": "seg-2", "target_text": "Bonjour beta"},
+                                            {"segment_id": "seg-3", "target_text": "Bonjour gamma"},
+                                        ],
+                                    }
+                                )
+                            }
+                        }
+                    ],
+                }
+            )
+        ]
+    )
+    adapter = OpenAITranslationAdapter(
+        api_key="test-key",  # pragma: allowlist secret
+        blob_store=blob_store,
+        provider_id="gemini",
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+        transport=transport,
+        retry_policy=RetryPolicy(max_attempts=1),
+        sleep=lambda _: None,
+        max_chunk_characters=200,
+        max_chunk_segments=10,
+    )
+
+    candidate = adapter.generate_translation(
+        _transcript_candidate(),
+        "variant-a",
+        _request_context(),
+    )
+
+    assert candidate.full_text == "Bonjour alpha Bonjour beta Bonjour gamma"
+    assert candidate.metadata["provider"]["provider_request_id"] == "chatcmpl-1"
+    assert len(transport.requests) == 1
+    assert transport.requests[0].url == (
+        "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+    )
+
+    assert transport.requests[0].body is not None
+    request_payload = json.loads(transport.requests[0].body.decode("utf-8"))
+    assert [message["role"] for message in request_payload["messages"]] == ["system", "user"]
+    assert request_payload["response_format"]["type"] == "json_schema"
+    assert request_payload["response_format"]["json_schema"]["name"] == "translation_chunk"
+
+
+def test_normalized_api_base_url_strips_endpoint_suffixes() -> None:
+    assert (
+        openai_translation_module._normalized_api_base_url(
+            "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+        )
+        == "https://generativelanguage.googleapis.com/v1beta/openai/"
+    )
+    assert (
+        openai_translation_module._normalized_api_base_url("https://api.openai.com/v1/responses")
+        == "https://api.openai.com/v1/"
+    )
+
+
 def test_openai_translation_adapter_splits_retryable_failed_chunks(
     tmp_path: Path,
 ) -> None:

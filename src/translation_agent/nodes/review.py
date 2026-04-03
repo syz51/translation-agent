@@ -27,12 +27,14 @@ from translation_agent.nodes.common import (
     translation_review_key,
     write_model_artifact,
 )
+from translation_agent.observability import TraceEvent
 from translation_agent.parallelism import ordered_parallel_map
 from translation_agent.review import (
     PARSER_VERSION,
     build_review_context,
     build_review_prompt,
     build_structured_review,
+    parse_reviewer_output,
     render_reviewer_output,
     review_bundle_from_draft,
     reviewer_roles_for_stage,
@@ -202,7 +204,12 @@ def _generate_and_persist_reviews(
     gathered = ordered_parallel_map(
         tasks,
         max_workers=runtime.parallelism.review_max_workers,
-        worker=lambda task: _build_review_bundle(state=state, task=task),
+        worker=lambda task: _build_review_bundle(
+            state=state,
+            runtime=runtime,
+            task=task,
+            bundle_total=len(tasks),
+        ),
         sort_key=lambda input_index, _task: (input_index,),
     )
     review_ids: list[str] = []
@@ -218,62 +225,105 @@ def _generate_and_persist_reviews(
 def _build_review_bundle(
     *,
     state: GraphState,
+    runtime: WorkflowRuntime,
     task: _ReviewTask,
+    bundle_total: int,
 ) -> ReviewBundle:
     stage = task.stage
     reviewer_role = task.reviewer_role
     candidates = task.candidates
     final_transcript = task.final_transcript
-    review_context = build_review_context(
-        run_id=state.run_id,
+    review_id = _review_id(
+        job=state.job,
         stage=stage,
         reviewer_role=reviewer_role,
-        job=state.job,
         candidate_ids=tuple(candidate.candidate_id for candidate in candidates),
-        memory_bundle=task.memory_bundle,
     )
-    candidate_refs = tuple(
-        transcript_candidate_key(state.job, candidate.candidate_id)
-        if stage == TRANSCRIPT_REVIEW_STAGE
-        else translation_candidate_key(state.job, candidate.candidate_id)
-        for candidate in candidates
+    runtime.trace_sink.record(
+        TraceEvent(
+            run_id=state.run_id,
+            name="review.bundle.started",
+            attributes={
+                "review_stage": stage,
+                "reviewer_role": reviewer_role,
+                "bundle_total": bundle_total,
+            },
+        )
     )
-    raw_payload_refs = _raw_payload_refs(stage=stage, candidates=candidates)
-    prompt_text = build_review_prompt(
-        review_context,
-        candidate_refs=candidate_refs,
-        raw_payload_refs=raw_payload_refs,
-        final_transcript_ref=(
-            transcript_candidate_key(state.job, final_transcript.candidate_id)
-            if final_transcript is not None
-            else None
-        ),
-    )
-    raw_review_text = render_reviewer_output(
-        review_context,
-        candidates=candidates,
-        prompt_text=prompt_text,
-        final_transcript=final_transcript,
-    )
-    draft = build_structured_review(
-        review_context,
-        candidates=candidates,
-        final_transcript=final_transcript,
-    )
-    review = review_bundle_from_draft(
-        review_id=_review_id(
-            job=state.job,
+    try:
+        review_context = build_review_context(
+            run_id=state.run_id,
             stage=stage,
             reviewer_role=reviewer_role,
+            job=state.job,
             candidate_ids=tuple(candidate.candidate_id for candidate in candidates),
-        ),
-        job_id=state.job.job_id,
-        stage=stage,
-        reviewer_role=reviewer_role,
-        raw_review_text=raw_review_text,
-        draft=draft,
-    ).model_copy(update={"parser_version": PARSER_VERSION})
-    return review
+            memory_bundle=task.memory_bundle,
+        )
+        candidate_refs = tuple(
+            transcript_candidate_key(state.job, candidate.candidate_id)
+            if stage == TRANSCRIPT_REVIEW_STAGE
+            else translation_candidate_key(state.job, candidate.candidate_id)
+            for candidate in candidates
+        )
+        raw_payload_refs = _raw_payload_refs(stage=stage, candidates=candidates)
+        prompt_text = build_review_prompt(
+            review_context,
+            candidate_refs=candidate_refs,
+            raw_payload_refs=raw_payload_refs,
+            final_transcript_ref=(
+                transcript_candidate_key(state.job, final_transcript.candidate_id)
+                if final_transcript is not None
+                else None
+            ),
+        )
+        raw_review_text = render_reviewer_output(
+            review_context,
+            candidates=candidates,
+            prompt_text=prompt_text,
+            final_transcript=final_transcript,
+        )
+        draft = build_structured_review(
+            review_context,
+            candidates=candidates,
+            final_transcript=final_transcript,
+        )
+        parsed = parse_reviewer_output(raw_review_text)
+        _validate_rendered_review_against_draft(parsed=parsed, draft=draft)
+        review = review_bundle_from_draft(
+            review_id=review_id,
+            job_id=state.job.job_id,
+            stage=stage,
+            reviewer_role=reviewer_role,
+            raw_review_text=raw_review_text,
+            draft=draft,
+        ).model_copy(update={"parser_version": PARSER_VERSION})
+        runtime.trace_sink.record(
+            TraceEvent(
+                run_id=state.run_id,
+                name="review.bundle.completed",
+                attributes={
+                    "review_stage": stage,
+                    "reviewer_role": reviewer_role,
+                    "bundle_total": bundle_total,
+                    "review_id": review_id,
+                },
+            )
+        )
+        return review
+    except Exception as exc:
+        runtime.trace_sink.record(
+            TraceEvent(
+                run_id=state.run_id,
+                name="review.bundle.failed",
+                attributes={
+                    "review_stage": stage,
+                    "reviewer_role": reviewer_role,
+                    "bundle_total": bundle_total,
+                    "error": str(exc),
+                },
+            )
+        )
+        raise
 
 
 def _load_final_transcript_candidate(
@@ -341,3 +391,15 @@ def _raw_payload_refs(
         for candidate in candidates
         if isinstance(candidate, TranslationCandidate) and candidate.raw_response_ref is not None
     )
+
+
+def _validate_rendered_review_against_draft(*, parsed, draft) -> None:  # noqa: ANN001
+    expected_winner = (
+        draft.candidate_preferences[0].candidate_id if draft.candidate_preferences else None
+    )
+    if parsed.winner_candidate_id != expected_winner:
+        raise ValueError("rendered reviewer winner does not match structured draft")
+    if round(parsed.confidence, 2) != round(draft.confidence, 2):
+        raise ValueError("rendered reviewer confidence does not match structured draft")
+    if parsed.escalation_signal != draft.escalation_signal:
+        raise ValueError("rendered reviewer escalation flag does not match structured draft")

@@ -44,7 +44,7 @@ Notes:
 - real mode defaults to all three transcription providers when `TA_TRANSCRIPTION_PROVIDERS` is unset
 - real mode optionally supports a comma-separated transcription-provider subset via `TA_TRANSCRIPTION_PROVIDERS`
 - real mode credential requirements depend on the selected transcription providers plus the selected translation provider
-- real mode translation defaults to `TA_TRANSLATION_PROVIDER=gemini` with `TA_TRANSLATION_MODEL_ID=gemini-3-flash`
+- real mode translation defaults to `TA_TRANSLATION_PROVIDER=gemini` with `TA_TRANSLATION_MODEL_ID=gemini-2.5-flash`
 - real mode also exposes a reasoning profile that defaults to `TA_REASONING_PROVIDER=openai` with `TA_REASONING_MODEL_ID=gpt-5.4`, but review and adjudication still run deterministically in this pass
 - real mode is currently gated behind the LangGraph Python 3.14 compatibility check unless `TA_ALLOW_LANGGRAPH_PY314_WARNING=1` is set
 - fake mode still writes the full run record, trace, blob artifacts, scorecards, memory batches, consolidations, and prompt-evolution proposals
@@ -352,7 +352,7 @@ The settings model accepts more fields than most users need. These are the ones 
 | `TA_SPEECHMATICS_API_KEY` | Speechmatics credential for real mode |
 | `TA_DEEPGRAM_API_KEY` | Deepgram credential for real mode |
 | `TA_TRANSLATION_PROVIDER` | translation provider for real mode: `gemini` or `openai` |
-| `TA_TRANSLATION_MODEL_ID` | translation model ID for real mode; defaults to `gemini-3-flash` |
+| `TA_TRANSLATION_MODEL_ID` | translation model ID for real mode; defaults to `gemini-2.5-flash` |
 | `TA_REASONING_PROVIDER` | configured reasoning provider profile; defaults to `openai` |
 | `TA_REASONING_MODEL_ID` | configured reasoning model profile; defaults to `gpt-5.4` |
 | `TA_GEMINI_API_KEY` | Gemini credential for real-mode translation when `TA_TRANSLATION_PROVIDER=gemini` |

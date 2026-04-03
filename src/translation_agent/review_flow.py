@@ -12,6 +12,11 @@ from typing import Any, cast
 
 from translation_agent.graph import GraphState, build_phase_two_runtime
 from translation_agent.graph.state import RoutingFact
+from translation_agent.memory.staging import (
+    apply_scope_defaults,
+    batch_metadata_for_job,
+    project_pair_scope_key,
+)
 from translation_agent.models import (
     FailureTag,
     FinalTranslationDecision,
@@ -2277,24 +2282,23 @@ def _write_resolution_learning_memory(
     learning_ref: str | None,
 ) -> tuple[MemoryWriteBatch, str, tuple[RoutingFact, ...]]:
     now = resolution.resolved_at
-    project_scope_key = (
-        f"{context.job.tenant_id}::{context.job.project_id}::"
-        f"{context.job.source_language}::{context.job.target_language}"
-    )
-    pair_scope_key = f"{context.job.source_language}::{context.job.target_language}"
+    project_scope_key = project_pair_scope_key(context.job)
     semantic_writes: list[MemoryWrite] = []
     episodic_writes: list[MemoryWrite] = [
         MemoryWrite(
             kind="episodic",
+            memory_subtype="project_fact",
             content=(
                 f"Human review resolved {resolution.resolution_kind} "
                 f"for run {context.run_record.run_id}."
             ),
-            scope_kind="project_pair",
-            scope_key=project_scope_key,
             updated_at=now,
             score=0.95 if resolution.resolution_kind == "approved_good" else 0.7,
             source_ref=resolution_ref,
+            promotion_status="candidate",
+            evidence_count=1,
+            supporting_run_count=1,
+            supporting_asset_count=1,
             metadata={
                 "dedupe_key": f"resolution:event:{context.run_record.run_id}",
                 "event_id": context.run_record.run_id,
@@ -2309,15 +2313,19 @@ def _write_resolution_learning_memory(
         semantic_writes.append(
             MemoryWrite(
                 kind="semantic",
+                memory_subtype="project_fact",
                 content=(
                     f"Operator review for {context.job.media_key} preferred transcript provider "
                     f"{resolution.transcript_provider_id} under {resolution.resolution_kind}."
                 ),
-                scope_kind="project_pair",
-                scope_key=project_scope_key,
                 updated_at=now,
                 score=0.95 if resolution.resolution_kind == "approved_good" else 0.7,
                 source_ref=learning_ref or resolution_ref,
+                promotion_status="candidate",
+                evidence_count=1,
+                supporting_run_count=1,
+                supporting_asset_count=1,
+                supporting_project_count=1,
                 metadata={
                     "dedupe_key": (
                         f"resolution:provider:{resolution.transcript_provider_id}:"
@@ -2335,16 +2343,20 @@ def _write_resolution_learning_memory(
         procedural_writes.append(
             MemoryWrite(
                 kind="procedural",
+                memory_subtype="prompt_guidance",
                 content=(
                     "Favor translation combo "
                     f"{resolution.combo_key} when review context is similar, "
                     f"but keep contradiction checks blocking."
                 ),
-                scope_kind="pair",
-                scope_key=pair_scope_key,
                 updated_at=now,
                 score=0.92 if resolution.resolution_kind == "approved_good" else 0.65,
                 source_ref=learning_ref or resolution_ref,
+                promotion_status="candidate",
+                evidence_count=1,
+                supporting_run_count=1,
+                supporting_asset_count=1,
+                supporting_project_count=1,
                 metadata={
                     "dedupe_key": f"resolution:combo:{resolution.combo_key}",
                     "supervision_kind": resolution.resolution_kind,
@@ -2365,14 +2377,18 @@ def _write_resolution_learning_memory(
             procedural_writes.append(
                 MemoryWrite(
                     kind="procedural",
+                    memory_subtype="prompt_guidance",
                     content=_failure_tag_instruction(tag),
-                    scope_kind="pair",
-                    scope_key=pair_scope_key,
                     updated_at=now,
                     score=0.78,
                     source_ref=resolution_ref,
+                    promotion_status="candidate",
+                    evidence_count=1,
+                    supporting_run_count=1,
+                    supporting_asset_count=1,
+                    supporting_project_count=1,
                     metadata={
-                        "dedupe_key": f"resolution:anti-pattern:{tag}:{pair_scope_key}",
+                        "dedupe_key": f"resolution:anti-pattern:{tag}:{project_scope_key}",
                         "supervision_kind": resolution.resolution_kind,
                         "supervision_strength": resolution.supervision_strength,
                         "failure_tags": [tag],
@@ -2394,26 +2410,32 @@ def _write_resolution_learning_memory(
         translation_model_winner=resolution.model_id,
         prompt_variant_winner=resolution.prompt_variant_id,
         prompt_version_winner=resolution.prompt_version,
-        semantic_writes=tuple(semantic_writes),
-        episodic_writes=tuple(episodic_writes),
-        procedural_writes=tuple(procedural_writes),
+        semantic_writes=tuple(
+            apply_scope_defaults(write, job=context.job) for write in semantic_writes
+        ),
+        episodic_writes=tuple(
+            apply_scope_defaults(write, job=context.job) for write in episodic_writes
+        ),
+        procedural_writes=tuple(
+            apply_scope_defaults(write, job=context.job) for write in procedural_writes
+        ),
         dedupe_keys=tuple(
             write.metadata["dedupe_key"]
             for write in (*semantic_writes, *episodic_writes, *procedural_writes)
         ),
-        metadata={
-            "resolution_kind": resolution.resolution_kind,
-            "approved_by": resolution.approved_by,
-            "failure_tags": list(resolution.failure_tags),
-            "supervision_kind": resolution.resolution_kind,
-            "supervision_strength": resolution.supervision_strength,
-            "transcript_provider_id": resolution.transcript_provider_id,
-            "prompt_variant_id": resolution.prompt_variant_id,
-            "prompt_version": resolution.prompt_version,
-            "model_id": resolution.model_id,
-            "combo_key": resolution.combo_key,
-            "media_key": context.job.media_key,
-        },
+        metadata=batch_metadata_for_job(
+            context.job,
+            resolution_kind=resolution.resolution_kind,
+            approved_by=resolution.approved_by,
+            failure_tags=list(resolution.failure_tags),
+            supervision_kind=resolution.resolution_kind,
+            supervision_strength=resolution.supervision_strength,
+            transcript_provider_id=resolution.transcript_provider_id,
+            prompt_variant_id=resolution.prompt_variant_id,
+            prompt_version=resolution.prompt_version,
+            model_id=resolution.model_id,
+            combo_key=resolution.combo_key,
+        ),
     )
     context.store.save_batch(batch, storage_job_id=operational_job_key(context.job))
     batch_ref = write_model_artifact(
@@ -2696,8 +2718,8 @@ def _compatibility_for_candidate_context(
         base_prompt_version=candidate.base_prompt_version,
         source_language=job.source_language,
         target_language=job.target_language,
-        scope_kind="pair",
-        scope_key=f"{job.source_language}::{job.target_language}",
+        scope_kind="project_pair",
+        scope_key=project_pair_scope_key(job),
     )
 
 
@@ -2808,6 +2830,7 @@ def _build_feedback_prompt_proposal(
             "target_language": context.job.target_language,
             "scope_kind": compatibility.scope_kind,
             "scope_key": compatibility.scope_key,
+            "human_backed_support": True,
         },
     )
 

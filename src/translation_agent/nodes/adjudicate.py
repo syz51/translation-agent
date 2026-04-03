@@ -220,7 +220,7 @@ def adjudicate_translation(state: GraphState, runtime: WorkflowRuntime) -> dict[
             "final_translation_candidate_id": None,
             "final_transcript_candidate_id": state.final_transcript_candidate_id,
             "final_translation_decision_ref": decision_ref,
-            "pending_memory_source_stage": None,
+            "pending_memory_source_stage": "translation_adjudication",
             "escalation_pending": True,
             "human_review_required": True,
             "review_required_stage": None,

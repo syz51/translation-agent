@@ -22,20 +22,48 @@ from translation_agent.storage import BlobStore
 
 _TOKEN_RE = re.compile(r"\w+", re.UNICODE)
 _SCOPE_ORDER: tuple[MemoryScopeKind, ...] = (
+    "asset",
     "project_pair",
     "pair",
     "source_language",
     "target_language",
     "global",
 )
-_REVIEW_CAPS = {"glossary": 2, "rule": 2, "semantic": 4, "episodic": 1, "procedural": 2}
-_ADJUDICATION_CAPS = {
+_SCOPE_WEIGHTS = {
+    "asset": 1.0,
+    "project_pair": 0.9,
+    "pair": 0.75,
+    "source_language": 0.55,
+    "target_language": 0.5,
+    "global": 0.35,
+}
+_SUBTYPE_WEIGHTS = {
+    "glossary": 1.0,
+    "style_rule": 0.88,
+    "provider_caveat": 0.7,
+    "language_convention": 0.84,
+    "project_fact": 0.78,
+    "failure_pattern": 0.82,
+    "escalation_pattern": 0.8,
+    "prompt_guidance": 0.94,
+    None: 0.6,
+}
+_TRANSLATION_REVIEW_CAPS = {
+    "glossary": 2,
+    "rule": 2,
+    "semantic": 4,
+    "episodic": 2,
+    "procedural": 2,
+}
+_TRANSCRIPT_REVIEW_CAPS = {"glossary": 2, "rule": 2, "semantic": 4, "episodic": 1}
+_TRANSLATION_ADJUDICATION_CAPS = {
     "glossary": 1,
     "rule": 1,
     "semantic": 2,
     "episodic": 1,
     "procedural": 1,
 }
+_TRANSCRIPT_ADJUDICATION_CAPS = {"glossary": 1, "rule": 1, "semantic": 2, "episodic": 1}
 _GENERATION_CAPS = {"rule": 2, "procedural": 2}
 
 
@@ -160,42 +188,40 @@ class LongTermMemoryRecallBackend:
     def recall_memory(self, query: MemoryQuery) -> MemoryBundle:
         caps = _caps_for_stage(query.stage)
         allowed_kinds = set(caps)
-        buckets: dict[MemoryScopeKind, list[tuple[float, float, datetime, str, MemoryEntry]]] = {
+        buckets: dict[MemoryScopeKind, list[tuple[float, datetime, str, MemoryEntry]]] = {
             scope_kind: [] for scope_kind in _SCOPE_ORDER
         }
 
         for entry in self._store.list_entries():
             if not _eligible(entry, query, allowed_kinds):
                 continue
-            score = _bucket_score(entry, query)
-            quality = float(entry.score or 0.5)
             updated_at = entry.updated_at or datetime.fromtimestamp(0, tz=UTC)
             buckets[entry.scope_kind or "global"].append(
-                (score, quality, updated_at, entry.memory_id, entry)
+                (_ranking_score(entry, query), updated_at, entry.memory_id, entry)
             )
 
         counts = {kind: 0 for kind in caps}
         kept: dict[str, MemoryEntry] = {}
         ordered: list[MemoryEntry] = []
+        total_cap = min(query.max_items, sum(caps.values()))
         for scope_kind in _SCOPE_ORDER:
             ranked = sorted(
                 buckets[scope_kind],
-                key=lambda item: (-item[0], -item[1], -item[2].timestamp(), item[3]),
+                key=lambda item: (-item[0], -item[1].timestamp(), item[2]),
             )
-            for _, _, _, _, entry in ranked:
+            for _, _, _, entry in ranked:
                 kind = _bundle_kind(entry.kind)
-                if counts[kind] >= caps[kind]:
+                if counts.get(kind, 0) >= caps.get(kind, 0):
                     continue
                 fact_key = _fact_key(entry)
-                existing = kept.get(fact_key)
-                if existing is not None:
+                if fact_key in kept:
                     continue
                 kept[fact_key] = entry
-                counts[kind] += 1
+                counts[kind] = counts.get(kind, 0) + 1
                 ordered.append(entry)
-                if sum(counts.values()) >= min(query.max_items, sum(caps.values())):
+                if sum(counts.values()) >= total_cap:
                     break
-            if sum(counts.values()) >= min(query.max_items, sum(caps.values())):
+            if sum(counts.values()) >= total_cap:
                 break
 
         return MemoryBundle(
@@ -213,6 +239,8 @@ def _eligible(entry: MemoryEntry, query: MemoryQuery, allowed_kinds: set[str]) -
         return False
     if entry.kind not in allowed_kinds:
         return False
+    if entry.kind == "procedural" and not _procedural_stage_allowed(query.stage):
+        return False
     if entry.lifecycle_status != "active":
         return False
     if entry.expires_at is not None and entry.expires_at <= datetime.now(UTC):
@@ -224,6 +252,8 @@ def _eligible(entry: MemoryEntry, query: MemoryQuery, allowed_kinds: set[str]) -
 
 def _scope_compatible(entry: MemoryEntry, query: MemoryQuery) -> bool:
     scope_kind = entry.scope_kind
+    if scope_kind == "asset":
+        return query.media_key is not None and entry.scope_key == query.media_key
     if scope_kind == "project_pair":
         return entry.scope_key == project_pair_scope_key(query)
     if scope_kind == "pair":
@@ -238,14 +268,23 @@ def _scope_compatible(entry: MemoryEntry, query: MemoryQuery) -> bool:
 
 
 def project_pair_scope_key(query: MemoryQuery) -> str:
-    return (
-        f"{query.job.tenant_id}::{query.job.project_id}::"
-        f"{query.job.source_language}::{query.job.target_language}"
+    return build_scope_key(
+        scope_kind="project_pair",
+        tenant_id=query.job.tenant_id,
+        project_id=query.job.project_id,
+        source_language=query.job.source_language,
+        target_language=query.job.target_language,
     )
 
 
 def pair_scope_key(query: MemoryQuery) -> str:
-    return f"{query.job.source_language}::{query.job.target_language}"
+    return build_scope_key(
+        scope_kind="pair",
+        tenant_id=query.job.tenant_id,
+        project_id=query.job.project_id,
+        source_language=query.job.source_language,
+        target_language=query.job.target_language,
+    )
 
 
 def build_scope_key(
@@ -256,6 +295,8 @@ def build_scope_key(
     source_language: str,
     target_language: str,
 ) -> str:
+    if scope_kind == "asset":
+        return "global"
     if scope_kind == "project_pair":
         return f"{tenant_id}::{project_id}::{source_language}::{target_language}"
     if scope_kind == "pair":
@@ -267,18 +308,24 @@ def build_scope_key(
     return "global"
 
 
-def _bucket_score(entry: MemoryEntry, query: MemoryQuery) -> float:
+def _ranking_score(entry: MemoryEntry, query: MemoryQuery) -> float:
+    scope_weight = _SCOPE_WEIGHTS.get(entry.scope_kind or "global", 0.0)
+    subtype_weight = _SUBTYPE_WEIGHTS.get(entry.memory_subtype, 0.6)
     metadata_match = _metadata_match_score(entry, query)
     semantic_relevance = _semantic_relevance(query.query_text, entry.content)
     lexical_relevance = _lexical_relevance(query.query_text, entry.content)
+    evidence_score = _evidence_score(entry)
     quality_score = float(entry.score or 0.5)
     recency_score = _recency_score(entry)
     return round(
-        0.45 * metadata_match
-        + 0.25 * semantic_relevance
-        + 0.10 * lexical_relevance
-        + 0.10 * quality_score
-        + 0.10 * recency_score,
+        0.32 * scope_weight
+        + 0.13 * subtype_weight
+        + 0.18 * metadata_match
+        + 0.12 * semantic_relevance
+        + 0.05 * lexical_relevance
+        + 0.10 * evidence_score
+        + 0.05 * quality_score
+        + 0.05 * recency_score,
         6,
     )
 
@@ -289,7 +336,7 @@ def _semantic_relevance(query_text: str, content: str) -> float:
     if not query_tokens or not content_tokens:
         return 0.0
     overlap = len(query_tokens & content_tokens) / len(query_tokens | content_tokens)
-    subsequence = 1.0 if " ".join(query_tokens) in content.casefold() else 0.0
+    subsequence = 1.0 if " ".join(sorted(query_tokens)) in content.casefold() else 0.0
     return round(min(1.0, overlap * 0.8 + subsequence * 0.2), 6)
 
 
@@ -303,17 +350,34 @@ def _lexical_relevance(query_text: str, content: str) -> float:
     return round(len(query_set & content_set) / max(len(query_set), 1), 6)
 
 
+def _evidence_score(entry: MemoryEntry) -> float:
+    max_support = max(
+        entry.evidence_count,
+        entry.supporting_run_count,
+        entry.supporting_asset_count,
+        entry.supporting_project_count,
+        0,
+    )
+    contradictions = entry.contradiction_count
+    if max_support <= 0 and contradictions <= 0:
+        return 0.0
+    support_score = min(max_support / 10.0, 1.0)
+    contradiction_penalty = min(contradictions / max(max_support, 1), 1.0)
+    return round(max(support_score - contradiction_penalty, 0.0), 6)
+
+
 def _recency_score(entry: MemoryEntry) -> float:
     if entry.kind in {"glossary", "rule"}:
         return 1.0
     if entry.updated_at is None:
         return 0.0
     age_days = max((datetime.now(UTC) - entry.updated_at).total_seconds() / 86400.0, 0.0)
-    half_life_days = 180.0 if entry.kind == "semantic" else 30.0
+    half_life_days = 180.0 if entry.kind == "semantic" else 45.0
     return round(math.exp(-math.log(2.0) * age_days / half_life_days), 6)
 
 
 def _fact_key(entry: MemoryEntry) -> str:
+    subtype = entry.memory_subtype or "generic"
     if entry.kind == "glossary":
         term_key = entry.metadata.get("fact_key") or entry.metadata.get("term")
         if isinstance(term_key, str) and term_key.strip():
@@ -324,17 +388,17 @@ def _fact_key(entry: MemoryEntry) -> str:
         return f"rule:{sha256(_normalize_text(str(rule_text)).encode('utf-8')).hexdigest()}"
     if entry.kind == "semantic":
         category = entry.metadata.get("category")
-        category_key = _normalize_text(category) if isinstance(category, str) else ""
+        category_key = _normalize_text(category) if isinstance(category, str) else subtype
         content_key = sha256(_normalize_text(entry.content).encode("utf-8")).hexdigest()
         return f"semantic:{category_key}:{content_key}"
     if entry.kind == "procedural":
         combo_key = entry.metadata.get("combo_key")
         if isinstance(combo_key, str) and combo_key.strip():
-            return f"procedural:{combo_key}"
+            return f"procedural:{subtype}:{combo_key}"
         content_key = sha256(_normalize_text(entry.content).encode("utf-8")).hexdigest()
-        return f"procedural:{content_key}"
+        return f"procedural:{subtype}:{content_key}"
     event_id = entry.metadata.get("event_id") or entry.metadata.get("batch_id") or entry.memory_id
-    return f"episodic:{event_id}"
+    return f"episodic:{subtype}:{event_id}"
 
 
 def _bundle_kind(kind: str) -> str:
@@ -347,9 +411,20 @@ def _caps_for_stage(stage: str) -> dict[str, int]:
     lowered = stage.casefold()
     if "generate_translation" in lowered or "translation_generation" in lowered:
         return dict(_GENERATION_CAPS)
+    if "adjudicat" in lowered and "translation" in lowered:
+        return dict(_TRANSLATION_ADJUDICATION_CAPS)
     if "adjudicat" in lowered:
-        return dict(_ADJUDICATION_CAPS)
-    return dict(_REVIEW_CAPS)
+        return dict(_TRANSCRIPT_ADJUDICATION_CAPS)
+    if "translation" in lowered:
+        return dict(_TRANSLATION_REVIEW_CAPS)
+    return dict(_TRANSCRIPT_REVIEW_CAPS)
+
+
+def _procedural_stage_allowed(stage: str) -> bool:
+    lowered = stage.casefold()
+    if "generate_translation" in lowered or "translation_generation" in lowered:
+        return True
+    return "translation" in lowered and ("review" in lowered or "adjudicat" in lowered)
 
 
 def _metadata_match_score(entry: MemoryEntry, query: MemoryQuery) -> float:
@@ -358,7 +433,7 @@ def _metadata_match_score(entry: MemoryEntry, query: MemoryQuery) -> float:
     metadata = entry.metadata
     if query.media_key is not None:
         filters += 1
-        if metadata.get("media_key") == query.media_key:
+        if metadata.get("media_key") == query.media_key or entry.scope_key == query.media_key:
             matches += 1.0
     if query.provider_ids:
         filters += 1
@@ -372,12 +447,48 @@ def _metadata_match_score(entry: MemoryEntry, query: MemoryQuery) -> float:
         filters += 1
         if metadata.get("model_id") in set(query.model_ids):
             matches += 1.0
+    if query.disagreement_bucket is not None:
+        filters += 1
+        if (
+            metadata.get("source_disagreement_bucket") == query.disagreement_bucket
+            or metadata.get("disagreement_bucket") == query.disagreement_bucket
+        ):
+            matches += 1.0
     if query.failure_tags:
         filters += 1
         entry_tags = metadata.get("failure_tags")
         if isinstance(entry_tags, (list, tuple, set)):
             if set(query.failure_tags) & {str(tag) for tag in entry_tags}:
                 matches += 1.0
+    if query.escalation_reasons:
+        filters += 1
+        entry_reasons = metadata.get("escalation_reasons")
+        if isinstance(entry_reasons, (list, tuple, set)):
+            if set(query.escalation_reasons) & {str(reason) for reason in entry_reasons}:
+                matches += 1.0
+    if query.glossary_misses:
+        filters += 1
+        glossary_misses = metadata.get("glossary_misses")
+        if isinstance(glossary_misses, (list, tuple, set)):
+            if set(query.glossary_misses) & {str(item) for item in glossary_misses}:
+                matches += 1.0
+    if query.entities:
+        filters += 1
+        entities = metadata.get("entities")
+        if isinstance(entities, (list, tuple, set)):
+            if set(query.entities) & {str(item) for item in entities}:
+                matches += 1.0
+    if query.numbers_dates:
+        filters += 1
+        numbers_dates = metadata.get("numbers_dates")
+        if isinstance(numbers_dates, (list, tuple, set)):
+            if set(query.numbers_dates) & {str(item) for item in numbers_dates}:
+                matches += 1.0
+    if query.candidate_ids:
+        filters += 1
+        candidate_id = metadata.get("candidate_id")
+        if isinstance(candidate_id, str) and candidate_id in set(query.candidate_ids):
+            matches += 1.0
     if filters == 0:
         return 0.0
     exact_bonus = 0.15 if matches == filters else 0.0

@@ -458,6 +458,7 @@ def test_phase_one_protocols_accept_fake_implementations(tmp_path: Path) -> None
             )
 
     class FakeTranslator:
+        provider_id = "fake-translation"
         model_id = "fake-translation-model"
 
         def generate_translation(

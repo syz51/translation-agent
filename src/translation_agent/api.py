@@ -44,12 +44,22 @@ from translation_agent.observability.events import (
     get_structured_logger,
     log_structured_event,
 )
-from translation_agent.observability.tracing import JsonlTraceSink, TraceEvent
+from translation_agent.observability.tracing import (
+    CompositeTraceSink,
+    JsonlTraceSink,
+    TraceEvent,
+    TraceSink,
+)
 from translation_agent.review_flow import (
     approve_translation_review,
     build_review_payload,
     resolve_translation_review,
     save_review_draft_resolution,
+)
+from translation_agent.run_status import (
+    RunStatusSnapshot,
+    derive_run_status_snapshot,
+    tail_trace_events,
 )
 from translation_agent.storage import (
     PostgresOperationalStore,
@@ -134,7 +144,31 @@ def list_runs(settings: Settings | None = None) -> list[RunRecord]:
         return run_store.list_runs()
 
 
-def run_job(request: RunJobRequest, settings: Settings | None = None) -> RunJobResult:
+def get_run_status(run_id: str, settings: Settings | None = None) -> RunStatusSnapshot:
+    """Build a live status snapshot from persisted run state and the trace tail."""
+
+    settings = settings or load_settings()
+    trace_path = settings.trace_dir / f"{run_id}.jsonl"
+    with _open_operational_store(settings) as run_store:
+        record = run_store.get_run(run_id)
+        if record is None:
+            raise ValueError(f"unknown run_id: {run_id}")
+        node_executions = run_store.list_node_executions(run_id)
+    trace_events = tail_trace_events(trace_path)
+    return derive_run_status_snapshot(
+        record,
+        node_executions,
+        trace_events,
+        trace_path=trace_path,
+    )
+
+
+def run_job(
+    request: RunJobRequest,
+    settings: Settings | None = None,
+    *,
+    live_trace_sink: TraceSink | None = None,
+) -> RunJobResult:
     """Execute the deterministic dry-run workflow from the public API."""
 
     settings = settings or load_settings()
@@ -224,7 +258,7 @@ def run_job(request: RunJobRequest, settings: Settings | None = None) -> RunJobR
             )
         )
     trace_path = trace_dir / f"{run_id}.jsonl"
-    with JsonlTraceSink(trace_path) as trace_sink:
+    with _open_trace_sink(trace_path, live_trace_sink=live_trace_sink) as trace_sink:
         runtime_run_store = _open_operational_store(settings)
         runtime = None
         try:
@@ -407,6 +441,7 @@ def resume_translation(
     *,
     review_mode: Literal["auto", "always", "never"] = "auto",
     settings: Settings | None = None,
+    live_trace_sink: TraceSink | None = None,
 ) -> RunJobResult:
     """Resume translation from persisted transcript artifacts of a prior run."""
 
@@ -513,7 +548,7 @@ def resume_translation(
         )
 
     trace_path = trace_dir / f"{new_run_id}.jsonl"
-    with JsonlTraceSink(trace_path) as trace_sink:
+    with _open_trace_sink(trace_path, live_trace_sink=live_trace_sink) as trace_sink:
         runtime_run_store = _open_operational_store(settings)
         runtime = None
         try:
@@ -714,6 +749,7 @@ def resume_transcription(
     provider_ids: tuple[str, ...] | None = None,
     review_mode: Literal["auto", "always", "never"] = "auto",
     settings: Settings | None = None,
+    live_trace_sink: TraceSink | None = None,
 ) -> RunJobResult:
     """Resume transcription from persisted audio while preserving other providers."""
 
@@ -823,7 +859,7 @@ def resume_transcription(
         )
 
     trace_path = trace_dir / f"{new_run_id}.jsonl"
-    with JsonlTraceSink(trace_path) as trace_sink:
+    with _open_trace_sink(trace_path, live_trace_sink=live_trace_sink) as trace_sink:
         runtime_run_store = _open_operational_store(settings)
         runtime = None
         try:
@@ -1570,6 +1606,17 @@ def _open_operational_store(
     if settings.state_db_dsn:
         return PostgresOperationalStore(settings.state_db_dsn)
     return SQLiteOperationalStore(settings.state_db_path)
+
+
+def _open_trace_sink(
+    trace_path: Path,
+    *,
+    live_trace_sink: TraceSink | None = None,
+) -> JsonlTraceSink | CompositeTraceSink:
+    jsonl_trace_sink = JsonlTraceSink(trace_path)
+    if live_trace_sink is None:
+        return jsonl_trace_sink
+    return CompositeTraceSink(jsonl_trace_sink, live_trace_sink)
 
 
 def _serialize_request(

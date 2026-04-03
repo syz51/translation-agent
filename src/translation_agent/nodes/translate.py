@@ -18,6 +18,7 @@ from translation_agent.nodes.common import (
     strip_private_metadata,
     write_model_artifact,
 )
+from translation_agent.observability import TraceEvent
 from translation_agent.parallelism import ordered_parallel_map
 
 PROMPT_VARIANTS = ("variant-a", "variant-b")
@@ -80,10 +81,10 @@ def generate_translation_candidates(
                 model_id=runtime.translation_adapter.model_id,
                 source_language=state.job.source_language,
                 target_language=state.job.target_language,
+                tenant_id=state.job.tenant_id,
+                project_id=state.job.project_id,
                 media_key=state.job.media_key,
                 run_id=state.run_id,
-                scope_kind="pair",
-                scope_key=f"{state.job.source_language}::{state.job.target_language}",
             )
             variant_request_context = request_context.model_copy(
                 update={
@@ -106,7 +107,12 @@ def generate_translation_candidates(
     gathered = ordered_parallel_map(
         task_specs,
         max_workers=runtime.parallelism.translation_candidate_max_workers,
-        worker=lambda task: _generate_translation_task(task, runtime),
+        worker=lambda task: _generate_translation_task(
+            task,
+            runtime,
+            run_id=state.run_id,
+            variant_total=len(task_specs),
+        ),
         sort_key=lambda input_index, _task: (input_index,),
     )
 
@@ -211,29 +217,72 @@ def _translation_candidate_id(
 def _generate_translation_task(
     task: _TranslationCandidateTask,
     runtime: WorkflowRuntime,
+    *,
+    run_id: str,
+    variant_total: int,
 ) -> tuple[TranslationCandidate, dict[str, object] | None]:
+    runtime.trace_sink.record(
+        TraceEvent(
+            run_id=run_id,
+            name="translation.variant.started",
+            attributes={
+                "prompt_variant_id": task.prompt_variant_id,
+                "source_transcript_candidate_id": task.transcript.candidate_id,
+                "variant_total": variant_total,
+            },
+        )
+    )
     generate_with_payload = getattr(
         runtime.translation_adapter,
         "generate_translation_with_payload",
         None,
     )
-    if callable(generate_with_payload):
-        return cast(
-            "tuple[TranslationCandidate, dict[str, object] | None]",
-            generate_with_payload(
-                task.transcript,
-                task.prompt_variant_id,
-                task.request_context,
-            ),
+    try:
+        if callable(generate_with_payload):
+            candidate, raw_payload = cast(
+                "tuple[TranslationCandidate, dict[str, object] | None]",
+                generate_with_payload(
+                    task.transcript,
+                    task.prompt_variant_id,
+                    task.request_context,
+                ),
+            )
+        else:
+            candidate, raw_payload = (
+                runtime.translation_adapter.generate_translation(
+                    task.transcript,
+                    task.prompt_variant_id,
+                    task.request_context,
+                ),
+                None,
+            )
+        runtime.trace_sink.record(
+            TraceEvent(
+                run_id=run_id,
+                name="translation.variant.completed",
+                attributes={
+                    "prompt_variant_id": task.prompt_variant_id,
+                    "source_transcript_candidate_id": task.transcript.candidate_id,
+                    "variant_total": variant_total,
+                    "candidate_id": candidate.candidate_id,
+                },
+            )
         )
-    return (
-        runtime.translation_adapter.generate_translation(
-            task.transcript,
-            task.prompt_variant_id,
-            task.request_context,
-        ),
-        None,
-    )
+        return candidate, raw_payload
+    except Exception as exc:
+        runtime.trace_sink.record(
+            TraceEvent(
+                run_id=run_id,
+                name="translation.variant.failed",
+                attributes={
+                    "prompt_variant_id": task.prompt_variant_id,
+                    "source_transcript_candidate_id": task.transcript.candidate_id,
+                    "variant_total": variant_total,
+                    "error": str(exc),
+                },
+            )
+        )
+        raise
 
 
 def _supports_raw_payload_translation(adapter: object) -> bool:

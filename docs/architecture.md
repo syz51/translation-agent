@@ -45,7 +45,7 @@ It uses:
 
 The translation role is provider-scoped:
 
-- `translation` defaults to Gemini with `gemini-3-flash`
+- `translation` defaults to Gemini with `gemini-2.5-flash`
 - `reasoning` defaults to OpenAI with `gpt-5.4`
 
 Real mode is gated by:

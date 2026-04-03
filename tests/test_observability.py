@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from translation_agent.observability import (  # noqa: E402
     STRUCTLOG_AVAILABLE,
+    CompositeTraceSink,
     JsonlTraceSink,
     NoOpTraceSink,
     StructuredEvent,
@@ -122,6 +123,31 @@ def test_jsonl_trace_sink_exposes_path_and_close_is_idempotent(tmp_path: Path) -
 
     payload = sink_path.read_text(encoding="utf-8").strip().splitlines()
     assert len(payload) == 1
+
+
+def test_composite_trace_sink_fan_outs_to_jsonl_and_live_sink(tmp_path: Path) -> None:
+    sink_path = tmp_path / "trace" / "events.jsonl"
+    live_events: list[str] = []
+
+    class LiveSink:
+        @property
+        def path(self) -> None:
+            return None
+
+        def record(self, event: TraceEvent) -> None:
+            live_events.append(event.name)
+
+        def close(self) -> None:
+            live_events.append("closed")
+
+    sink = CompositeTraceSink(JsonlTraceSink(sink_path), LiveSink())
+    sink.record(TraceEvent(name="run.started", run_id="run-1"))
+    sink.close()
+
+    payload = sink_path.read_text(encoding="utf-8").strip().splitlines()
+    assert len(payload) == 1
+    assert live_events == ["run.started", "closed"]
+    assert sink.path == sink_path
 
 
 def test_structlog_paths_are_exercised(monkeypatch: pytest.MonkeyPatch) -> None:
