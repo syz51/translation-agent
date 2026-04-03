@@ -9,7 +9,12 @@ from pydantic import Field, model_validator
 
 from .base import ContractModel
 from .jobs import ReferenceTranscriptFormat
-from .memory import PromptCompatibilityTuple, ProposalAggregateMetrics
+from .memory import (
+    PromotionGateOutcome,
+    PromptCompatibilityTuple,
+    ProposalAggregateMetrics,
+    StrongerGraderScore,
+)
 
 NonEmptyStr = Annotated[str, Field(min_length=1)]
 
@@ -171,6 +176,9 @@ class EvaluationReport(ContractModel):
     failures: tuple[EvaluationFailure, ...] = ()
     canary_metrics: ProposalAggregateMetrics | None = None
     control_metrics: ProposalAggregateMetrics | None = None
+    canary_stronger_grader: StrongerGraderScore | None = None
+    control_stronger_grader: StrongerGraderScore | None = None
+    gate_outcome: PromotionGateOutcome | None = None
     proposal_compatibility: tuple[PromptCompatibilityTuple, ...] = ()
     metadata: dict[str, Any] = Field(default_factory=dict)
 

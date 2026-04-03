@@ -143,8 +143,10 @@ def test_reference_evaluation_path_publishes_asset_artifacts_and_keeps_canonical
     assert manifest["improvement_proposal_refs"] == []
     assert evaluation_report["failures"] == []
     assert evaluation_report["proposal_refs"] == []
-    assert evaluation_report["proposal_compatibility"][0]["scope_kind"] == "pair"
+    assert evaluation_report["proposal_compatibility"][0]["scope_kind"] == "project_pair"
     assert "control_metrics" in evaluation_report
+    assert "control_stronger_grader" in evaluation_report
+    assert "gate_outcome" in evaluation_report
 
 
 def test_parse_srt_uses_pysubs2_plaintext_for_reference_segments() -> None:
@@ -237,6 +239,7 @@ def test_active_prompt_proposals_affect_prompt_resolution(tmp_path: Path) -> Non
         "assets/asset-id-asset-1/improvement-proposals/proposal-active.json",
     )
     assert resolved.resolution_mode == "active"
+    assert resolved.scope_kind == "pair"
 
 
 def test_reference_evaluation_preserves_historical_link_order_under_parallel_loading(
