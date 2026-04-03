@@ -229,6 +229,10 @@ def review_resolution_key(job: JobContext) -> str:
     return job_path(job, "review-resolutions", "translation.json")
 
 
+def review_draft_key(job: JobContext) -> str:
+    return job_path(job, "review", "draft-resolution.json")
+
+
 def transcript_approval_learning_key(job: JobContext) -> str:
     return job_path(job, "learning", "transcript-approval.json")
 

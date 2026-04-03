@@ -453,10 +453,27 @@ The review payload includes:
 - `review_required_stage`
 - `summary`
 - ranked translation candidates
-- additive `review_diffs` cards ordered for terminal review
+- span-aligned `review_spans` records keyed by `source_span_id`
+- optional `draft_resolution` for save/resume
+- additive legacy `review_diffs` cards ordered for compatibility only
 - source transcript provenance per candidate
 - transcript disagreement and investigation summary
 - preview paths for rendered translation and transcript artifacts
+
+Each `review_spans[*]` record includes:
+
+- `source_span_id`
+- `start_ms`
+- `end_ms`
+- `time_range`
+- `severity_summary`
+- `blocking`
+- `reviewer_roles`
+- `evidence_summary`
+- `source_excerpt`
+- `transcript_provenance_options`
+- `variants`
+- `current_draft_decision`
 
 Each `review_diffs[*]` card includes:
 
@@ -473,7 +490,11 @@ Each `review_diffs[*]` card includes:
 - `left_candidate`
 - `right_candidate`
 
-Interactive `review-job` renders one diff card at a time in the terminal, shows the shared source excerpt above the candidate pair, keeps approval at the whole-candidate level, and requires an explicit finalization confirmation before delegating the final selection to `approve-review`.
+`review_diffs` is now legacy and should not be treated as the primary TUI contract.
+Interactive `review-job` launches a Textual app that reviews one span at a time, saves resumable
+draft decisions, and finalizes a synthetic human-reviewed `TranslationCandidate`. The current TUI
+uses Textual's themed command-palette surface, a tabbed span workspace, and toast notifications
+instead of the earlier flat terminal layout.
 
 ### `approve-review --json`
 
@@ -484,6 +505,7 @@ The approval payload includes:
 - `status`
 - `approval_ref`
 - `approved_candidate_id`
+- `final_translation_candidate_id`
 - `approved_source_transcript_candidate_id`
 - final transcript and translation refs
 - `default_output_path`

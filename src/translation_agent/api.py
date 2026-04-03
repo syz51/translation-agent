@@ -26,6 +26,8 @@ from translation_agent.models import (
     FinalTranscriptDecision,
     HistoricalRunLink,
     JobContext,
+    ReviewDraftResolution,
+    ReviewedSpanDecision,
     TranscriptCandidate,
     TranslationCandidate,
 )
@@ -52,6 +54,7 @@ from translation_agent.review_flow import (
     approve_translation_review,
     build_review_payload,
     resolve_translation_review,
+    save_review_draft_resolution,
 )
 from translation_agent.run_status import (
     RunStatusSnapshot,
@@ -1099,6 +1102,7 @@ def resolve_review(
     *,
     resolution: str,
     candidate_id: str | None = None,
+    reviewed_span_decisions: tuple[ReviewedSpanDecision | dict[str, object], ...] = (),
     failure_tags: tuple[str, ...] = (),
     approved_by: str | None = None,
     note: str | None = None,
@@ -1113,9 +1117,39 @@ def resolve_review(
             run_id,
             resolution_kind=resolution,  # type: ignore[arg-type]
             candidate_id=candidate_id,
+            reviewed_span_decisions=tuple(
+                decision
+                if isinstance(decision, ReviewedSpanDecision)
+                else ReviewedSpanDecision.model_validate(decision)
+                for decision in reviewed_span_decisions
+            ),
             failure_tags=failure_tags,  # type: ignore[arg-type]
             approved_by=approved_by,
             note=note,
+            store=store,
+            blob_store=blob_store,
+        )
+
+
+def save_review_draft(
+    run_id: str,
+    *,
+    draft_resolution: ReviewDraftResolution | dict[str, object],
+    settings: Settings | None = None,
+) -> dict[str, object]:
+    """Persist an in-progress review draft for a later review-job resume."""
+
+    settings = settings or load_settings()
+    blob_store = LocalBlobStore(settings.blob_dir)
+    with _open_operational_store(settings) as store:
+        normalized = (
+            draft_resolution
+            if isinstance(draft_resolution, ReviewDraftResolution)
+            else ReviewDraftResolution.model_validate(draft_resolution)
+        )
+        return save_review_draft_resolution(
+            run_id,
+            draft_resolution=normalized,
             store=store,
             blob_store=blob_store,
         )

@@ -31,6 +31,8 @@ from translation_agent.models import (
     PromptCompatibilityTuple,
     PromptEvolutionProposal,
     ReviewBundle,
+    ReviewDraftResolution,
+    ReviewedSpanDecision,
     Segment,
     StructuredEvidence,
     TranscriptApprovalLearningEvent,
@@ -46,6 +48,7 @@ from translation_agent.nodes.common import (
     memory_consolidation_key,
     operational_job_key,
     read_model_artifact,
+    review_draft_key,
     review_preview_key,
     review_resolution_key,
     select_transcript_candidates,
@@ -53,12 +56,14 @@ from translation_agent.nodes.common import (
     transcript_approval_learning_key,
     transcript_decision_key,
     transcript_investigation_key,
+    translation_candidate_key,
     translation_decision_key,
     translation_investigation_key,
     translation_review_key,
     write_model_artifact,
 )
 from translation_agent.nodes.reference_evaluation import update_historical_run_link
+from translation_agent.normalization import normalize_translation_candidate
 from translation_agent.observability import NoOpTraceSink
 from translation_agent.publish.outputs import publish_outputs
 from translation_agent.storage import LocalBlobStore, OperationalStore, job_path
@@ -153,6 +158,7 @@ def build_review_payload(
     )
     approval = _optional_json(runtime, approval_record_key(context.job))
     resolution = _load_resolution_payload(context)
+    draft_resolution = _load_draft_resolution(context)
 
     preferred_candidate_id = None
     if translation_decision is not None:
@@ -238,6 +244,17 @@ def build_review_payload(
             for rank, candidate in enumerate(ranked_candidates, start=1)
         },
     )
+    review_spans = _build_review_spans(
+        translation_candidates=ranked_candidates,
+        transcript_candidates=transcript_candidates,
+        preferred_candidate_id=preferred_candidate_id,
+        candidate_rank_map={
+            candidate.candidate_id: rank
+            for rank, candidate in enumerate(ranked_candidates, start=1)
+        },
+        reviews=translation_reviews,
+        draft_resolution=draft_resolution,
+    )
     candidate_summaries = contradiction_summary["candidate_summaries"]
     for payload in candidate_payloads:
         candidate_summary = candidate_summaries.get(str(payload["candidate_id"]), {})
@@ -296,6 +313,10 @@ def build_review_payload(
             "machine_review_refs": machine_review_refs,
         },
         "human_review_summary": contradiction_summary["summary"],
+        "review_spans": review_spans,
+        "draft_resolution": (
+            draft_resolution.model_dump(mode="json") if draft_resolution is not None else None
+        ),
         "review_diffs": contradiction_summary["review_diffs"],
         "approval": approval,
         "resume_commands": [
@@ -309,11 +330,36 @@ def build_review_payload(
     }
 
 
+def save_review_draft_resolution(
+    run_id: str,
+    *,
+    draft_resolution: ReviewDraftResolution,
+    store: OperationalStore,
+    blob_store: LocalBlobStore,
+) -> dict[str, Any]:
+    """Persist an in-progress review draft for resume."""
+
+    context = _load_review_session(run_id, store=store, blob_store=blob_store)
+    if draft_resolution.run_id != run_id:
+        raise ValueError("draft run_id does not match target run")
+    if draft_resolution.job_id != context.job.job_id:
+        raise ValueError("draft job_id does not match target run")
+    draft_ref = review_draft_key(context.job)
+    write_model_artifact(context.runtime, draft_ref, draft_resolution)
+    return {
+        "run_id": run_id,
+        "job_id": context.job.job_id,
+        "draft_ref": draft_ref,
+        "updated_at": draft_resolution.updated_at.isoformat(),
+    }
+
+
 def resolve_translation_review(
     run_id: str,
     *,
     resolution_kind: HumanSupervisionKind,
     candidate_id: str | None,
+    reviewed_span_decisions: tuple[ReviewedSpanDecision, ...] = (),
     failure_tags: tuple[FailureTag, ...] = (),
     approved_by: str | None,
     note: str | None,
@@ -354,6 +400,43 @@ def resolve_translation_review(
             storage_job_id=storage_job_id,
         )
     }
+    from translation_agent.models import FinalTranslationDecision
+
+    machine_translation_decision = read_model_artifact(
+        runtime,
+        output_data.get("translation_decision_ref") or translation_decision_key(context.job),
+        FinalTranslationDecision,
+    )
+    translation_reviews = tuple(
+        read_model_artifact(
+            runtime,
+            translation_review_key(context.job, review_id),
+            ReviewBundle,
+        )
+        for review_id in machine_translation_decision.review_refs
+        if runtime.blob_store.exists(translation_review_key(context.job, review_id))
+    )
+    preferred_candidate_id = (
+        machine_translation_decision.adjudication_scorecard.preferred_candidate_id
+        or machine_translation_decision.winner_candidate_id
+    )
+    review_spans = _build_review_spans(
+        translation_candidates=sorted(
+            translation_candidates.values(),
+            key=lambda candidate: candidate.candidate_id,
+        ),
+        transcript_candidates=transcript_candidates,
+        preferred_candidate_id=preferred_candidate_id,
+        candidate_rank_map={
+            candidate.candidate_id: rank
+            for rank, candidate in enumerate(
+                sorted(translation_candidates.values(), key=lambda item: item.candidate_id),
+                start=1,
+            )
+        },
+        reviews=translation_reviews,
+        draft_resolution=None,
+    )
     reviewed_candidates = _reviewed_candidate_contexts(
         job=context.job,
         translation_candidates=translation_candidates,
@@ -362,38 +445,94 @@ def resolve_translation_review(
     _validate_resolution_inputs(
         resolution_kind=resolution_kind,
         candidate_id=candidate_id,
+        reviewed_span_decisions=reviewed_span_decisions,
         failure_tags=failure_tags,
         translation_candidates=translation_candidates,
-    )
-    approved_candidate = (
-        translation_candidates[candidate_id]
-        if candidate_id is not None and candidate_id in translation_candidates
-        else None
-    )
-    approved_transcript = (
-        transcript_candidates.get(approved_candidate.source_transcript_candidate_id or "")
-        if approved_candidate is not None
-        else None
-    )
-    if approved_candidate is not None and approved_transcript is None:
-        raise ValueError("approved source transcript candidate was not found")
-
-    from translation_agent.models import FinalTranslationDecision
-
-    machine_translation_decision = read_model_artifact(
-        runtime,
-        output_data.get("translation_decision_ref") or translation_decision_key(context.job),
-        FinalTranslationDecision,
     )
     resolved_at = datetime.now(UTC)
     approved_by = _normalized_approved_by(approved_by)
     normalized_failure_tags = tuple(dict.fromkeys(failure_tags))
     residual_failure_tags = normalized_failure_tags if resolution_kind != "approved_good" else ()
+    final_translation_candidate: TranslationCandidate | None = None
+    approved_candidate: TranslationCandidate | None = None
+    approved_transcript: TranscriptCandidate | None = None
+    normalized_span_decisions: tuple[ReviewedSpanDecision, ...] = ()
+
+    if resolution_kind in {"approved_good", "approved_best_available"}:
+        normalized_span_decisions = (
+            _validated_reviewed_span_decisions(
+                reviewed_span_decisions,
+                review_spans=review_spans,
+                translation_candidates=translation_candidates,
+                transcript_candidates=transcript_candidates,
+            )
+            if reviewed_span_decisions
+            else _legacy_reviewed_span_decisions(
+                candidate_id=cast(str, candidate_id),
+                review_spans=review_spans,
+                translation_candidates=translation_candidates,
+                transcript_candidates=transcript_candidates,
+            )
+        )
+        final_translation_candidate = _synthesize_reviewed_translation_candidate(
+            context=context,
+            decisions=normalized_span_decisions,
+            output_data=output_data,
+        )
+        runtime.decision_store.save_translation_candidate(
+            final_translation_candidate,
+            storage_job_id=storage_job_id,
+        )
+        write_model_artifact(
+            runtime,
+            translation_candidate_key(context.job, final_translation_candidate.candidate_id),
+            final_translation_candidate,
+        )
+        approved_candidate = _dominant_translation_candidate(
+            decisions=normalized_span_decisions,
+            translation_candidates=translation_candidates,
+        )
+        approved_transcript = _single_approved_transcript(
+            decisions=normalized_span_decisions,
+            transcript_candidates=transcript_candidates,
+        )
+
+    contributing_candidate_ids = tuple(
+        sorted({decision.selected_candidate_id for decision in normalized_span_decisions})
+    )
+    contributing_transcript_candidate_ids = tuple(
+        sorted(
+            {
+                decision.selected_source_transcript_candidate_id
+                for decision in normalized_span_decisions
+                if decision.selected_source_transcript_candidate_id is not None
+            }
+        )
+    )
+    contributing_provider_ids = tuple(
+        sorted(
+            {
+                decision.selected_transcript_provider_id
+                for decision in normalized_span_decisions
+                if decision.selected_transcript_provider_id is not None
+            }
+        )
+    )
     resolution_record = HumanReviewResolutionRecord(
         run_id=run_id,
         job_id=context.job.job_id,
         resolution_kind=resolution_kind,
         candidate_id=approved_candidate.candidate_id if approved_candidate is not None else None,
+        final_translation_candidate_id=(
+            final_translation_candidate.candidate_id
+            if final_translation_candidate is not None
+            else None
+        ),
+        reviewed_span_count=len(normalized_span_decisions),
+        reviewed_span_decisions=normalized_span_decisions,
+        contributing_translation_candidate_ids=contributing_candidate_ids,
+        contributing_source_transcript_candidate_ids=contributing_transcript_candidate_ids,
+        contributing_transcript_provider_ids=contributing_provider_ids,
         approved_by=approved_by,
         note=note or "",
         failure_tags=normalized_failure_tags,
@@ -442,12 +581,15 @@ def resolve_translation_review(
 
     approval_record = None
     learning_ref = None
-    if approved_candidate is not None and approved_transcript is not None:
+    if final_translation_candidate is not None:
         approval_record = HumanApprovalRecord(
             run_id=run_id,
             job_id=context.job.job_id,
-            approved_candidate_id=approved_candidate.candidate_id,
-            approved_source_transcript_candidate_id=approved_transcript.candidate_id,
+            approved_candidate_id=approved_candidate.candidate_id if approved_candidate else None,
+            final_translation_candidate_id=final_translation_candidate.candidate_id,
+            approved_source_transcript_candidate_id=(
+                approved_transcript.candidate_id if approved_transcript is not None else None
+            ),
             approved_by=approved_by,
             note=note or "",
             approved_at=resolved_at,
@@ -456,24 +598,25 @@ def resolve_translation_review(
             machine_review_refs=resolution_record.machine_review_refs,
         )
         write_model_artifact(runtime, approval_ref, approval_record)
-        learning_ref = transcript_approval_learning_key(context.job)
-        learning_event = TranscriptApprovalLearningEvent(
-            run_id=run_id,
-            job_id=context.job.job_id,
-            approved_translation_candidate_id=approved_candidate.candidate_id,
-            approved_source_transcript_candidate_id=approved_transcript.candidate_id,
-            transcript_provider_id=approved_transcript.provider_id,
-            source_language=context.job.source_language,
-            target_language=context.job.target_language,
-            tenant_id=context.job.tenant_id,
-            project_id=context.job.project_id,
-            media_key=context.job.media_key,
-            linked_translation_approval_ref=approval_ref,
-            supervision_kind=resolution_kind,
-            supervision_strength=resolution_record.supervision_strength,
-            created_at=resolved_at,
-        )
-        write_model_artifact(runtime, learning_ref, learning_event)
+        if approved_candidate is not None and approved_transcript is not None:
+            learning_ref = transcript_approval_learning_key(context.job)
+            learning_event = TranscriptApprovalLearningEvent(
+                run_id=run_id,
+                job_id=context.job.job_id,
+                approved_translation_candidate_id=final_translation_candidate.candidate_id,
+                approved_source_transcript_candidate_id=approved_transcript.candidate_id,
+                transcript_provider_id=approved_transcript.provider_id,
+                source_language=context.job.source_language,
+                target_language=context.job.target_language,
+                tenant_id=context.job.tenant_id,
+                project_id=context.job.project_id,
+                media_key=context.job.media_key,
+                linked_translation_approval_ref=approval_ref,
+                supervision_kind=resolution_kind,
+                supervision_strength=resolution_record.supervision_strength,
+                created_at=resolved_at,
+            )
+            write_model_artifact(runtime, learning_ref, learning_event)
 
     _update_provider_quality_stats(
         store=store,
@@ -503,6 +646,7 @@ def resolve_translation_review(
     state = _resolution_publish_state(
         context=context,
         output_data=output_data,
+        final_translation_candidate=final_translation_candidate,
         approved_candidate=approved_candidate,
         approved_transcript=approved_transcript,
         resolution_ref=resolution_ref,
@@ -541,6 +685,13 @@ def resolve_translation_review(
         )
         if ref is not None
     )
+    if resolution_record.final_translation_ref != artifacts.final_translation_ref:
+        resolution_record = resolution_record.model_copy(
+            update={"final_translation_ref": artifacts.final_translation_ref}
+        )
+        write_model_artifact(runtime, resolution_ref, resolution_record)
+        store.save_human_review_resolution(resolution_record)
+    runtime.blob_store.delete(review_draft_key(context.job))
     updated_output_data = {
         **output_data,
         "resolution_ref": resolution_ref,
@@ -551,6 +702,11 @@ def resolve_translation_review(
         "approved_candidate_id": approved_candidate.candidate_id if approved_candidate else None,
         "approved_source_transcript_candidate_id": (
             approved_transcript.candidate_id if approved_transcript is not None else None
+        ),
+        "final_translation_candidate_id": (
+            final_translation_candidate.candidate_id
+            if final_translation_candidate is not None
+            else None
         ),
         "review_required_stage": "translation",
         "human_review_required": False,
@@ -605,6 +761,11 @@ def resolve_translation_review(
         "approved_candidate_id": approved_candidate.candidate_id if approved_candidate else None,
         "approved_source_transcript_candidate_id": (
             approved_transcript.candidate_id if approved_transcript is not None else None
+        ),
+        "final_translation_candidate_id": (
+            final_translation_candidate.candidate_id
+            if final_translation_candidate is not None
+            else None
         ),
         "final_transcript_ref": artifacts.final_transcript_ref,
         "final_translation_ref": artifacts.final_translation_ref,
@@ -891,6 +1052,190 @@ def _build_contradiction_summary(
         "candidate_summaries": candidate_summaries,
         "review_diffs": review_diffs,
     }
+
+
+def _build_review_spans(
+    *,
+    translation_candidates: list[TranslationCandidate],
+    transcript_candidates: dict[str, TranscriptCandidate],
+    preferred_candidate_id: str | None,
+    candidate_rank_map: dict[str, int],
+    reviews: tuple[ReviewBundle, ...],
+    draft_resolution: ReviewDraftResolution | None,
+) -> list[dict[str, Any]]:
+    span_entries: dict[str, dict[str, Any]] = {}
+    draft_by_span = (
+        {decision.source_span_id: decision for decision in draft_resolution.span_decisions}
+        if draft_resolution is not None
+        else {}
+    )
+
+    for candidate in translation_candidates:
+        transcript = transcript_candidates.get(candidate.source_transcript_candidate_id or "")
+        for span_id, span_payload in _candidate_span_payloads(candidate.segments).items():
+            entry = span_entries.get(span_id)
+            if entry is None:
+                entry = {
+                    "source_span_id": span_id,
+                    "start_ms": span_payload["start_ms"],
+                    "end_ms": span_payload["end_ms"],
+                    "time_range": _format_ms(cast(int, span_payload["start_ms"]))
+                    + "-"
+                    + _format_ms(cast(int, span_payload["end_ms"])),
+                    "source_excerpt": span_payload["source_excerpt"] or _NO_OVERLAPPING_EXCERPT,
+                    "severity_summary": "none",
+                    "blocking": False,
+                    "reviewer_roles": [],
+                    "evidence_summary": [],
+                    "transcript_provenance_options": [],
+                    "_transcript_provenance_index": {},
+                    "variants": [],
+                }
+                span_entries[span_id] = entry
+            elif (
+                entry["source_excerpt"] == _NO_OVERLAPPING_EXCERPT
+                and span_payload["source_excerpt"] is not None
+            ):
+                entry["source_excerpt"] = span_payload["source_excerpt"]
+
+            provider_id = transcript.provider_id if transcript is not None else None
+            transcript_excerpt = (
+                _span_text_from_segments(transcript.segments, span_id, field_name="source_text")
+                if transcript is not None
+                else None
+            )
+            provenance_key = (
+                candidate.source_transcript_candidate_id or "",
+                provider_id or "",
+            )
+            provenance_index = cast(
+                dict[tuple[str, str], dict[str, Any]],
+                entry["_transcript_provenance_index"],
+            )
+            if provenance_key not in provenance_index:
+                provenance_payload = {
+                    "source_transcript_candidate_id": candidate.source_transcript_candidate_id,
+                    "transcript_provider_id": provider_id,
+                    "transcript_excerpt": transcript_excerpt or _NO_OVERLAPPING_EXCERPT,
+                }
+                provenance_index[provenance_key] = provenance_payload
+                cast(list[dict[str, Any]], entry["transcript_provenance_options"]).append(
+                    provenance_payload
+                )
+
+            cast(list[dict[str, Any]], entry["variants"]).append(
+                {
+                    "candidate_id": candidate.candidate_id,
+                    "rank": candidate_rank_map.get(candidate.candidate_id, 10**9),
+                    "model_id": candidate.model_id,
+                    "prompt_variant_id": candidate.prompt_variant_id,
+                    "prompt_version": candidate.prompt_version,
+                    "source_transcript_candidate_id": candidate.source_transcript_candidate_id,
+                    "transcript_provider_id": provider_id,
+                    "target_excerpt": span_payload["target_excerpt"] or _NO_OVERLAPPING_EXCERPT,
+                    "machine_preferred": candidate.candidate_id == preferred_candidate_id,
+                }
+            )
+
+    for review in reviews:
+        for evidence in review.structured_evidence:
+            if evidence.polarity != "refutes" or evidence.source_span_id is None:
+                continue
+            entry = span_entries.get(evidence.source_span_id)
+            if entry is None:
+                start_ms, end_ms = _parse_span_id(evidence.source_span_id)
+                if start_ms is None or end_ms is None:
+                    continue
+                entry = {
+                    "source_span_id": evidence.source_span_id,
+                    "start_ms": start_ms,
+                    "end_ms": end_ms,
+                    "time_range": _format_ms(start_ms) + "-" + _format_ms(end_ms),
+                    "source_excerpt": _NO_OVERLAPPING_EXCERPT,
+                    "severity_summary": "none",
+                    "blocking": False,
+                    "reviewer_roles": [],
+                    "evidence_summary": [],
+                    "transcript_provenance_options": [],
+                    "_transcript_provenance_index": {},
+                    "variants": [],
+                }
+                span_entries[evidence.source_span_id] = entry
+            if review.reviewer_role not in cast(list[str], entry["reviewer_roles"]):
+                cast(list[str], entry["reviewer_roles"]).append(review.reviewer_role)
+            cast(list[dict[str, Any]], entry["evidence_summary"]).append(
+                {
+                    "candidate_id": evidence.candidate_id,
+                    "dimension": evidence.dimension,
+                    "severity": evidence.severity,
+                    "normalized_value": evidence.normalized_value,
+                    "evidence_text": evidence.evidence_text,
+                    "reviewer_role": review.reviewer_role,
+                }
+            )
+            entry["severity_summary"] = _max_optional_severity(
+                cast(str, entry["severity_summary"]),
+                evidence.severity,
+            )
+            if evidence.dimension in _HARD_CONTRADICTION_DIMENSIONS:
+                entry["blocking"] = True
+
+    review_spans: list[dict[str, Any]] = []
+    for span_id, entry in span_entries.items():
+        variants = cast(list[dict[str, Any]], entry["variants"])
+        variants.sort(key=lambda item: (cast(int, item["rank"]), cast(str, item["candidate_id"])))
+        evidence_summary = cast(list[dict[str, Any]], entry["evidence_summary"])
+        evidence_summary.sort(
+            key=lambda item: (
+                _severity_sort_key(cast(str, item["severity"])),
+                cast(str, item["dimension"]),
+                cast(str, item["candidate_id"]),
+            )
+        )
+        draft = draft_by_span.get(span_id)
+        review_spans.append(
+            {
+                "source_span_id": span_id,
+                "start_ms": entry["start_ms"],
+                "end_ms": entry["end_ms"],
+                "time_range": entry["time_range"],
+                "severity_summary": entry["severity_summary"],
+                "blocking": entry["blocking"],
+                "reviewer_roles": sorted(cast(list[str], entry["reviewer_roles"])),
+                "evidence_summary": evidence_summary,
+                "source_excerpt": entry["source_excerpt"],
+                "transcript_provenance_options": cast(
+                    list[dict[str, Any]],
+                    entry["transcript_provenance_options"],
+                ),
+                "variants": variants,
+                "current_draft_decision": {
+                    "selected_base_variant_id": (
+                        draft.selected_base_variant_id
+                        if draft is not None
+                        else _default_review_variant_id(
+                            variants=variants,
+                            preferred_candidate_id=preferred_candidate_id,
+                        )
+                    ),
+                    "edited_text": draft.edited_text if draft is not None else None,
+                    "resolution_status": (
+                        draft.resolution_status if draft is not None else "unresolved"
+                    ),
+                    "dirty": draft.dirty if draft is not None else False,
+                    "reviewer_note": draft.reviewer_note if draft is not None else "",
+                },
+            }
+        )
+
+    review_spans.sort(
+        key=lambda item: (
+            0 if cast(bool, item["blocking"]) else 1,
+            _span_sort_key(cast(str, item["source_span_id"])),
+            _severity_sort_key(cast(str, item["severity_summary"])),
+        )
+    )
+    return review_spans
 
 
 def _record_contradiction(
@@ -1203,6 +1548,77 @@ def _display_excerpt(text: str | None) -> str:
     return text or _NO_OVERLAPPING_EXCERPT
 
 
+def _candidate_span_payloads(segments: tuple[Segment, ...]) -> dict[str, dict[str, Any]]:
+    span_payloads: dict[str, dict[str, Any]] = {}
+    for segment in segments:
+        span_id = _segment_source_span_id(segment)
+        entry = span_payloads.get(span_id)
+        if entry is None:
+            entry = {
+                "start_ms": segment.start_ms,
+                "end_ms": segment.end_ms,
+                "source_segments": [],
+                "target_segments": [],
+            }
+            span_payloads[span_id] = entry
+        entry["start_ms"] = min(cast(int, entry["start_ms"]), segment.start_ms)
+        entry["end_ms"] = max(cast(int, entry["end_ms"]), segment.end_ms)
+        if segment.source_text:
+            cast(list[str], entry["source_segments"]).append(segment.source_text)
+        if segment.target_text:
+            cast(list[str], entry["target_segments"]).append(segment.target_text)
+    return {
+        span_id: {
+            "start_ms": payload["start_ms"],
+            "end_ms": payload["end_ms"],
+            "source_excerpt": _truncate_excerpt(
+                " ".join(cast(list[str], payload["source_segments"])).strip() or None
+            ),
+            "target_excerpt": _truncate_excerpt(
+                " ".join(cast(list[str], payload["target_segments"])).strip() or None
+            ),
+        }
+        for span_id, payload in span_payloads.items()
+    }
+
+
+def _segment_source_span_id(segment: Segment) -> str:
+    source_span_id = segment.annotations.get("source_span_id")
+    if isinstance(source_span_id, str) and source_span_id.strip():
+        return source_span_id
+    return f"span:{segment.start_ms}:{segment.end_ms}"
+
+
+def _span_text_from_segments(
+    segments: tuple[Segment, ...],
+    source_span_id: str,
+    *,
+    field_name: str,
+) -> str | None:
+    matching = [
+        getattr(segment, field_name)
+        for segment in segments
+        if _segment_source_span_id(segment) == source_span_id
+        and isinstance(getattr(segment, field_name), str)
+    ]
+    joined = " ".join(str(text).strip() for text in matching if str(text).strip()).strip()
+    return _truncate_excerpt(joined or None)
+
+
+def _default_review_variant_id(
+    *,
+    variants: list[dict[str, Any]],
+    preferred_candidate_id: str | None,
+) -> str | None:
+    if preferred_candidate_id is not None:
+        for variant in variants:
+            if variant["candidate_id"] == preferred_candidate_id:
+                return cast(str, variant["candidate_id"])
+    if not variants:
+        return None
+    return cast(str, variants[0]["candidate_id"])
+
+
 def _parse_span_id(source_span_id: str | None) -> tuple[int | None, int | None]:
     if source_span_id is None:
         return None, None
@@ -1239,11 +1655,25 @@ def _span_sort_key(source_span_id: str | None) -> tuple[int, int]:
 
 
 def _severity_sort_key(severity: str) -> int:
-    return {"critical": 0, "major": 1, "minor": 2}.get(severity, 3)
+    return {"critical": 0, "major": 1, "minor": 2, "none": 3}.get(severity, 4)
 
 
 def _max_severity(left: str, right: str) -> str:
     return left if _severity_sort_key(left) <= _severity_sort_key(right) else right
+
+
+def _max_optional_severity(left: str, right: str) -> str:
+    if left == "none":
+        return right
+    return _max_severity(left, right)
+
+
+def _load_draft_resolution(context: ReviewSessionContext) -> ReviewDraftResolution | None:
+    return _optional_model(
+        context.runtime,
+        review_draft_key(context.job),
+        model_type=ReviewDraftResolution,
+    )
 
 
 def _load_resolution_payload(context: ReviewSessionContext) -> dict[str, Any] | None:
@@ -1306,19 +1736,267 @@ def _validate_resolution_inputs(
     *,
     resolution_kind: HumanSupervisionKind,
     candidate_id: str | None,
+    reviewed_span_decisions: tuple[ReviewedSpanDecision, ...],
     failure_tags: tuple[FailureTag, ...],
     translation_candidates: dict[str, TranslationCandidate],
 ) -> None:
     if resolution_kind in {"approved_good", "approved_best_available"}:
-        if candidate_id is None:
-            raise ValueError("candidate_id is required for approved resolutions")
-        if candidate_id not in translation_candidates:
+        if candidate_id is None and not reviewed_span_decisions:
+            raise ValueError("candidate_id or reviewed_span_decisions is required")
+        if candidate_id is not None and candidate_id not in translation_candidates:
             raise ValueError(f"unknown candidate_id: {candidate_id}")
     if resolution_kind == "rejected_all":
-        if candidate_id is not None:
-            raise ValueError("candidate_id is forbidden for rejected_all")
+        if candidate_id is not None or reviewed_span_decisions:
+            raise ValueError(
+                "candidate_id and reviewed_span_decisions are forbidden for rejected_all"
+            )
         if not failure_tags:
             raise ValueError("at least one failure_tag is required for rejected_all")
+
+
+def _validated_reviewed_span_decisions(
+    reviewed_span_decisions: tuple[ReviewedSpanDecision, ...],
+    *,
+    review_spans: list[dict[str, Any]],
+    translation_candidates: dict[str, TranslationCandidate],
+    transcript_candidates: dict[str, TranscriptCandidate],
+) -> tuple[ReviewedSpanDecision, ...]:
+    span_map = {
+        cast(str, span["source_span_id"]): span
+        for span in review_spans
+        if span.get("source_span_id")
+    }
+    decisions_by_span = {decision.source_span_id: decision for decision in reviewed_span_decisions}
+    missing = [span_id for span_id in span_map if span_id not in decisions_by_span]
+    if missing:
+        raise ValueError(f"missing reviewed span decisions for: {', '.join(sorted(missing))}")
+    normalized: list[ReviewedSpanDecision] = []
+    for span_id, span in span_map.items():
+        decision = decisions_by_span[span_id]
+        if decision.selected_candidate_id not in translation_candidates:
+            raise ValueError(f"unknown selected_candidate_id: {decision.selected_candidate_id}")
+        variants = {
+            cast(str, variant["candidate_id"]): variant
+            for variant in cast(list[dict[str, Any]], span["variants"])
+        }
+        if decision.selected_candidate_id not in variants:
+            raise ValueError(
+                f"selected_candidate_id {decision.selected_candidate_id} does not overlap {span_id}"
+            )
+        candidate = translation_candidates[decision.selected_candidate_id]
+        transcript = transcript_candidates.get(candidate.source_transcript_candidate_id or "")
+        variant = variants[decision.selected_candidate_id]
+        base_text = decision.base_target_text or cast(str, variant["target_excerpt"])
+        final_text = decision.final_target_text or base_text
+        normalized.append(
+            decision.model_copy(
+                update={
+                    "start_ms": cast(int, span["start_ms"]),
+                    "end_ms": cast(int, span["end_ms"]),
+                    "selected_source_transcript_candidate_id": (
+                        decision.selected_source_transcript_candidate_id
+                        or candidate.source_transcript_candidate_id
+                    ),
+                    "selected_transcript_provider_id": (
+                        decision.selected_transcript_provider_id
+                        or (transcript.provider_id if transcript is not None else None)
+                    ),
+                    "base_target_text": base_text,
+                    "final_target_text": final_text,
+                    "edited": decision.edited or final_text != base_text,
+                }
+            )
+        )
+    normalized.sort(key=lambda item: _span_sort_key(item.source_span_id))
+    return tuple(normalized)
+
+
+def _legacy_reviewed_span_decisions(
+    *,
+    candidate_id: str,
+    review_spans: list[dict[str, Any]],
+    translation_candidates: dict[str, TranslationCandidate],
+    transcript_candidates: dict[str, TranscriptCandidate],
+) -> tuple[ReviewedSpanDecision, ...]:
+    if candidate_id not in translation_candidates:
+        raise ValueError(f"unknown candidate_id: {candidate_id}")
+    decisions: list[ReviewedSpanDecision] = []
+    candidate = translation_candidates[candidate_id]
+    transcript = transcript_candidates.get(candidate.source_transcript_candidate_id or "")
+    for span in review_spans:
+        variants = {
+            cast(str, variant["candidate_id"]): variant
+            for variant in cast(list[dict[str, Any]], span["variants"])
+        }
+        variant = variants.get(candidate_id)
+        if variant is None:
+            raise ValueError(f"candidate {candidate_id} does not cover {span['source_span_id']}")
+        base_text = cast(str, variant["target_excerpt"])
+        decisions.append(
+            ReviewedSpanDecision(
+                source_span_id=cast(str, span["source_span_id"]),
+                start_ms=cast(int, span["start_ms"]),
+                end_ms=cast(int, span["end_ms"]),
+                selected_candidate_id=candidate_id,
+                selected_source_transcript_candidate_id=candidate.source_transcript_candidate_id,
+                selected_transcript_provider_id=(
+                    transcript.provider_id if transcript is not None else None
+                ),
+                base_target_text=base_text,
+                final_target_text=base_text,
+                edited=False,
+            )
+        )
+    return tuple(decisions)
+
+
+def _synthesize_reviewed_translation_candidate(
+    *,
+    context: ReviewSessionContext,
+    decisions: tuple[ReviewedSpanDecision, ...],
+    output_data: dict[str, Any],
+) -> TranslationCandidate:
+    candidate_id = f"human-reviewed-{context.run_record.run_id}"
+    transcript_candidate_ids = {
+        decision.selected_source_transcript_candidate_id
+        for decision in decisions
+        if decision.selected_source_transcript_candidate_id is not None
+    }
+    segments = tuple(
+        Segment(
+            segment_id=f"{candidate_id}:{index}",
+            start_ms=decision.start_ms,
+            end_ms=decision.end_ms,
+            source_text=_source_text_for_synthesized_span(
+                decision=decision,
+                context=context,
+            ),
+            target_text=decision.final_target_text,
+            annotations={
+                "source_span_id": decision.source_span_id,
+                "selected_candidate_id": decision.selected_candidate_id,
+                "selected_source_transcript_candidate_id": (
+                    decision.selected_source_transcript_candidate_id
+                ),
+                "selected_transcript_provider_id": decision.selected_transcript_provider_id,
+                "base_target_text": decision.base_target_text,
+                "edited": decision.edited,
+                "reviewer_note": decision.reviewer_note,
+                "reviewed": True,
+            },
+        )
+        for index, decision in enumerate(
+            sorted(decisions, key=lambda item: _span_sort_key(item.source_span_id)),
+            start=1,
+        )
+    )
+    synthesized = normalize_translation_candidate(
+        TranslationCandidate(
+            candidate_id=candidate_id,
+            job_id=context.job.job_id,
+            source_transcript_candidate_id=(
+                next(iter(transcript_candidate_ids)) if len(transcript_candidate_ids) == 1 else None
+            ),
+            final_transcript_ref=_optional_string(output_data.get("final_transcript_ref")),
+            model_id="human-reviewed",
+            prompt_variant_id="reviewed-synthesis",
+            prompt_version="translation-human-review-v1",
+            language=context.job.target_language,
+            segments=segments,
+            full_text=" ".join(
+                decision.final_target_text.strip()
+                for decision in decisions
+                if decision.final_target_text.strip()
+            ),
+            normalization_version="human-review-synthesis/v1",
+            metadata={
+                "review_mode": "human_review_synthesis",
+                "reviewed_run_id": context.run_record.run_id,
+                "reviewed_span_count": len(decisions),
+                "provenance_summary": {
+                    "translation_candidate_ids": sorted(
+                        {decision.selected_candidate_id for decision in decisions}
+                    ),
+                    "source_transcript_candidate_ids": sorted(
+                        {
+                            decision.selected_source_transcript_candidate_id
+                            for decision in decisions
+                            if decision.selected_source_transcript_candidate_id is not None
+                        }
+                    ),
+                    "transcript_provider_ids": sorted(
+                        {
+                            decision.selected_transcript_provider_id
+                            for decision in decisions
+                            if decision.selected_transcript_provider_id is not None
+                        }
+                    ),
+                },
+                "reviewed_span_decisions": [
+                    decision.model_dump(mode="json") for decision in decisions
+                ],
+            },
+        )
+    )
+    return synthesized
+
+
+def _source_text_for_synthesized_span(
+    *,
+    decision: ReviewedSpanDecision,
+    context: ReviewSessionContext,
+) -> str | None:
+    transcript_id = decision.selected_source_transcript_candidate_id
+    if transcript_id is None:
+        return None
+    transcript = next(
+        (
+            candidate
+            for candidate in context.runtime.decision_store.list_transcript_candidates(
+                context.job.job_id,
+                storage_job_id=operational_job_key(context.job),
+            )
+            if candidate.candidate_id == transcript_id
+        ),
+        None,
+    )
+    if transcript is None:
+        return None
+    return _span_text_from_segments(
+        transcript.segments,
+        decision.source_span_id,
+        field_name="source_text",
+    )
+
+
+def _dominant_translation_candidate(
+    *,
+    decisions: tuple[ReviewedSpanDecision, ...],
+    translation_candidates: dict[str, TranslationCandidate],
+) -> TranslationCandidate | None:
+    if not decisions:
+        return None
+    counts: dict[str, int] = {}
+    for decision in decisions:
+        counts[decision.selected_candidate_id] = counts.get(decision.selected_candidate_id, 0) + 1
+    candidate_id = sorted(counts.items(), key=lambda item: (-item[1], item[0]))[0][0]
+    return translation_candidates.get(candidate_id)
+
+
+def _single_approved_transcript(
+    *,
+    decisions: tuple[ReviewedSpanDecision, ...],
+    transcript_candidates: dict[str, TranscriptCandidate],
+) -> TranscriptCandidate | None:
+    transcript_ids = {
+        decision.selected_source_transcript_candidate_id
+        for decision in decisions
+        if decision.selected_source_transcript_candidate_id is not None
+    }
+    if len(transcript_ids) != 1:
+        return None
+    transcript_id = next(iter(transcript_ids))
+    return transcript_candidates.get(transcript_id)
 
 
 def _reviewed_candidate_contexts(
@@ -1794,6 +2472,7 @@ def _resolution_publish_state(
     *,
     context: ReviewSessionContext,
     output_data: dict[str, Any],
+    final_translation_candidate: TranslationCandidate | None,
     approved_candidate: TranslationCandidate | None,
     approved_transcript: TranscriptCandidate | None,
     resolution_ref: str,
@@ -1844,7 +2523,9 @@ def _resolution_publish_state(
             )
         ),
         final_translation_candidate_id=(
-            approved_candidate.candidate_id if approved_candidate is not None else None
+            final_translation_candidate.candidate_id
+            if final_translation_candidate is not None
+            else None
         ),
         final_translation_decision_ref=output_data.get("translation_decision_ref")
         or translation_decision_key(context.job),
