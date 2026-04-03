@@ -204,6 +204,8 @@ Special cases:
 - a translation conflict investigation can time out and be converted into `human_review`
 - human review is translation-only; approving a translation candidate implicitly selects its source
   transcript candidate
+- normal disagreements with a surviving machine winner stay in machine adjudication and do not
+  open routine human review
 
 Outputs:
 
@@ -225,7 +227,7 @@ Outputs:
 - published transcript when a transcript winner exists
 - published translation when a translation winner exists and human review is not required
 - approval-driven republish of transcript, translation, exports, and deliveries when a human
-  selects a translation candidate
+  publishes a flagged-span review decision
 - recoverable translation failure manifest when translation generation failed
 - scorecard
 - exports

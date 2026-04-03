@@ -255,6 +255,7 @@ def build_review_payload(
         reviews=translation_reviews,
         draft_resolution=draft_resolution,
     )
+    flagged_spans = _build_flagged_spans(review_spans)
     candidate_summaries = contradiction_summary["candidate_summaries"]
     for payload in candidate_payloads:
         candidate_summary = candidate_summaries.get(str(payload["candidate_id"]), {})
@@ -271,12 +272,16 @@ def build_review_payload(
         contradiction_summary=contradiction_summary,
         reviews=translation_reviews,
     )
+    blocking_span_count = sum(1 for span in flagged_spans if bool(span.get("blocking")))
+    warning_span_count = len(flagged_spans) - blocking_span_count
     return {
         "run_id": run_id,
         "job_id": context.job.job_id,
         "status": context.run_record.status,
+        "review_mode": "exception_only",
         "review_required_stage": output_data.get("review_required_stage"),
         "review_available": output_data.get("review_required_stage") == "translation",
+        "recommended_candidate_id": preferred_candidate_id,
         "resolution_ref": resolution.get("resolution_ref") if resolution else None,
         "resolution_kind": resolution.get("resolution_kind") if resolution else None,
         "failure_tags": list(resolution.get("failure_tags", [])) if resolution else [],
@@ -313,6 +318,10 @@ def build_review_payload(
             "machine_review_refs": machine_review_refs,
         },
         "human_review_summary": contradiction_summary["summary"],
+        "flagged_spans": flagged_spans,
+        "auto_accepted_span_count": max(len(review_spans) - len(flagged_spans), 0),
+        "blocking_span_count": blocking_span_count,
+        "warning_span_count": warning_span_count,
         "review_spans": review_spans,
         "draft_resolution": (
             draft_resolution.model_dump(mode="json") if draft_resolution is not None else None
@@ -1193,6 +1202,14 @@ def _build_review_spans(
             )
         )
         draft = draft_by_span.get(span_id)
+        recommended_variant_id = _default_review_variant_id(
+            variants=variants,
+            preferred_candidate_id=preferred_candidate_id,
+        )
+        selected_variant_id = (
+            draft.selected_base_variant_id if draft is not None else recommended_variant_id
+        )
+        acknowledged = draft.acknowledged if draft is not None else False
         review_spans.append(
             {
                 "source_span_id": span_id,
@@ -1200,6 +1217,7 @@ def _build_review_spans(
                 "end_ms": entry["end_ms"],
                 "time_range": entry["time_range"],
                 "severity_summary": entry["severity_summary"],
+                "severity": entry["severity_summary"],
                 "blocking": entry["blocking"],
                 "reviewer_roles": sorted(cast(list[str], entry["reviewer_roles"])),
                 "evidence_summary": evidence_summary,
@@ -1208,19 +1226,18 @@ def _build_review_spans(
                     list[dict[str, Any]],
                     entry["transcript_provenance_options"],
                 ),
+                "recommended_variant_id": recommended_variant_id,
                 "variants": variants,
                 "current_draft_decision": {
-                    "selected_base_variant_id": (
-                        draft.selected_base_variant_id
-                        if draft is not None
-                        else _default_review_variant_id(
-                            variants=variants,
-                            preferred_candidate_id=preferred_candidate_id,
-                        )
-                    ),
+                    "selected_base_variant_id": selected_variant_id,
+                    "selected_variant_id": selected_variant_id,
+                    "recommended_variant_id": recommended_variant_id,
                     "edited_text": draft.edited_text if draft is not None else None,
+                    "acknowledged": acknowledged,
                     "resolution_status": (
-                        draft.resolution_status if draft is not None else "unresolved"
+                        draft.resolution_status
+                        if draft is not None
+                        else ("resolved" if acknowledged else "unresolved")
                     ),
                     "dirty": draft.dirty if draft is not None else False,
                     "reviewer_note": draft.reviewer_note if draft is not None else "",
@@ -1236,6 +1253,67 @@ def _build_review_spans(
         )
     )
     return review_spans
+
+
+def _build_flagged_spans(review_spans: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    flagged_spans: list[dict[str, Any]] = []
+    for span in review_spans:
+        evidence_summary = [
+            item for item in span.get("evidence_summary", []) if isinstance(item, dict)
+        ]
+        recommended_variant_id = cast(str | None, span.get("recommended_variant_id"))
+        if not (bool(span.get("blocking")) or evidence_summary or recommended_variant_id is None):
+            continue
+        current_draft = cast(dict[str, Any], span.get("current_draft_decision") or {})
+        flagged_spans.append(
+            {
+                "source_span_id": span["source_span_id"],
+                "time_range": span["time_range"],
+                "source_excerpt": span["source_excerpt"],
+                "blocking": bool(span.get("blocking")),
+                "severity": span.get("severity_summary") or "none",
+                "issue_summary": _issue_summary_for_span(span),
+                "recommended_variant_id": recommended_variant_id,
+                "variants": span["variants"],
+                "selected_variant_id": (
+                    current_draft.get("selected_variant_id")
+                    or current_draft.get("selected_base_variant_id")
+                    or recommended_variant_id
+                ),
+                "edited_text": current_draft.get("edited_text"),
+                "acknowledged": bool(current_draft.get("acknowledged")),
+                "evidence_summary": evidence_summary,
+                "transcript_provenance_options": span.get("transcript_provenance_options", []),
+            }
+        )
+    flagged_spans.sort(
+        key=lambda item: (
+            0 if cast(bool, item["blocking"]) else 1,
+            _span_sort_key(cast(str, item["source_span_id"])),
+        )
+    )
+    return flagged_spans
+
+
+def _issue_summary_for_span(span: dict[str, Any]) -> str:
+    evidence_summary = [item for item in span.get("evidence_summary", []) if isinstance(item, dict)]
+    if not evidence_summary:
+        if not span.get("recommended_variant_id"):
+            return "Machine adjudication could not recommend a variant for this span."
+        return "Operator confirmation required for this span."
+    primary = evidence_summary[0]
+    reviewer_roles = {
+        str(item.get("reviewer_role"))
+        for item in evidence_summary
+        if item.get("reviewer_role") is not None
+    }
+    severity = str(primary.get("severity") or span.get("severity_summary") or "minor")
+    dimension = str(primary.get("dimension") or "meaning").replace("_", " ")
+    blocker = "blocking" if span.get("blocking") else "warning"
+    return (
+        f"{severity} {dimension} disagreement; {blocker} review item "
+        f"raised by {len(reviewer_roles) or 1} reviewer(s)."
+    )
 
 
 def _record_contradiction(

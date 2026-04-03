@@ -130,21 +130,7 @@ def assess_review_disagreement(
         + (0.8 if escalation_signal_count else 0.0)
     )
     total_score = round(base_score * _RISK_MULTIPLIERS.get(content_risk_class, 1.0), 4)
-    human_review_required = (
-        preferred_candidate_id is None
-        or contradiction_summary.blocking_hard_count >= 2
-        or (
-            contradiction_summary.blocking_hard_count >= 1
-            and content_risk_class in {"legal", "medical", "critical"}
-            and highest_issue_severity == "critical"
-        )
-        or (
-            highest_issue_severity == "critical"
-            and escalation_signal_count == len(reviews)
-            and content_risk_class == "critical"
-        )
-        or total_score >= 15.0
-    )
+    human_review_required = preferred_candidate_id is None
     if human_review_required:
         decision_mode = "human_review"
     elif contradiction_summary.blocking_hard_count >= 1:
@@ -525,6 +511,20 @@ def _execute_escalation(
 ) -> InvestigationResult | None:
     if assessment.decision_mode == "automatic_finalize" and not single_candidate_escalation:
         return None
+    if assessment.preferred_candidate_id is None:
+        payload = {
+            "status": "unresolved",
+            "strategy": "no surviving candidate",
+            "review_ids": list(context.review_ids),
+        }
+        return InvestigationResult(
+            status="unresolved",
+            strategy="no surviving candidate",
+            recommended_candidate_id=None,
+            confidence_adjustment=0.0,
+            rationale="No translation candidate survived structured adjudication.",
+            payload=payload,
+        )
     if single_candidate_escalation:
         payload = {
             "status": "checked",
@@ -553,6 +553,16 @@ def _execute_escalation(
         "contradictions": assessment.contradictory_evidence_count,
         "winner": assessment.preferred_candidate_id,
     }
+    if _requires_human_follow_up_after_escalation(assessment=assessment, context=context):
+        payload["status"] = "unresolved"
+        return InvestigationResult(
+            status="unresolved",
+            strategy=strategy,
+            recommended_candidate_id=None,
+            confidence_adjustment=-0.1,
+            rationale="Blocking contradiction remained unresolved after machine escalation.",
+            payload=payload,
+        )
     return InvestigationResult(
         status="resolved",
         strategy=strategy,
@@ -580,6 +590,26 @@ def _decision_confidence(
     if final_decision_mode == "human_review":
         return 0.0
     return round(max(0.0, min(base + confidence_adjustment, 0.99)), 2)
+
+
+def _requires_human_follow_up_after_escalation(
+    *,
+    assessment: DisagreementAssessment,
+    context: AdjudicationContext,
+) -> bool:
+    if (
+        context.stage == "transcript"
+        and assessment.highest_issue_severity == "critical"
+        and assessment.escalation_signal_count >= 1
+        and assessment.total_score >= 8.0
+    ):
+        return True
+    return (
+        assessment.highest_issue_severity == "critical"
+        and assessment.winner_mismatch
+        and assessment.escalation_signal_count >= 1
+        and (assessment.blocking_hard_contradiction_count >= 1 or assessment.total_score >= 10.0)
+    )
 
 
 def _rationale_summary(
