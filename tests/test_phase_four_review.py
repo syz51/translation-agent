@@ -26,6 +26,7 @@ from translation_agent.observability import NoOpTraceSink
 from translation_agent.review import (
     adjudicate_reviews,
     parse_reviewer_output,
+    render_reviewer_output,
     reviewer_roles_for_stage,
 )
 from translation_agent.storage import LocalBlobStore, NodeExecutionRecord, RunRecord, job_path
@@ -348,14 +349,18 @@ def test_parallel_review_generation_preserves_review_id_order(
     gate_release = threading.Event()
 
     def delayed_render(review_context, candidates, prompt_text, final_transcript):  # noqa: ANN001
-        del candidates, prompt_text, final_transcript
         if review_context.reviewer_role == first_role:
             gate_started.set()
             assert gate_release.wait(timeout=1)
         else:
             assert gate_started.wait(timeout=1)
             gate_release.set()
-        return f"review:{review_context.stage}:{review_context.reviewer_role}"
+        return render_reviewer_output(
+            review_context,
+            candidates=candidates,
+            prompt_text=prompt_text,
+            final_transcript=final_transcript,
+        )
 
     monkeypatch.setattr("translation_agent.nodes.review.render_reviewer_output", delayed_render)
 

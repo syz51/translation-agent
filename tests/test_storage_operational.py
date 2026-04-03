@@ -9,6 +9,7 @@ from translation_agent.models import (
     AdjudicationScorecard,
     FinalTranscriptDecision,
     FinalTranslationDecision,
+    HistoricalRunLink,
     JobContext,
     MemoryWrite,
     MemoryWriteBatch,
@@ -476,6 +477,62 @@ def test_sqlite_operational_store_resolves_assets_and_persists_prompt_proposals(
     assert len(proposals) == 1
     assert proposals[0].status == "active"
     assert proposals[0].compatibility is not None
+
+
+@pytest.mark.unit
+def test_sqlite_historical_run_link_upsert_merges_prompt_metadata(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.sqlite3"
+    created_at = datetime(2026, 4, 2, 12, 0, tzinfo=UTC)
+
+    with SQLiteOperationalStore(db_path) as store:
+        store.resolve_asset(
+            asset_id="asset-1",
+            media_fingerprint="sha256:merge-test",
+            first_seen_run_id="run-merge",
+            source_language="en",
+            target_language="fr",
+        )
+        store.upsert_historical_run_link(
+            HistoricalRunLink(
+                run_id="run-merge",
+                media_key="asset-id:asset-1",
+                job_id="job-merge",
+                tenant_id="tenant-1",
+                project_id="project-1",
+                source_language="en",
+                target_language="fr",
+                created_at=created_at,
+                translation_model_id="gpt-5.4-mini",
+                translation_prompt_variant_id="variant-a",
+                translation_base_prompt_version="phase-5-v1",
+                translation_effective_prompt_version="phase-5-v1+active-12345678",
+                prompt_scope_kind="project_pair",
+                prompt_scope_key="tenant-1::project-1::en::fr",
+                prompt_resolution_mode="active",
+                prompt_proposal_id="proposal-1",
+            )
+        )
+        store.upsert_historical_run_link(
+            HistoricalRunLink(
+                run_id="run-merge",
+                media_key="asset-id:asset-1",
+                job_id="job-merge",
+                tenant_id="tenant-1",
+                project_id="project-1",
+                source_language="en",
+                target_language="fr",
+                created_at=created_at,
+                translation_ref="translations/final.json",
+            )
+        )
+
+    with SQLiteOperationalStore(db_path) as reopened:
+        links = reopened.list_historical_run_links("asset-id:asset-1")
+
+    assert len(links) == 1
+    assert links[0].translation_ref == "translations/final.json"
+    assert links[0].prompt_scope_kind == "project_pair"
+    assert links[0].prompt_proposal_id == "proposal-1"
 
 
 @pytest.mark.unit

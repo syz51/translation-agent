@@ -978,6 +978,13 @@ class PostgresOperationalStore(PostgresRunStore):
 
     def upsert_historical_run_link(self, link: HistoricalRunLink) -> None:
         now = _utc_now()
+        existing_row = self._conn.execute(
+            "SELECT link_json FROM historical_run_links WHERE run_id = %s",
+            (link.run_id,),
+        ).fetchone()
+        if existing_row is not None:
+            existing = HistoricalRunLink.model_validate(_decode_db_json(existing_row["link_json"]))
+            link = _merge_historical_run_link(existing, link)
         with self._conn.transaction():
             self._conn.execute(
                 """
@@ -1543,6 +1550,15 @@ class SQLiteOperationalStore(AbstractContextManager["SQLiteOperationalStore"]):
 
     def upsert_historical_run_link(self, link: HistoricalRunLink) -> None:
         now = _utc_now()
+        existing_row = self._conn.execute(
+            "SELECT link_json FROM historical_run_links WHERE run_id = ?",
+            (link.run_id,),
+        ).fetchone()
+        if existing_row is not None:
+            existing = HistoricalRunLink.model_validate(
+                _decode_sqlite_json(existing_row["link_json"])
+            )
+            link = _merge_historical_run_link(existing, link)
         with self._conn:
             self._conn.execute(
                 """
@@ -2320,6 +2336,18 @@ def _proposal_metadata_value(
         normalized = value.strip()
         return normalized or None
     return None
+
+
+def _merge_historical_run_link(
+    existing: HistoricalRunLink,
+    incoming: HistoricalRunLink,
+) -> HistoricalRunLink:
+    merged: dict[str, Any] = existing.model_dump(mode="python")
+    for key, value in incoming.model_dump(mode="python").items():
+        if value is None:
+            continue
+        merged[key] = value
+    return HistoricalRunLink.model_validate(merged)
 
 
 def _normalized_proposal_status(status: str | None) -> str | None:

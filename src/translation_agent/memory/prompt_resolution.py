@@ -1,4 +1,4 @@
-"""Prompt resolution over exact-match active and canary proposal overlays."""
+"""Prompt resolution over exact-match project-pair and promoted pair overlays."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import json
 from hashlib import sha256
 from typing import Protocol, cast, runtime_checkable
 
+from translation_agent.memory.recall import build_scope_key
 from translation_agent.models import (
     PromptCompatibilityTuple,
     PromptEvolutionProposal,
@@ -49,15 +50,15 @@ class PromptResolver(Protocol):
         model_id: str,
         source_language: str,
         target_language: str,
+        tenant_id: str = "",
+        project_id: str = "",
         media_key: str | None = None,
         run_id: str | None = None,
-        scope_kind: str = "pair",
-        scope_key: str | None = None,
     ) -> ResolvedTranslationPrompt: ...
 
 
 class ProposalBackedPromptResolver:
-    """Apply exact-match active proposals and deterministic canary overlays."""
+    """Apply project-pair overlays first, then promoted pair overlays."""
 
     def __init__(
         self, proposal_store: object | None = None, blob_store: object | None = None
@@ -73,51 +74,79 @@ class ProposalBackedPromptResolver:
         model_id: str,
         source_language: str,
         target_language: str,
+        tenant_id: str = "",
+        project_id: str = "",
         media_key: str | None = None,
         run_id: str | None = None,
-        scope_kind: str = "pair",
-        scope_key: str | None = None,
     ) -> ResolvedTranslationPrompt:
-        compatibility = PromptCompatibilityTuple(
+        project_pair = PromptCompatibilityTuple(
             prompt_family="translation",
             model_id=model_id,
             prompt_variant_id=prompt_variant_id,
             base_prompt_version=base_prompt_version,
             source_language=source_language,
             target_language=target_language,
-            scope_kind=scope_kind,  # type: ignore[arg-type]
-            scope_key=scope_key or f"{source_language}::{target_language}",
+            scope_kind="project_pair",
+            scope_key=build_scope_key(
+                scope_kind="project_pair",
+                tenant_id=tenant_id,
+                project_id=project_id,
+                source_language=source_language,
+                target_language=target_language,
+            ),
         )
-        self._promote_proposed_if_needed(
-            compatibility=compatibility,
+        pair = PromptCompatibilityTuple(
+            prompt_family="translation",
+            model_id=model_id,
+            prompt_variant_id=prompt_variant_id,
+            base_prompt_version=base_prompt_version,
+            source_language=source_language,
+            target_language=target_language,
+            scope_kind="pair",
+            scope_key=build_scope_key(
+                scope_kind="pair",
+                tenant_id=tenant_id,
+                project_id=project_id,
+                source_language=source_language,
+                target_language=target_language,
+            ),
+        )
+
+        self._promote_proposed_if_needed(compatibility=project_pair, media_key=media_key)
+        project_pair_selection = self._select_overlay(
+            compatibility=project_pair,
             media_key=media_key,
+            run_id=run_id,
+            pair_scope=False,
         )
-        active_proposals = self._matching_proposals(
-            compatibility=compatibility,
-            status="active",
-            media_key=media_key,
+        pair_selection = (
+            None
+            if project_pair_selection is not None
+            else self._select_overlay(
+                compatibility=pair,
+                media_key=media_key,
+                run_id=run_id,
+                pair_scope=True,
+            )
         )
-        canary_proposals = self._matching_proposals(
-            compatibility=compatibility,
-            status="canary",
-            media_key=media_key,
-        )
-        selected: tuple[PromptEvolutionProposal, ...]
-        resolution_mode = "control"
-        if canary_proposals and run_id is not None and _is_canary_run(run_id):
-            selected = canary_proposals[:1]
-            resolution_mode = "canary"
-        else:
-            selected = active_proposals
-            if active_proposals:
-                resolution_mode = "active"
+        selected = project_pair_selection or pair_selection
+        selected_scope = project_pair if project_pair_selection is not None else pair
+        if selected is None:
+            selected_scope = project_pair
         instructions = tuple(
-            change.instruction for proposal in selected for change in proposal.suggested_changes
+            change.instruction
+            for proposal in selected or ()
+            for change in proposal.suggested_changes
         )
-        proposal_refs = tuple(ref for proposal in selected for ref in _proposal_refs(proposal))
+        proposal_refs = tuple(
+            ref for proposal in selected or () for ref in _proposal_refs(proposal)
+        )
         effective_prompt_version = base_prompt_version
-        selected_proposal_id = selected[0].proposal_id if selected else None
+        resolution_mode = "control"
+        selected_proposal_id = None
         if selected:
+            resolution_mode = "canary" if selected[0].status == "canary" else "active"
+            selected_proposal_id = selected[0].proposal_id
             version_suffix = sha256(
                 "|".join(proposal.proposal_id for proposal in selected).encode("utf-8")
             ).hexdigest()[:8]
@@ -128,9 +157,37 @@ class ProposalBackedPromptResolver:
             effective_prompt_version=effective_prompt_version,
             resolution_mode=resolution_mode,  # type: ignore[arg-type]
             selected_proposal_id=selected_proposal_id,
+            scope_kind=selected_scope.scope_kind,
+            scope_key=selected_scope.scope_key,
             instructions=instructions,
             applied_proposal_refs=proposal_refs,
         )
+
+    def _select_overlay(
+        self,
+        *,
+        compatibility: PromptCompatibilityTuple,
+        media_key: str | None,
+        run_id: str | None,
+        pair_scope: bool,
+    ) -> tuple[PromptEvolutionProposal, ...] | None:
+        active = self._matching_proposals(
+            compatibility=compatibility,
+            status="active",
+            media_key=media_key,
+            pair_scope=pair_scope,
+        )
+        canary = self._matching_proposals(
+            compatibility=compatibility,
+            status="canary",
+            media_key=media_key,
+            pair_scope=pair_scope,
+        )
+        if canary and run_id is not None and _is_canary_run(run_id):
+            return canary[:1]
+        if active:
+            return active
+        return None
 
     def _matching_proposals(
         self,
@@ -138,6 +195,7 @@ class ProposalBackedPromptResolver:
         compatibility: PromptCompatibilityTuple,
         status: str,
         media_key: str | None,
+        pair_scope: bool,
     ) -> tuple[PromptEvolutionProposal, ...]:
         matched: list[PromptEvolutionProposal] = []
         if self._proposal_store is None:
@@ -145,6 +203,7 @@ class ProposalBackedPromptResolver:
                 compatibility=compatibility,
                 status=status,
                 media_key=media_key,
+                pair_scope=pair_scope,
             )
 
         if hasattr(self._proposal_store, "list_prompt_evolution_proposals"):
@@ -163,13 +222,19 @@ class ProposalBackedPromptResolver:
                     scope_key=compatibility.scope_key,
                     media_key=None,
                 )
-                if _proposal_matches(proposal, compatibility, media_key=media_key)
+                if _proposal_matches(
+                    proposal,
+                    compatibility,
+                    media_key=media_key,
+                    pair_scope=pair_scope,
+                )
             )
 
         for proposal in self._matching_blob_proposals(
             compatibility=compatibility,
             status=status,
             media_key=media_key,
+            pair_scope=pair_scope,
         ):
             if all(existing.proposal_id != proposal.proposal_id for existing in matched):
                 matched.append(proposal)
@@ -181,6 +246,7 @@ class ProposalBackedPromptResolver:
         compatibility: PromptCompatibilityTuple,
         status: str,
         media_key: str | None,
+        pair_scope: bool,
     ) -> tuple[PromptEvolutionProposal, ...]:
         store = self._blob_store if self._blob_store is not None else self._proposal_store
         if (
@@ -196,17 +262,15 @@ class ProposalBackedPromptResolver:
         for key in keys:
             proposal = PromptEvolutionProposal.model_validate_json(blob_store.read_bytes(key))
             if proposal.status != status or not _proposal_matches(
-                proposal, compatibility, media_key=media_key
+                proposal,
+                compatibility,
+                media_key=media_key,
+                pair_scope=pair_scope,
             ):
                 continue
             matched.append(
                 proposal.model_copy(
-                    update={
-                        "metadata": {
-                            **proposal.metadata,
-                            "asset_proposal_ref": key,
-                        }
-                    }
+                    update={"metadata": {**proposal.metadata, "asset_proposal_ref": key}}
                 )
             )
         return tuple(matched)
@@ -222,22 +286,30 @@ class ProposalBackedPromptResolver:
         ):
             return
         if self._matching_proposals(
-            compatibility=compatibility, status="active", media_key=media_key
+            compatibility=compatibility,
+            status="active",
+            media_key=media_key,
+            pair_scope=False,
         ):
             return
         if self._matching_proposals(
-            compatibility=compatibility, status="canary", media_key=media_key
+            compatibility=compatibility,
+            status="canary",
+            media_key=media_key,
+            pair_scope=False,
         ):
             return
         proposed = self._matching_proposals(
             compatibility=compatibility,
             status="proposed",
             media_key=media_key,
+            pair_scope=False,
         )
         proposed = tuple(
             proposal
             for proposal in proposed
-            if proposal.metadata.get("proposal_origin") == "human_review_feedback"
+            if proposal.metadata.get("proposal_origin")
+            in {"human_review_feedback", "mainline_adjudication"}
         )
         if not proposed:
             return
@@ -273,9 +345,20 @@ def _proposal_matches(
     compatibility: PromptCompatibilityTuple,
     *,
     media_key: str | None,
+    pair_scope: bool,
 ) -> bool:
     if proposal.compatibility != compatibility:
         return False
+    if proposal.compatibility is None:
+        return False
+    if proposal.compatibility.scope_kind == "asset":
+        return False
+    if pair_scope and proposal.compatibility.scope_kind == "pair":
+        promotion_status = proposal.promotion_status
+        if promotion_status != "promoted":
+            legacy_status = proposal.metadata.get("promotion_status")
+            if legacy_status not in {None, "promoted"}:
+                return False
     proposal_media_key = proposal.metadata.get("media_key")
     if isinstance(proposal_media_key, str) and proposal_media_key.strip():
         return proposal_media_key == media_key
@@ -286,6 +369,9 @@ def _proposal_refs(proposal: PromptEvolutionProposal) -> tuple[str, ...]:
     asset_ref = proposal.metadata.get("asset_proposal_ref")
     if isinstance(asset_ref, str) and asset_ref.strip():
         return (asset_ref,)
+    proposal_ref = proposal.metadata.get("proposal_ref")
+    if isinstance(proposal_ref, str) and proposal_ref.strip():
+        return (proposal_ref,)
     media_key = proposal.metadata.get("media_key")
     if isinstance(media_key, str) and media_key.strip():
         return (
@@ -295,9 +381,6 @@ def _proposal_refs(proposal: PromptEvolutionProposal) -> tuple[str, ...]:
                 f"{proposal.proposal_id}.json",
             ),
         )
-    proposal_ref = proposal.metadata.get("proposal_ref")
-    if isinstance(proposal_ref, str) and proposal_ref.strip():
-        return (proposal_ref,)
     return ()
 
 

@@ -34,6 +34,7 @@ from translation_agent.review import (
     build_review_context,
     build_review_prompt,
     build_structured_review,
+    parse_reviewer_output,
     render_reviewer_output,
     review_bundle_from_draft,
     reviewer_roles_for_stage,
@@ -286,6 +287,8 @@ def _build_review_bundle(
             candidates=candidates,
             final_transcript=final_transcript,
         )
+        parsed = parse_reviewer_output(raw_review_text)
+        _validate_rendered_review_against_draft(parsed=parsed, draft=draft)
         review = review_bundle_from_draft(
             review_id=review_id,
             job_id=state.job.job_id,
@@ -388,3 +391,15 @@ def _raw_payload_refs(
         for candidate in candidates
         if isinstance(candidate, TranslationCandidate) and candidate.raw_response_ref is not None
     )
+
+
+def _validate_rendered_review_against_draft(*, parsed, draft) -> None:  # noqa: ANN001
+    expected_winner = (
+        draft.candidate_preferences[0].candidate_id if draft.candidate_preferences else None
+    )
+    if parsed.winner_candidate_id != expected_winner:
+        raise ValueError("rendered reviewer winner does not match structured draft")
+    if round(parsed.confidence, 2) != round(draft.confidence, 2):
+        raise ValueError("rendered reviewer confidence does not match structured draft")
+    if parsed.escalation_signal != draft.escalation_signal:
+        raise ValueError("rendered reviewer escalation flag does not match structured draft")

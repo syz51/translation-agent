@@ -81,10 +81,10 @@ def generate_translation_candidates(
                 model_id=runtime.translation_adapter.model_id,
                 source_language=state.job.source_language,
                 target_language=state.job.target_language,
+                tenant_id=state.job.tenant_id,
+                project_id=state.job.project_id,
                 media_key=state.job.media_key,
                 run_id=state.run_id,
-                scope_kind="pair",
-                scope_key=f"{state.job.source_language}::{state.job.target_language}",
             )
             variant_request_context = request_context.model_copy(
                 update={

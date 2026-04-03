@@ -12,7 +12,18 @@ from .jobs import JobContext
 
 NonEmptyStr = Annotated[str, Field(min_length=1)]
 MemoryKind = Literal["semantic", "episodic", "glossary", "rule", "procedural"]
+MemorySubtype = Literal[
+    "glossary",
+    "style_rule",
+    "provider_caveat",
+    "language_convention",
+    "project_fact",
+    "failure_pattern",
+    "escalation_pattern",
+    "prompt_guidance",
+]
 MemoryScopeKind = Literal[
+    "asset",
     "project_pair",
     "pair",
     "source_language",
@@ -22,6 +33,20 @@ MemoryScopeKind = Literal[
 MemoryLifecycleStatus = Literal["active", "stale", "rolled_back", "superseded", "expired"]
 ConsolidationStatus = Literal["pending", "consolidated", "skipped", "failed"]
 PromptFamily = Literal["translation", "reviewer", "adjudicator"]
+PromotionStatus = Literal[
+    "not_promoted",
+    "candidate",
+    "promoted",
+    "superseded",
+    "blocked",
+]
+QualityGateStatus = Literal[
+    "not_evaluated",
+    "pending",
+    "passed",
+    "failed",
+    "disagreed",
+]
 PromptEvolutionStatus = Literal[
     "proposed",
     "canary",
@@ -41,6 +66,7 @@ def utc_now() -> datetime:
 class MemoryEntry(ContractModel):
     memory_id: NonEmptyStr
     kind: MemoryKind
+    memory_subtype: MemorySubtype | None = None
     content: NonEmptyStr
     source_ref: str | None = None
     scope_kind: MemoryScopeKind | None = None
@@ -50,6 +76,16 @@ class MemoryEntry(ContractModel):
     lifecycle_status: MemoryLifecycleStatus = "active"
     expires_at: datetime | None = None
     superseded_by: str | None = None
+    origin_scope_kind: MemoryScopeKind | None = None
+    origin_scope_key: NonEmptyStr | None = None
+    promotion_status: PromotionStatus = "not_promoted"
+    evidence_count: int = Field(default=0, ge=0)
+    supporting_run_count: int = Field(default=0, ge=0)
+    supporting_asset_count: int = Field(default=0, ge=0)
+    supporting_project_count: int = Field(default=0, ge=0)
+    contradiction_count: int = Field(default=0, ge=0)
+    promotion_ref: str | None = None
+    quality_gate_status: QualityGateStatus = "not_evaluated"
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
@@ -67,6 +103,8 @@ class MemoryEntry(ContractModel):
             raise ValueError("scoped memory entries require score")
         if self.scope_kind == "global" and self.scope_key != "global":
             raise ValueError("global scope entries must use scope_key='global'")
+        if self.scope_kind == "asset" and self.scope_key == "global":
+            raise ValueError("asset scope entries require a concrete scope_key")
         return self
 
 
@@ -85,7 +123,12 @@ class MemoryQuery(ContractModel):
     provider_ids: tuple[str, ...] = ()
     prompt_variant_ids: tuple[str, ...] = ()
     model_ids: tuple[str, ...] = ()
+    disagreement_bucket: str | None = None
+    glossary_misses: tuple[str, ...] = ()
+    entities: tuple[str, ...] = ()
+    numbers_dates: tuple[str, ...] = ()
     failure_tags: tuple[str, ...] = ()
+    escalation_reasons: tuple[str, ...] = ()
     media_key: str | None = None
     max_items: int = Field(default=10, ge=1, le=100)
 
@@ -103,18 +146,31 @@ class MemoryBundle(ContractModel):
 
 class MemoryWrite(ContractModel):
     kind: MemoryKind
+    memory_subtype: MemorySubtype | None = None
     content: NonEmptyStr
     scope_kind: MemoryScopeKind = "global"
     scope_key: NonEmptyStr = "global"
     updated_at: datetime = Field(default_factory=utc_now)
     score: float = Field(default=0.5, ge=0.0, le=1.0)
     source_ref: str | None = None
+    origin_scope_kind: MemoryScopeKind | None = None
+    origin_scope_key: NonEmptyStr | None = None
+    promotion_status: PromotionStatus = "not_promoted"
+    evidence_count: int = Field(default=0, ge=0)
+    supporting_run_count: int = Field(default=0, ge=0)
+    supporting_asset_count: int = Field(default=0, ge=0)
+    supporting_project_count: int = Field(default=0, ge=0)
+    contradiction_count: int = Field(default=0, ge=0)
+    promotion_ref: str | None = None
+    quality_gate_status: QualityGateStatus = "not_evaluated"
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def validate_scope_key(self) -> MemoryWrite:
         if self.scope_kind == "global" and self.scope_key != "global":
             raise ValueError("global scope writes must use scope_key='global'")
+        if self.scope_kind == "asset" and self.scope_key == "global":
+            raise ValueError("asset scope writes require a concrete scope_key")
         return self
 
 
@@ -154,6 +210,8 @@ class MemoryConsolidation(ContractModel):
     source_translation_model_id: str | None = None
     source_prompt_variant_id: str | None = None
     source_prompt_version: str | None = None
+    source_tenant_id: str | None = None
+    source_project_id: str | None = None
     source_language: str | None = None
     target_language: str | None = None
     scope_kind: MemoryScopeKind | None = None
@@ -195,6 +253,27 @@ class ProposalAggregateMetrics(ContractModel):
     severe_failure_bucket_rate: float = Field(default=0.0, ge=0.0, le=1.0)
 
 
+class StrongerGraderScore(ContractModel):
+    grader_id: NonEmptyStr
+    grader_version: NonEmptyStr
+    metric_family: NonEmptyStr = "stronger_grader"
+    score: float = Field(default=0.0, ge=0.0, le=1.0)
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    notes: tuple[str, ...] = ()
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class PromotionGateOutcome(ContractModel):
+    heuristic_gate_pass: bool = False
+    stronger_grader_pass: bool = False
+    human_support_pass: bool = False
+    rollback_signal_present: bool = False
+    material_disagreement: bool = False
+    eligible_for_pair_promotion: bool = False
+    quality_gate_status: QualityGateStatus = "not_evaluated"
+    notes: tuple[str, ...] = ()
+
+
 class ResolvedTranslationPrompt(ContractModel):
     """Prompt resolver output used by translation-generation boundaries."""
 
@@ -203,6 +282,8 @@ class ResolvedTranslationPrompt(ContractModel):
     effective_prompt_version: NonEmptyStr
     resolution_mode: PromptResolutionMode = "control"
     selected_proposal_id: str | None = None
+    scope_kind: MemoryScopeKind = "project_pair"
+    scope_key: NonEmptyStr
     instructions: tuple[str, ...] = ()
     applied_proposal_refs: tuple[str, ...] = ()
 
@@ -227,6 +308,10 @@ class PromptEvolutionProposal(ContractModel):
     control_run_count: int = Field(default=0, ge=0)
     canary_metrics: ProposalAggregateMetrics = Field(default_factory=ProposalAggregateMetrics)
     control_metrics: ProposalAggregateMetrics = Field(default_factory=ProposalAggregateMetrics)
+    canary_stronger_grader: StrongerGraderScore | None = None
+    control_stronger_grader: StrongerGraderScore | None = None
+    promotion_status: PromotionStatus = "candidate"
+    gate_outcome: PromotionGateOutcome | None = None
     rollback_reason: str | None = None
     activation_mode: str | None = None
     auto_activate: bool | None = None
@@ -254,7 +339,7 @@ class PromptEvolutionProposal(ContractModel):
             )
             source_language = _metadata_string(metadata, "source_language")
             target_language = _metadata_string(metadata, "target_language")
-            scope_kind = _metadata_scope_kind(metadata.get("scope_kind")) or "pair"
+            scope_kind = _metadata_scope_kind(metadata.get("scope_kind")) or "project_pair"
             scope_key = _metadata_string(metadata, "scope_key") or (
                 f"{source_language}::{target_language}"
                 if source_language is not None and target_language is not None
@@ -310,6 +395,13 @@ def _metadata_string(metadata: dict[str, Any], key: str) -> str | None:
 
 
 def _metadata_scope_kind(value: object) -> MemoryScopeKind | None:
-    if value in {"project_pair", "pair", "source_language", "target_language", "global"}:
+    if value in {
+        "asset",
+        "project_pair",
+        "pair",
+        "source_language",
+        "target_language",
+        "global",
+    }:
         return value  # type: ignore[return-value]
     return None
