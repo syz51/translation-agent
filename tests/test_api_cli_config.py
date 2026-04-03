@@ -42,7 +42,9 @@ from translation_agent.models import (
     TranscriptCandidate,
     TranslationCandidate,
 )
+from translation_agent.observability import TraceEvent
 from translation_agent.review_flow import _build_contradiction_summary
+from translation_agent.run_status import PhaseCounters, RecentRunEvent, RunStatusSnapshot
 from translation_agent.storage import (
     LocalBlobStore,
     PostgresRunStore,
@@ -636,6 +638,214 @@ def test_cli_run_job_json_includes_default_output_path(
             / job_path(_job_context("job-json"), "exports", "translation.srt")
         ).resolve()
     )
+
+
+@pytest.mark.unit
+def test_cli_run_job_tty_live_panel_renders_recent_events_and_counters(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    trace_path = Path("/tmp/trace-live.jsonl")
+
+    def fake_run_job(request, settings=None, live_trace_sink=None) -> RunJobResult:
+        del settings
+        if live_trace_sink is not None:
+            live_trace_sink.record(
+                TraceEvent(
+                    run_id="run-live",
+                    name="run.bootstrapped",
+                    attributes={"job_id": request.job_id or "job-live"},
+                )
+            )
+            live_trace_sink.record(
+                TraceEvent(
+                    run_id="run-live",
+                    name="run.started",
+                    attributes={"job_id": request.job_id or "job-live"},
+                )
+            )
+            live_trace_sink.record(
+                TraceEvent(
+                    run_id="run-live",
+                    name="node.started",
+                    attributes={"node_name": "fanout_transcription", "execution_id": "exec-1"},
+                )
+            )
+            live_trace_sink.record(
+                TraceEvent(
+                    run_id="run-live",
+                    name="transcription.provider.completed",
+                    attributes={
+                        "provider_id": "deepgram",
+                        "provider_total": 2,
+                        "candidate_id": "tr-1",
+                    },
+                )
+            )
+            live_trace_sink.record(
+                TraceEvent(
+                    run_id="run-live",
+                    name="transcription.provider.failed",
+                    attributes={
+                        "provider_id": "speechmatics",
+                        "provider_total": 2,
+                        "error": "timeout",
+                    },
+                )
+            )
+            live_trace_sink.record(
+                TraceEvent(
+                    run_id="run-live",
+                    name="run.completed",
+                    attributes={"status": "completed"},
+                )
+            )
+        return RunJobResult(
+            run_id="run-live",
+            job_id=request.job_id or "job-live",
+            status="completed",
+            source=request.source,
+            source_language="en",
+            target_language="zh",
+            blob_root=Path("/tmp/blob-root"),
+            trace_path=trace_path,
+            state_backend="sqlite",
+            state_db_target="/tmp/state.sqlite3",
+        )
+
+    monkeypatch.setattr("translation_agent.cli.run_job", fake_run_job)
+    monkeypatch.setattr("translation_agent.cli._has_tty", lambda: True)
+
+    exit_code = main(["run-job", "input.wav", "--job-id", "job-live"])
+
+    output = capsys.readouterr().out
+    assert exit_code == 0
+    assert "providers: active=0 completed=1 failed=1 total=2" in output
+    assert "recent events:" in output
+    assert "Failed transcription provider speechmatics: timeout" in output
+    assert "run-live" in output
+    assert "completed" in output
+
+
+@pytest.mark.unit
+def test_cli_show_run_json_payload_shape(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    runtime_dir = tmp_path / "runtime"
+    monkeypatch.setenv("TA_DATA_DIR", str(runtime_dir))
+    monkeypatch.delenv("TA_STATE_DB_DSN", raising=False)
+
+    with SQLiteOperationalStore(runtime_dir / "state.sqlite3") as store:
+        store.create_run(
+            run_id="run-show",
+            status="completed",
+            input_data={"job_id": "job-show", "source": "input.wav"},
+            created_at="2026-04-03T00:00:00+00:00",
+        )
+        store.update_run(
+            "run-show",
+            status="completed",
+            output_data={"final_stage": "finalize_outputs"},
+            updated_at="2026-04-03T00:00:05+00:00",
+        )
+    trace_path = runtime_dir / "traces" / "run-show.jsonl"
+    trace_path.parent.mkdir(parents=True, exist_ok=True)
+    trace_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "run_id": "run-show",
+                        "name": "run.started",
+                        "timestamp": "2026-04-03T00:00:00+00:00",
+                        "attributes": {"job_id": "job-show"},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "run_id": "run-show",
+                        "name": "run.completed",
+                        "timestamp": "2026-04-03T00:00:05+00:00",
+                        "attributes": {"status": "completed"},
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    exit_code = main(["show-run", "run-show", "--json"])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert payload["run_id"] == "run-show"
+    assert payload["job_id"] == "job-show"
+    assert payload["status"] == "completed"
+    assert payload["current_stage"] == "finalize_outputs"
+    assert payload["active_node"] is None
+    assert payload["elapsed_seconds"] == 5.0
+    assert payload["trace_path"] == str(trace_path)
+    assert len(payload["recent_events"]) == 2
+
+
+@pytest.mark.unit
+def test_cli_watch_run_tty_exits_on_terminal_state_and_renders_recent_events(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    snapshots = iter(
+        [
+            RunStatusSnapshot(
+                run_id="run-watch",
+                job_id="job-watch",
+                status="running",
+                current_stage="fanout_transcription",
+                active_node="fanout_transcription",
+                elapsed_seconds=2.0,
+                trace_path=Path("/tmp/run-watch.jsonl"),
+                transcription_providers=PhaseCounters(total=2, active=1, completed=0, failed=0),
+                recent_events=(
+                    RecentRunEvent(
+                        timestamp="2026-04-03T00:00:02+00:00",
+                        name="transcription.provider.started",
+                        message="Started transcription provider deepgram",
+                    ),
+                ),
+            ),
+            RunStatusSnapshot(
+                run_id="run-watch",
+                job_id="job-watch",
+                status="completed",
+                current_stage="finalize_outputs",
+                active_node=None,
+                elapsed_seconds=5.0,
+                trace_path=Path("/tmp/run-watch.jsonl"),
+                recent_events=(
+                    RecentRunEvent(
+                        timestamp="2026-04-03T00:00:05+00:00",
+                        name="run.completed",
+                        message="Run completed with status completed",
+                    ),
+                ),
+            ),
+        ]
+    )
+    monkeypatch.setattr("translation_agent.cli._has_tty", lambda: True)
+    monkeypatch.setattr("translation_agent.cli.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        "translation_agent.cli.get_run_status",
+        lambda run_id, settings=None: next(snapshots),
+    )
+
+    exit_code = main(["watch-run", "run-watch", "--interval", "0.01"])
+
+    output = capsys.readouterr().out
+    assert exit_code == 0
+    assert "Started transcription provider deepgram" in output
+    assert "Run completed with status completed" in output
 
 
 @pytest.mark.unit

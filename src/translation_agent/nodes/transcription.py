@@ -16,6 +16,7 @@ from translation_agent.nodes.common import (
     strip_private_metadata,
     write_model_artifact,
 )
+from translation_agent.observability import TraceEvent
 from translation_agent.parallelism import ordered_parallel_map
 
 
@@ -37,7 +38,14 @@ def fanout_transcription(state: GraphState, runtime: WorkflowRuntime) -> dict[st
     gathered = ordered_parallel_map(
         runtime.transcription_adapters,
         max_workers=max_workers,
-        worker=lambda adapter: _transcribe_adapter(adapter, audio_artifact, request_context),
+        worker=lambda adapter: _transcribe_adapter(
+            adapter,
+            audio_artifact,
+            request_context,
+            runtime=runtime,
+            run_id=state.run_id,
+            provider_total=len(runtime.transcription_adapters),
+        ),
     )
 
     for adapter, result in zip(runtime.transcription_adapters, gathered, strict=True):
@@ -109,13 +117,60 @@ def fanout_transcription(state: GraphState, runtime: WorkflowRuntime) -> dict[st
     }
 
 
-def _transcribe_adapter(adapter, audio_artifact: AudioArtifact, request_context):
+def _transcribe_adapter(
+    adapter,
+    audio_artifact: AudioArtifact,
+    request_context,
+    *,
+    runtime: WorkflowRuntime,
+    run_id: str,
+    provider_total: int,
+):
+    provider_id = adapter.provider_id
+    runtime.trace_sink.record(
+        TraceEvent(
+            run_id=run_id,
+            name="transcription.provider.started",
+            attributes={
+                "provider_id": provider_id,
+                "provider_total": provider_total,
+            },
+        )
+    )
     raw_payload: dict[str, object] | None = None
-    if _supports_raw_payload_transcription(adapter):
-        candidate, raw_payload = adapter.transcribe_with_payload(audio_artifact, request_context)
-    else:
-        candidate = adapter.transcribe(audio_artifact, request_context)
-    return candidate, raw_payload
+    try:
+        if _supports_raw_payload_transcription(adapter):
+            candidate, raw_payload = adapter.transcribe_with_payload(
+                audio_artifact,
+                request_context,
+            )
+        else:
+            candidate = adapter.transcribe(audio_artifact, request_context)
+        runtime.trace_sink.record(
+            TraceEvent(
+                run_id=run_id,
+                name="transcription.provider.completed",
+                attributes={
+                    "provider_id": provider_id,
+                    "provider_total": provider_total,
+                    "candidate_id": candidate.candidate_id,
+                },
+            )
+        )
+        return candidate, raw_payload
+    except Exception as exc:
+        runtime.trace_sink.record(
+            TraceEvent(
+                run_id=run_id,
+                name="transcription.provider.failed",
+                attributes={
+                    "provider_id": provider_id,
+                    "provider_total": provider_total,
+                    "error": str(exc),
+                },
+            )
+        )
+        raise
 
 
 def _supports_raw_payload_transcription(adapter: object) -> bool:

@@ -85,3 +85,30 @@ class JsonlTraceSink:
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
+
+
+class CompositeTraceSink:
+    def __init__(self, *sinks: TraceSink) -> None:
+        self._sinks = tuple(sink for sink in sinks)
+
+    @property
+    def path(self) -> Path | None:
+        for sink in self._sinks:
+            sink_path = getattr(sink, "path", None)
+            if sink_path is not None:
+                return Path(sink_path)
+        return None
+
+    def record(self, event: TraceEvent) -> None:
+        for sink in self._sinks:
+            sink.record(event)
+
+    def close(self) -> None:
+        for sink in reversed(self._sinks):
+            sink.close()
+
+    def __enter__(self) -> CompositeTraceSink:
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
