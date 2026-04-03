@@ -13,6 +13,7 @@ import translation_agent.graph.runtime as runtime_module
 from translation_agent.adapters import (
     AdapterError,
     AssemblyAITranscriptionAdapter,
+    ChatCompletionTranslationAdapter,
     DeepgramTranscriptionAdapter,
     FFmpegAudioExtractionAdapter,
     OpenAITranslationAdapter,
@@ -294,6 +295,7 @@ def _real_settings(**overrides: Any) -> Settings:
         "assemblyai_api_key": "test-assemblyai-key",  # pragma: allowlist secret
         "speechmatics_api_key": "test-speechmatics-key",  # pragma: allowlist secret
         "deepgram_api_key": "test-deepgram-key",  # pragma: allowlist secret
+        "gemini_api_key": "test-gemini-key",  # pragma: allowlist secret
         "openai_api_key": "test-openai-key",  # pragma: allowlist secret
     }
     defaults.update(overrides)
@@ -1169,7 +1171,8 @@ def test_openai_translation_adapter_tracks_prompt_metadata_for_variants(
     adapter = OpenAITranslationAdapter(
         api_key="test-key",
         blob_store=blob_store,
-        model_id="gpt-5.4-mini",
+        provider_id="gemini",
+        model_id="gemini-3-flash",
         prompt_version="phase-3-v1",
         transport=transport,
         retry_policy=_retry_policy(),
@@ -1184,7 +1187,7 @@ def test_openai_translation_adapter_tracks_prompt_metadata_for_variants(
 
     assert candidate.prompt_variant_id == prompt_variant_id
     assert candidate.prompt_version == "phase-3-v1"
-    assert candidate.metadata["provider"]["provider_id"] == "openai"
+    assert candidate.metadata["provider"]["provider_id"] == "gemini"
     assert candidate.metadata["provider"]["provider_request_id"] == "resp-1"
     assert candidate.metadata["provider"]["response_id"] == "resp-1"
     assert candidate.metadata["prompt"]["variant_id"] == prompt_variant_id
@@ -1408,7 +1411,11 @@ def test_openai_translation_helpers_cover_output_blocks_and_validation(tmp_path:
             prompt_variant_id="variant-a",
             prompt_version="phase-3-v1",
             model_id="gpt-5.4-mini",
-            raw_response_ref=_artifact_path("raw", "provider-payloads", "openai-variant-a.json"),
+            raw_response_ref=_artifact_path(
+                "raw",
+                "provider-payloads",
+                "translation-openai-variant-a.json",
+            ),
         )
 
     class NonObjectResponse:
@@ -1538,7 +1545,9 @@ def test_phase_three_normalization_helpers_canonicalize_candidates() -> None:
             ),
         ),
         full_text=" Bonjour   le   monde ",
-        raw_response_ref=f" {_artifact_path('raw', 'provider-payloads', 'openai-variant-a.json')} ",
+        raw_response_ref=(
+            f" {_artifact_path('raw', 'provider-payloads', 'translation-gemini-variant-a.json')} "
+        ),
         normalization_version="raw",
         metadata={"prompt": "bad-shape"},
     )
@@ -1566,10 +1575,10 @@ def test_phase_three_normalization_helpers_canonicalize_candidates() -> None:
     assert normalized_translation.prompt_version == "phase-3-v1"
     assert normalized_translation.full_text == "Bonjour le monde"
     assert normalized_translation.raw_response_ref == (
-        _artifact_path("raw", "provider-payloads", "openai-variant-a.json")
+        _artifact_path("raw", "provider-payloads", "translation-gemini-variant-a.json")
     )
     assert normalized_translation.segments[0].segment_id == "seg-1"
-    assert normalized_translation.metadata["provider"]["provider_id"] == "openai"
+    assert normalized_translation.metadata["provider"]["provider_id"] == "unknown-provider"
     assert normalized_translation.metadata["provider"]["provider_request_id"] is None
     assert normalized_translation.metadata["prompt"]["variant_id"] == "variant-a"
     assert normalized_translation.metadata["prompt"]["version"] == "phase-3-v1"
@@ -1635,7 +1644,8 @@ def test_phase_three_runtime_uses_configured_ffmpeg_retry_budget(
         assemblyai_api_key="assembly",
         speechmatics_api_key="speech",
         deepgram_api_key="deepgram",
-        openai_api_key="openai",
+        gemini_api_key="gemini",  # pragma: allowlist secret
+        openai_api_key="openai",  # pragma: allowlist secret
         adapter_retry_attempts=4,
         adapter_initial_backoff_seconds=0.5,
         adapter_max_backoff_seconds=1.5,
@@ -1707,7 +1717,7 @@ def test_phase_three_runtime_builds_selected_transcription_provider_subset_in_or
     ]
 
 
-def test_phase_three_runtime_unset_selector_builds_all_transcription_providers_and_openai(
+def test_phase_three_runtime_unset_selector_builds_all_transcription_providers_and_gemini(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1731,8 +1741,11 @@ def test_phase_three_runtime_unset_selector_builds_all_transcription_providers_a
         "speechmatics",
         "deepgram",
     ]
-    assert isinstance(runtime.translation_adapter, OpenAITranslationAdapter)
+    assert isinstance(runtime.translation_adapter, ChatCompletionTranslationAdapter)
+    assert runtime.translation_adapter.provider_id == "gemini"
     assert runtime.translation_adapter.model_id == settings.translation_model_id
+    assert runtime.reasoning_profile.provider_id == "openai"
+    assert runtime.reasoning_profile.model_id == "gpt-5.4"
 
 
 @pytest.mark.contract
@@ -1749,7 +1762,8 @@ def test_validate_runtime_compatibility_gates_python314_warning(
         assemblyai_api_key="assembly",
         speechmatics_api_key="speech",
         deepgram_api_key="deepgram",
-        openai_api_key="openai",
+        gemini_api_key="gemini",  # pragma: allowlist secret
+        openai_api_key="openai",  # pragma: allowlist secret
     )
 
     error = validate_runtime_compatibility(settings)
@@ -1884,7 +1898,8 @@ def test_phase_three_runtime_completes_workflow_with_real_adapters(tmp_path: Pat
         assemblyai_api_key="assembly",
         speechmatics_api_key="speech",
         deepgram_api_key="deepgram",
-        openai_api_key="openai",
+        gemini_api_key="gemini",  # pragma: allowlist secret
+        openai_api_key="openai",  # pragma: allowlist secret
     )
     overrides = RealRuntimeOverrides(
         audio_extractor=FFmpegAudioExtractionAdapter(
@@ -1946,7 +1961,9 @@ def test_phase_three_runtime_completes_workflow_with_real_adapters(tmp_path: Pat
     assert blob_store.exists(_artifact_path("raw", "provider-payloads", "assemblyai.json"))
     assert blob_store.exists(_artifact_path("raw", "provider-payloads", "speechmatics.json"))
     assert blob_store.exists(_artifact_path("raw", "provider-payloads", "deepgram.json"))
-    assert blob_store.exists(_artifact_path("raw", "provider-payloads", "openai-variant-a.json"))
+    assert blob_store.exists(
+        _artifact_path("raw", "provider-payloads", "translation-openai-variant-a.json")
+    )
     assert blob_store.exists(
         _artifact_path(
             "candidates",

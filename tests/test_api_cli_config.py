@@ -126,6 +126,7 @@ def _configure_real_mode_env(
     tmp_path: Path,
     *,
     transcription_providers: str | None = None,
+    translation_provider: str | None = None,
 ) -> None:
     monkeypatch.setenv("TA_DATA_DIR", str(tmp_path / "runtime"))
     monkeypatch.setenv("TA_ADAPTER_MODE", "real")
@@ -134,22 +135,29 @@ def _configure_real_mode_env(
     monkeypatch.delenv("TA_ASSEMBLYAI_API_KEY", raising=False)
     monkeypatch.delenv("TA_SPEECHMATICS_API_KEY", raising=False)
     monkeypatch.delenv("TA_DEEPGRAM_API_KEY", raising=False)
+    monkeypatch.delenv("TA_GEMINI_API_KEY", raising=False)
     monkeypatch.delenv("TA_OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("TA_TRANSLATION_PROVIDER", raising=False)
+    monkeypatch.delenv("TA_REASONING_PROVIDER", raising=False)
+    monkeypatch.delenv("TA_REASONING_MODEL_ID", raising=False)
     if transcription_providers is None:
         monkeypatch.delenv("TA_TRANSCRIPTION_PROVIDERS", raising=False)
     else:
         monkeypatch.setenv("TA_TRANSCRIPTION_PROVIDERS", transcription_providers)
+    if translation_provider is not None:
+        monkeypatch.setenv("TA_TRANSLATION_PROVIDER", translation_provider)
 
 
 @pytest.mark.unit
 def test_load_settings_reads_environment(monkeypatch, tmp_path: Path) -> None:
+    postgres_dsn = (
+        "postgresql://user:secret@db.example.com:5432/translation_agent"
+        "?sslmode=require"
+    )  # pragma: allowlist secret
     monkeypatch.setenv("TA_DATA_DIR", str(tmp_path / "runtime"))
     monkeypatch.setenv("TA_DEFAULT_TARGET_LANGUAGE", "ja")
     monkeypatch.setenv("TA_ASSEMBLYAI_TIMEOUT_SECONDS", "300")
-    monkeypatch.setenv(
-        "TA_STATE_DB_DSN",
-        "postgresql://user:secret@db.example.com:5432/translation_agent?sslmode=require",
-    )
+    monkeypatch.setenv("TA_STATE_DB_DSN", postgres_dsn)
 
     settings = load_settings()
 
@@ -273,6 +281,7 @@ def test_validate_environment_real_mode_requires_provider_keys(monkeypatch, tmp_
     monkeypatch.delenv("TA_ASSEMBLYAI_API_KEY", raising=False)
     monkeypatch.delenv("TA_SPEECHMATICS_API_KEY", raising=False)
     monkeypatch.delenv("TA_DEEPGRAM_API_KEY", raising=False)
+    monkeypatch.delenv("TA_GEMINI_API_KEY", raising=False)
     monkeypatch.delenv("TA_OPENAI_API_KEY", raising=False)
 
     result = validate_environment(load_settings())
@@ -280,6 +289,7 @@ def test_validate_environment_real_mode_requires_provider_keys(monkeypatch, tmp_
     assert result.ok is False
     assert result.provider_config_error is not None
     assert "TA_ASSEMBLYAI_API_KEY" in result.provider_config_error
+    assert "TA_GEMINI_API_KEY" in result.provider_config_error
 
 
 @pytest.mark.unit
@@ -294,7 +304,7 @@ def test_validate_environment_real_mode_unset_selector_requires_all_stt_keys(
     assert result.ok is False
     assert result.provider_config_error == (
         "real adapter mode requires TA_ASSEMBLYAI_API_KEY, "
-        "TA_SPEECHMATICS_API_KEY, TA_DEEPGRAM_API_KEY, TA_OPENAI_API_KEY"
+        "TA_SPEECHMATICS_API_KEY, TA_DEEPGRAM_API_KEY, TA_GEMINI_API_KEY"
     )
 
 
@@ -309,7 +319,7 @@ def test_validate_environment_real_mode_assemblyai_selector_requires_only_select
 
     assert result.ok is False
     assert result.provider_config_error == (
-        "real adapter mode requires TA_ASSEMBLYAI_API_KEY, TA_OPENAI_API_KEY"
+        "real adapter mode requires TA_ASSEMBLYAI_API_KEY, TA_GEMINI_API_KEY"
     )
 
 
@@ -324,7 +334,7 @@ def test_validate_environment_real_mode_subset_selector_requires_only_subset_key
 
     assert result.ok is False
     assert result.provider_config_error == (
-        "real adapter mode requires TA_ASSEMBLYAI_API_KEY, TA_DEEPGRAM_API_KEY, TA_OPENAI_API_KEY"
+        "real adapter mode requires TA_ASSEMBLYAI_API_KEY, TA_DEEPGRAM_API_KEY, TA_GEMINI_API_KEY"
     )
 
 
@@ -399,7 +409,7 @@ def test_validate_environment_real_mode_requires_langgraph_py314_opt_in(
     monkeypatch.setenv("TA_ASSEMBLYAI_API_KEY", "assembly")
     monkeypatch.setenv("TA_SPEECHMATICS_API_KEY", "speech")
     monkeypatch.setenv("TA_DEEPGRAM_API_KEY", "deepgram")
-    monkeypatch.setenv("TA_OPENAI_API_KEY", "openai")
+    monkeypatch.setenv("TA_GEMINI_API_KEY", "gemini")
     monkeypatch.delenv("TA_ALLOW_LANGGRAPH_PY314_WARNING", raising=False)
     monkeypatch.setattr(
         "translation_agent.config._langgraph_py314_warning",
@@ -465,6 +475,7 @@ def test_validate_environment_real_mode_requires_provider_credentials(
     monkeypatch.delenv("TA_ASSEMBLYAI_API_KEY", raising=False)
     monkeypatch.delenv("TA_SPEECHMATICS_API_KEY", raising=False)
     monkeypatch.delenv("TA_DEEPGRAM_API_KEY", raising=False)
+    monkeypatch.delenv("TA_GEMINI_API_KEY", raising=False)
     monkeypatch.delenv("TA_OPENAI_API_KEY", raising=False)
 
     result = validate_environment(load_settings())
@@ -474,6 +485,7 @@ def test_validate_environment_real_mode_requires_provider_credentials(
     assert result.provider_config_ok is False
     assert result.provider_config_error is not None
     assert "TA_ASSEMBLYAI_API_KEY" in result.provider_config_error
+    assert "TA_GEMINI_API_KEY" in result.provider_config_error
     assert result.runtime_compatibility_ok is True
 
 
@@ -1199,6 +1211,7 @@ def test_run_job_persists_structured_translation_failure_error(
         "category": "translation_failed",
         "reason": "all_translation_variants_failed",
         "message": "All translation variants failed; transcript preserved for recovery.",
+        "provider_id": "fake-translation",
         "failure_ref": str(
             job_path(
                 _job_context("job-translation-failed-structured"),

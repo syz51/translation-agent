@@ -1,18 +1,21 @@
-"""OpenAI translation adapter."""
+"""SDK-backed translation adapter for OpenAI-compatible providers."""
 
 from __future__ import annotations
 
 import json
+import urllib.parse
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol, cast
+
+from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAI
 
 from translation_agent.adapters.common import (
     AdapterError,
     HttpRequest,
+    HttpResponse,
     HttpTransport,
     RetryPolicy,
-    StdlibHttpTransport,
     classify_http_error,
     perform_with_retries,
 )
@@ -25,6 +28,8 @@ from translation_agent.models import (
 from translation_agent.parallelism import ordered_parallel_map
 from translation_agent.storage import BlobStore, job_path, job_scope_token
 
+DEFAULT_GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1/"
 DEFAULT_MAX_CHUNK_CHARACTERS = 5_000
 DEFAULT_MAX_CHUNK_SEGMENTS = 100
 DEFAULT_CONTEXT_SEGMENT_WINDOW = 2
@@ -66,21 +71,76 @@ class _ChunkExecutionResult:
     response_ids: tuple[str, ...]
 
 
-class OpenAITranslationAdapter:
-    """Direct OpenAI Responses API adapter for translation candidate generation."""
+class _ResponsesClient(Protocol):
+    def create(self, **kwargs: Any) -> object: ...
 
-    provider_id = "openai"
+
+class _TransportBackedResponsesClient:
+    """Small OpenAI-compatible shim used by deterministic adapter tests."""
 
     def __init__(
         self,
         *,
+        provider_id: str,
+        api_key: str,
+        base_url: str | None,
+        timeout_seconds: float,
+        transport: HttpTransport,
+    ) -> None:
+        self._provider_id = provider_id
+        self._api_key = api_key
+        self._endpoint = _responses_endpoint(provider_id, base_url)
+        self._timeout_seconds = timeout_seconds
+        self._transport = transport
+
+    def create(self, **kwargs: Any) -> dict[str, Any]:
+        timeout_seconds = kwargs.pop("timeout", self._timeout_seconds)
+        response = self._transport.request(
+            HttpRequest(
+                method="POST",
+                url=self._endpoint,
+                headers={
+                    "authorization": f"Bearer {self._api_key}",
+                    "content-type": "application/json",
+                },
+                body=json.dumps(kwargs).encode("utf-8"),
+                timeout_seconds=float(timeout_seconds),
+            )
+        )
+        status_code = int(getattr(response, "status_code", 200) or 200)
+        if status_code >= 300:
+            error = _classify_provider_http_error(
+                self._provider_id,
+                _coerced_http_response(response, status_code=status_code),
+            )
+            if error is not None:
+                raise error
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise AdapterError(
+                provider_id=self._provider_id,
+                message="provider response must be a JSON object",
+                category="malformed_response",
+                retryable=False,
+            )
+        return payload
+
+
+class ChatCompletionTranslationAdapter:
+    """Provider-neutral translation adapter backed by an OpenAI-compatible client."""
+
+    def __init__(
+        self,
+        *,
+        provider_id: str = "openai",
         api_key: str,
         blob_store: BlobStore,
-        model_id: str = "gpt-5.4-mini",
+        model_id: str = "gemini-3-flash",
         prompt_version: str = "phase-3-v1",
-        base_url: str = "https://api.openai.com/v1/responses",
+        base_url: str | None = None,
         timeout_seconds: float = 60.0,
         retry_policy: RetryPolicy | None = None,
+        client: object | None = None,
         transport: HttpTransport | None = None,
         sleep: Callable[[float], None] | None = None,
         max_chunk_workers: int = 4,
@@ -88,19 +148,60 @@ class OpenAITranslationAdapter:
         max_chunk_segments: int = DEFAULT_MAX_CHUNK_SEGMENTS,
         context_segment_window: int = DEFAULT_CONTEXT_SEGMENT_WINDOW,
     ) -> None:
+        self.provider_id = provider_id
         self.model_id = model_id
-        self._api_key = api_key
         self._blob_store = blob_store
         self._prompt_version = prompt_version
-        self._base_url = base_url
+        self._base_url = _normalized_api_base_url(base_url)
         self._timeout_seconds = timeout_seconds
         self._retry_policy = retry_policy or RetryPolicy()
-        self._transport = transport or StdlibHttpTransport()
         self._sleep = sleep or (lambda seconds: __import__("time").sleep(seconds))
         self._max_chunk_workers = max(1, max_chunk_workers)
         self._max_chunk_characters = max(1, max_chunk_characters)
         self._max_chunk_segments = max(1, max_chunk_segments)
         self._context_segment_window = max(0, context_segment_window)
+        self._responses_client = self._build_responses_client(
+            api_key=api_key,
+            client=client,
+            transport=transport,
+        )
+
+    def _build_responses_client(
+        self,
+        *,
+        api_key: str,
+        client: object | None,
+        transport: HttpTransport | None,
+    ) -> _ResponsesClient:
+        if client is not None:
+            responses = getattr(client, "responses", client)
+            return cast("_ResponsesClient", responses)
+        if transport is not None:
+            return _TransportBackedResponsesClient(
+                provider_id=self.provider_id,
+                api_key=api_key,
+                base_url=self._base_url,
+                timeout_seconds=self._timeout_seconds,
+                transport=transport,
+            )
+        if self._base_url is None:
+            return cast(
+                "_ResponsesClient",
+                OpenAI(
+                    api_key=api_key,
+                    timeout=self._timeout_seconds,
+                    max_retries=0,
+                ).responses,
+            )
+        return cast(
+            "_ResponsesClient",
+            OpenAI(
+                api_key=api_key,
+                base_url=self._base_url,
+                timeout=self._timeout_seconds,
+                max_retries=0,
+            ).responses,
+        )
 
     def generate_translation(
         self,
@@ -160,9 +261,10 @@ class OpenAITranslationAdapter:
             request_context.job,
             "raw",
             "provider-payloads",
-            f"openai-{prompt_variant_id}.json",
+            f"translation-{self.provider_id}-{prompt_variant_id}.json",
         )
         raw_payload = {
+            "provider_id": self.provider_id,
             "model": self.model_id,
             "prompt_variant_id": prompt_variant_id,
             "prompt_version": str(
@@ -187,6 +289,7 @@ class OpenAITranslationAdapter:
         }
         return (
             _candidate_from_chunk_results(
+                provider_id=self.provider_id,
                 translated_segments=tuple(translated_segments),
                 full_text=" ".join(text for text in chunk_full_texts if text).strip(),
                 chunk_count=len(chunk_full_texts),
@@ -248,27 +351,33 @@ class OpenAITranslationAdapter:
                     "schema": _translation_schema(),
                 }
             },
+            "timeout": self._timeout_seconds,
         }
-        response = self._transport.request(
-            HttpRequest(
-                method="POST",
-                url=self._base_url,
-                headers={
-                    "authorization": f"Bearer {self._api_key}",
-                    "content-type": "application/json",
-                },
-                body=json.dumps(body).encode("utf-8"),
-                timeout_seconds=self._timeout_seconds,
-            )
-        )
-        error = _classify_openai_http_error(response)
-        if error is not None:
-            raise error
-        payload = response.json()
+        try:
+            response = self._responses_client.create(**body)
+        except AdapterError:
+            raise
+        except APIStatusError as exc:
+            raise _classify_provider_status_error(self.provider_id, exc) from exc
+        except APITimeoutError as exc:
+            raise AdapterError(
+                provider_id=self.provider_id,
+                message="request timed out",
+                category="timeout",
+                retryable=True,
+            ) from exc
+        except APIConnectionError as exc:
+            raise AdapterError(
+                provider_id=self.provider_id,
+                message=f"network failure: {exc}",
+                category="network_error",
+                retryable=True,
+            ) from exc
+        payload = _response_payload(response, provider_id=self.provider_id)
         if not isinstance(payload, dict):
             raise AdapterError(
-                provider_id="openai",
-                message="OpenAI response must be a JSON object",
+                provider_id=self.provider_id,
+                message="provider response must be a JSON object",
                 category="malformed_response",
                 retryable=False,
             )
@@ -285,17 +394,25 @@ class OpenAITranslationAdapter:
         try:
             raw_payload = perform_with_retries(
                 lambda: self._generate_once(chunk, prompt_variant_id, request_context),
-                provider_id="openai",
+                provider_id=self.provider_id,
                 retry_policy=self._retry_policy,
                 sleep=self._sleep,
             )
-            translation_payload = _extract_translation_payload(raw_payload)
-            chunk_result = _chunk_translation_from_payload(translation_payload, chunk=chunk)
+            translation_payload = _extract_translation_payload(
+                raw_payload,
+                provider_id=self.provider_id,
+            )
+            chunk_result = _chunk_translation_from_payload(
+                translation_payload,
+                chunk=chunk,
+                provider_id=self.provider_id,
+            )
         except AdapterError as exc:
             if _should_split_chunk(chunk, exc):
                 left_chunk, right_chunk = _split_chunk(
                     chunk,
                     context_segment_window=self._context_segment_window,
+                    provider_id=self.provider_id,
                 )
                 left_result = self._translate_chunk_with_fallback(
                     left_chunk,
@@ -309,6 +426,7 @@ class OpenAITranslationAdapter:
                 )
                 fallback_record = _chunk_attempt_record(
                     chunk,
+                    provider_id=self.provider_id,
                     status=(
                         "split_after_retryable_failure"
                         if exc.retryable
@@ -333,6 +451,7 @@ class OpenAITranslationAdapter:
             attempts=(
                 _chunk_attempt_record(
                     chunk,
+                    provider_id=self.provider_id,
                     status="translated",
                     response=raw_payload,
                 ),
@@ -343,12 +462,83 @@ class OpenAITranslationAdapter:
         )
 
 
-def _classify_openai_http_error(response) -> AdapterError | None:
-    error = classify_http_error("openai", response)
+OpenAITranslationAdapter = ChatCompletionTranslationAdapter
+
+
+def _normalized_api_base_url(base_url: str | None) -> str | None:
+    if base_url is None:
+        return None
+    normalized = base_url.strip()
+    if not normalized:
+        return None
+    normalized = normalized.rstrip("/")
+    if normalized.endswith("/responses"):
+        normalized = normalized[: -len("/responses")]
+    return normalized.rstrip("/") + "/"
+
+
+def _responses_endpoint(provider_id: str, base_url: str | None) -> str:
+    normalized = _normalized_api_base_url(base_url)
+    if normalized is None:
+        normalized = DEFAULT_GEMINI_BASE_URL if provider_id == "gemini" else DEFAULT_OPENAI_BASE_URL
+    return urllib.parse.urljoin(normalized, "responses")
+
+
+def _response_payload(response: object, *, provider_id: str) -> dict[str, Any]:
+    if isinstance(response, dict):
+        return response
+    if hasattr(response, "model_dump"):
+        payload = cast("Any", response).model_dump(mode="json")
+        if isinstance(payload, dict):
+            return cast("dict[str, Any]", payload)
+    if hasattr(response, "to_dict"):
+        payload = cast("Any", response).to_dict()
+        if isinstance(payload, dict):
+            return cast("dict[str, Any]", payload)
+    raise AdapterError(
+        provider_id=provider_id,
+        message="provider response must be a JSON object",
+        category="malformed_response",
+        retryable=False,
+    )
+
+
+def _classify_provider_status_error(provider_id: str, exc: APIStatusError) -> AdapterError:
+    response = getattr(exc, "response", None)
+    if response is None:
+        return AdapterError(
+            provider_id=provider_id,
+            message=str(exc),
+            category="http_error",
+            retryable=False,
+            status_code=getattr(exc, "status_code", None),
+        )
+
+    response_text = getattr(response, "text", "")
+    body = response_text.encode("utf-8") if isinstance(response_text, str) else b""
+    http_response = HttpResponse(
+        status_code=int(getattr(response, "status_code", getattr(exc, "status_code", 500) or 500)),
+        headers={key.lower(): value for key, value in dict(response.headers).items()},
+        body=body,
+    )
+    classified = _classify_provider_http_error(provider_id, http_response)
+    if classified is not None:
+        return classified
+    return AdapterError(
+        provider_id=provider_id,
+        message=str(exc),
+        category="http_error",
+        retryable=False,
+        status_code=getattr(exc, "status_code", None),
+    )
+
+
+def _classify_provider_http_error(provider_id: str, response: HttpResponse) -> AdapterError | None:
+    error = classify_http_error(provider_id, response)
     if error is None or response.status_code != 429:
         return error
 
-    payload = _openai_error_payload(response.body)
+    payload = _error_payload(response.body)
     error_details = payload.get("error")
     if not isinstance(error_details, dict):
         return error
@@ -358,7 +548,7 @@ def _classify_openai_http_error(response) -> AdapterError | None:
         return error
 
     return AdapterError(
-        provider_id="openai",
+        provider_id=provider_id,
         message=str(error_details.get("message") or error),
         category="quota_exhausted",
         retryable=False,
@@ -366,7 +556,23 @@ def _classify_openai_http_error(response) -> AdapterError | None:
     )
 
 
-def _openai_error_payload(body: bytes) -> dict[str, Any]:
+def _coerced_http_response(response: object, *, status_code: int) -> HttpResponse:
+    headers = getattr(response, "headers", {})
+    body = getattr(response, "body", b"")
+    normalized_headers = (
+        {key.lower(): value for key, value in dict(headers).items()}
+        if isinstance(headers, dict)
+        else {}
+    )
+    normalized_body = body if isinstance(body, bytes) else b""
+    return HttpResponse(
+        status_code=status_code,
+        headers=normalized_headers,
+        body=normalized_body,
+    )
+
+
+def _error_payload(body: bytes) -> dict[str, Any]:
     try:
         payload = json.loads(body.decode("utf-8"))
     except Exception:
@@ -542,13 +748,14 @@ def _split_chunk(
     chunk: _TranslationChunk,
     *,
     context_segment_window: int,
+    provider_id: str = "openai",
 ) -> tuple[_TranslationChunk, _TranslationChunk]:
     midpoint = max(1, len(chunk.segments) // 2)
     left_segments = chunk.segments[:midpoint]
     right_segments = chunk.segments[midpoint:]
     if not left_segments or not right_segments:
         raise AdapterError(
-            provider_id="openai",
+            provider_id=provider_id,
             message="cannot split translation chunk further",
             category="chunking_error",
             retryable=False,
@@ -597,23 +804,25 @@ def _chunk_translation_from_payload(
     payload: dict[str, Any],
     *,
     chunk: _TranslationChunk,
+    provider_id: str = "openai",
 ) -> _ChunkTranslationResult:
     full_text = payload.get("full_text")
     if not isinstance(full_text, str) or not full_text.strip():
         raise AdapterError(
-            provider_id="openai",
+            provider_id=provider_id,
             message="translation payload was missing full_text",
             category="malformed_response",
             retryable=False,
         )
     return _ChunkTranslationResult(
         full_text=full_text.strip(),
-        segments=_merge_segments(chunk.segments, payload.get("segments")),
+        segments=_merge_segments(chunk.segments, payload.get("segments"), provider_id=provider_id),
     )
 
 
 def _candidate_from_chunk_results(
     *,
+    provider_id: str,
     translated_segments: tuple[Segment, ...],
     full_text: str,
     chunk_count: int,
@@ -628,7 +837,7 @@ def _candidate_from_chunk_results(
 ) -> TranslationCandidate:
     provider_request_id = response_ids[0] if response_ids else None
     provider_metadata: dict[str, Any] = {
-        "provider_id": "openai",
+        "provider_id": provider_id,
         "provider_request_id": provider_request_id,
         "response_id": provider_request_id,
     }
@@ -648,7 +857,7 @@ def _candidate_from_chunk_results(
         segments=translated_segments,
         full_text=full_text.strip(),
         raw_response_ref=raw_response_ref,
-        normalization_version="raw-openai-v1",
+        normalization_version="raw-translation-v1",
         metadata={
             "provider": provider_metadata,
             "prompt": {
@@ -668,6 +877,7 @@ def _chunk_attempt_record(
     chunk: _TranslationChunk,
     *,
     status: str,
+    provider_id: str = "openai",
     response: dict[str, Any] | None = None,
     error: AdapterError | None = None,
     fallback_children: tuple[str, str] | None = None,
@@ -676,6 +886,7 @@ def _chunk_attempt_record(
         "chunk_key": chunk.chunk_key,
         "chunk_index": chunk.chunk_index,
         "status": status,
+        "provider_id": provider_id,
         "segment_ids": [segment.segment_id for segment in chunk.segments],
         "source_text": chunk.full_text,
         "context_before": list(chunk.context_before),
@@ -690,10 +901,14 @@ def _chunk_attempt_record(
     return record
 
 
-def _extract_translation_payload(response_payload: dict[str, Any]) -> dict[str, Any]:
+def _extract_translation_payload(
+    response_payload: dict[str, Any],
+    *,
+    provider_id: str = "openai",
+) -> dict[str, Any]:
     output_text = response_payload.get("output_text")
     if isinstance(output_text, str) and output_text.strip():
-        return _parse_model_json(output_text)
+        return _parse_model_json(output_text, provider_id=provider_id)
 
     output = response_payload.get("output")
     if isinstance(output, list):
@@ -708,29 +923,29 @@ def _extract_translation_payload(response_payload: dict[str, Any]) -> dict[str, 
                     continue
                 text = block.get("text")
                 if isinstance(text, str) and text.strip():
-                    return _parse_model_json(text)
+                    return _parse_model_json(text, provider_id=provider_id)
 
     raise AdapterError(
-        provider_id="openai",
-        message="OpenAI response did not contain output text",
+        provider_id=provider_id,
+        message="provider response did not contain output text",
         category="malformed_response",
         retryable=False,
     )
 
 
-def _parse_model_json(text: str) -> dict[str, Any]:
+def _parse_model_json(text: str, *, provider_id: str = "openai") -> dict[str, Any]:
     try:
         payload = json.loads(text)
     except json.JSONDecodeError as exc:
         raise AdapterError(
-            provider_id="openai",
+            provider_id=provider_id,
             message="model output was not valid JSON",
             category="malformed_response",
             retryable=False,
         ) from exc
     if not isinstance(payload, dict):
         raise AdapterError(
-            provider_id="openai",
+            provider_id=provider_id,
             message="model output must be a JSON object",
             category="malformed_response",
             retryable=False,
@@ -749,11 +964,12 @@ def _candidate_from_translation_payload(
     prompt_version: str,
     model_id: str,
     raw_response_ref: str,
+    provider_id: str = "openai",
 ) -> TranslationCandidate:
     full_text = payload.get("full_text")
     if not isinstance(full_text, str) or not full_text.strip():
         raise AdapterError(
-            provider_id="openai",
+            provider_id=provider_id,
             message="translation payload was missing full_text",
             category="malformed_response",
             retryable=False,
@@ -761,6 +977,7 @@ def _candidate_from_translation_payload(
     translated_segments = _merge_segments(
         final_transcript.segments,
         payload.get("segments"),
+        provider_id=provider_id,
     )
     return TranslationCandidate(
         candidate_id=(
@@ -776,10 +993,10 @@ def _candidate_from_translation_payload(
         segments=translated_segments,
         full_text=full_text.strip(),
         raw_response_ref=raw_response_ref,
-        normalization_version="raw-openai-v1",
+        normalization_version="raw-translation-v1",
         metadata={
             "provider": {
-                "provider_id": "openai",
+                "provider_id": provider_id,
                 "provider_request_id": _provider_request_id(response_payload),
                 "response_id": _provider_request_id(response_payload),
             },
@@ -795,6 +1012,8 @@ def _candidate_from_translation_payload(
 def _merge_segments(
     source_segments: tuple[Segment, ...],
     payload_segments: object,
+    *,
+    provider_id: str = "openai",
 ) -> tuple[Segment, ...]:
     translations_by_id: dict[str, str] = {}
     if isinstance(payload_segments, list):
@@ -815,7 +1034,7 @@ def _merge_segments(
         if target_text is None:
             missing_segment_ids.append(segment.segment_id)
             continue
-        _validate_segment_translation(segment, target_text)
+        _validate_segment_translation(segment, target_text, provider_id=provider_id)
         translated.append(
             segment.model_copy(
                 update={
@@ -825,7 +1044,7 @@ def _merge_segments(
         )
     if missing_segment_ids:
         raise AdapterError(
-            provider_id="openai",
+            provider_id=provider_id,
             message=(
                 "translation payload was missing segment translations for "
                 + ", ".join(missing_segment_ids)
@@ -834,11 +1053,16 @@ def _merge_segments(
             retryable=False,
         )
     translated_tuple = tuple(translated)
-    _validate_chunk_segment_alignment(translated_tuple)
+    _validate_chunk_segment_alignment(translated_tuple, provider_id=provider_id)
     return translated_tuple
 
 
-def _validate_segment_translation(segment: Segment, target_text: str) -> None:
+def _validate_segment_translation(
+    segment: Segment,
+    target_text: str,
+    *,
+    provider_id: str = "openai",
+) -> None:
     source_text = (segment.source_text or "").strip()
     if not source_text:
         return
@@ -851,7 +1075,7 @@ def _validate_segment_translation(segment: Segment, target_text: str) -> None:
     if target_length <= max_target_length:
         return
     raise AdapterError(
-        provider_id="openai",
+        provider_id=provider_id,
         message=(
             "translation payload produced implausibly long text for "
             f"{segment.segment_id}: source_length={source_length} "
@@ -862,7 +1086,11 @@ def _validate_segment_translation(segment: Segment, target_text: str) -> None:
     )
 
 
-def _validate_chunk_segment_alignment(segments: tuple[Segment, ...]) -> None:
+def _validate_chunk_segment_alignment(
+    segments: tuple[Segment, ...],
+    *,
+    provider_id: str = "openai",
+) -> None:
     for index, segment in enumerate(segments):
         current_text = _normalized_translation_text(segment.target_text or "")
         if len(current_text) < MIN_DUPLICATED_SEGMENT_TEXT_LENGTH:
@@ -873,7 +1101,7 @@ def _validate_chunk_segment_alignment(segments: tuple[Segment, ...]) -> None:
                 continue
             if later_text in current_text:
                 raise AdapterError(
-                    provider_id="openai",
+                    provider_id=provider_id,
                     message=(
                         "translation payload duplicated later segment text: "
                         f"{segment.segment_id} contains {later_segment.segment_id}"

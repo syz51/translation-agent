@@ -10,16 +10,20 @@ from typing import Any
 from translation_agent.adapters import (
     AssemblyAITranscriptionAdapter,
     AudioExtractionAdapter,
+    ChatCompletionTranslationAdapter,
     DeepgramTranscriptionAdapter,
     FFmpegAudioExtractionAdapter,
-    OpenAITranslationAdapter,
     RetryPolicy,
     SpeechmaticsTranscriptionAdapter,
     TranscriptionAdapter,
     TranslationAdapter,
 )
 from translation_agent.config import (
+    LlmProviderId,
     Settings,
+    llm_provider_api_key,
+    llm_provider_base_url,
+    llm_provider_base_url_source,
     resolve_transcription_providers,
     validate_provider_configuration,
     validate_runtime_compatibility,
@@ -64,6 +68,24 @@ PHASE_THREE_NORMALIZATION_VERSION = "2026-04-03-phase-4"
 DEFAULT_SCENARIO = "happy"
 
 
+@dataclass(frozen=True, slots=True)
+class ReasoningProfile:
+    """Configured reasoning runtime metadata for future live reasoning adapters."""
+
+    provider_id: str
+    model_id: str
+    base_url_source: str
+    live_adapter_enabled: bool = False
+
+    def as_metadata(self) -> dict[str, object]:
+        return {
+            "provider_id": self.provider_id,
+            "model_id": self.model_id,
+            "base_url_source": self.base_url_source,
+            "live_adapter_enabled": self.live_adapter_enabled,
+        }
+
+
 @dataclass(slots=True)
 class WorkflowRuntime:
     """Dependencies required to execute the deterministic Phase 2 graph."""
@@ -82,6 +104,7 @@ class WorkflowRuntime:
     prompt_evolution_backend: PromptEvolutionBackend
     prompt_resolver: PromptResolver
     parallelism: RuntimeParallelismPolicy
+    reasoning_profile: ReasoningProfile
     source_artifact_ref: str
     scenario: str = DEFAULT_SCENARIO
     adapter_mode: str = "fake"
@@ -336,6 +359,7 @@ class FakeTranscriptionAdapter:
 class FakeTranslationAdapter:
     """Deterministic translation adapter with scenario-driven failure injection."""
 
+    provider_id = "fake-translation"
     model_id = "gpt-5-mini"
 
     def __init__(self, *, blob_store: BlobStore) -> None:
@@ -372,6 +396,7 @@ class FakeTranslationAdapter:
         resolved_prompt = request_context.metadata.get("resolved_translation_prompt", {})
         text = _translation_text_for_variant(prompt_variant_id, scenario)
         raw_payload: dict[str, object] = {
+            "provider": self.provider_id,
             "translation": text,
             "variant": prompt_variant_id,
         }
@@ -379,7 +404,7 @@ class FakeTranslationAdapter:
             request_context.job,
             "raw",
             "provider-payloads",
-            f"openai-{prompt_variant_id}.json",
+            f"translation-{self.provider_id}-{prompt_variant_id}.json",
         )
         scope_token = job_scope_token(request_context.job)
         return (
@@ -418,7 +443,13 @@ class FakeTranslationAdapter:
                 full_text=text,
                 raw_response_ref=raw_response_ref,
                 normalization_version=PHASE_TWO_NORMALIZATION_VERSION,
-                metadata={"scenario": scenario, "prompt_resolver": resolved_prompt},
+                metadata={
+                    "provider": {
+                        "provider_id": self.provider_id,
+                    },
+                    "scenario": scenario,
+                    "prompt_resolver": resolved_prompt,
+                },
             ),
             raw_payload,
         )
@@ -458,6 +489,7 @@ def build_phase_two_runtime(
         prompt_evolution_backend=DeterministicPromptEvolutionBackend(),
         prompt_resolver=ProposalBackedPromptResolver(run_store, blob_store),
         parallelism=_default_parallelism_policy(provider_count=3),
+        reasoning_profile=_default_reasoning_profile(),
         source_artifact_ref=source_artifact_ref,
         scenario=scenario,
         adapter_mode="fake",
@@ -547,18 +579,10 @@ def build_phase_three_runtime(
         blob_store=blob_store,
         retry_policy=retry_policy,
     )
-    translation_adapter = overrides.translation_adapter or OpenAITranslationAdapter(
+    translation_adapter = overrides.translation_adapter or _build_real_translation_adapter(
+        settings=settings,
         blob_store=blob_store,
-        api_key=_required_setting(settings.openai_api_key, "TA_OPENAI_API_KEY"),
-        model_id=settings.translation_model_id,
-        prompt_version=settings.translation_prompt_version,
-        base_url=settings.openai_base_url,
-        timeout_seconds=settings.translation_timeout_seconds,
         retry_policy=retry_policy,
-        max_chunk_workers=settings.translation_chunk_max_workers,
-        max_chunk_characters=settings.translation_max_chunk_characters,
-        max_chunk_segments=settings.translation_max_chunk_segments,
-        context_segment_window=settings.translation_context_segment_window,
     )
 
     memory_store = BlobBackedLongTermMemoryStore(blob_store)
@@ -582,6 +606,7 @@ def build_phase_three_runtime(
             settings,
             provider_count=len(transcription_adapters),
         ),
+        reasoning_profile=_reasoning_profile_from_settings(settings),
         source_artifact_ref=source_artifact_ref,
         scenario=scenario,
         adapter_mode="real",
@@ -598,6 +623,7 @@ def runtime_metadata(base_metadata: dict[str, Any], runtime: WorkflowRuntime) ->
         "adapter_mode": runtime.adapter_mode,
         "blob_root": _blob_root(runtime.blob_store),
         "normalization_version": runtime.normalization_version,
+        "reasoning_profile": runtime.reasoning_profile.as_metadata(),
     }
 
 
@@ -653,6 +679,53 @@ def _build_real_transcription_adapters(
     if not adapters:
         raise RuntimeError("TA_TRANSCRIPTION_PROVIDERS must select at least one provider when set")
     return tuple(adapters)
+
+
+def _build_real_translation_adapter(
+    *,
+    settings: Settings,
+    blob_store: BlobStore,
+    retry_policy: RetryPolicy,
+) -> TranslationAdapter:
+    provider_id = settings.translation_provider
+    return ChatCompletionTranslationAdapter(
+        provider_id=provider_id,
+        blob_store=blob_store,
+        api_key=_required_llm_provider_setting(settings, provider_id),
+        model_id=settings.translation_model_id,
+        prompt_version=settings.translation_prompt_version,
+        base_url=llm_provider_base_url(settings, provider_id),
+        timeout_seconds=settings.translation_timeout_seconds,
+        retry_policy=retry_policy,
+        max_chunk_workers=settings.translation_chunk_max_workers,
+        max_chunk_characters=settings.translation_max_chunk_characters,
+        max_chunk_segments=settings.translation_max_chunk_segments,
+        context_segment_window=settings.translation_context_segment_window,
+    )
+
+
+def _required_llm_provider_setting(settings: Settings, provider_id: LlmProviderId) -> str:
+    api_key = llm_provider_api_key(settings, provider_id)
+    if api_key:
+        return api_key
+    env_var = "TA_GEMINI_API_KEY" if provider_id == "gemini" else "TA_OPENAI_API_KEY"
+    raise RuntimeError(f"{env_var} is required when TA_ADAPTER_MODE=real")
+
+
+def _reasoning_profile_from_settings(settings: Settings) -> ReasoningProfile:
+    return ReasoningProfile(
+        provider_id=settings.reasoning_provider,
+        model_id=settings.reasoning_model_id,
+        base_url_source=llm_provider_base_url_source(settings, settings.reasoning_provider),
+    )
+
+
+def _default_reasoning_profile() -> ReasoningProfile:
+    return ReasoningProfile(
+        provider_id="openai",
+        model_id="gpt-5.4",
+        base_url_source="openai-sdk-default",
+    )
 
 
 def _default_parallelism_policy(*, provider_count: int) -> RuntimeParallelismPolicy:

@@ -41,7 +41,12 @@ It uses:
 - `AssemblyAITranscriptionAdapter`
 - `SpeechmaticsTranscriptionAdapter`
 - `DeepgramTranscriptionAdapter`
-- `OpenAITranslationAdapter`
+- `ChatCompletionTranslationAdapter`
+
+The translation role is provider-scoped:
+
+- `translation` defaults to Gemini with `gemini-3-flash`
+- `reasoning` defaults to OpenAI with `gpt-5.4`
 
 Real mode is gated by:
 
@@ -66,7 +71,7 @@ Deterministic code owns:
 - artifact publishing
 - replay
 
-The review layer is still structured around reviewer roles, but in the current fake runtime those roles are rendered deterministically into fixed-section prose and parsed back into structured review bundles. This matters because the design target is not “free-form multi-agent orchestration”; it is inspectable workflow execution with narrow judgment points.
+The review layer is still structured around reviewer roles, but in the current fake runtime those roles are rendered deterministically into fixed-section prose and parsed back into structured review bundles. The configured reasoning profile is already attached to `WorkflowRuntime`, but review and adjudication still use deterministic code paths in this pass. This matters because the design target is not “free-form multi-agent orchestration”; it is inspectable workflow execution with narrow judgment points.
 
 ## Workflow Layering
 
@@ -297,7 +302,7 @@ The repo does not yet provide:
 - a human-in-the-loop operator UI
 - runtime manual override workflows
 - free-form multi-agent orchestration
-- a second translation provider
+- live reasoning adapters for review, adjudication, or escalation
 - external vector or semantic databases for long-term memory
 
 Those remain roadmap items rather than hidden assumptions in the current code.

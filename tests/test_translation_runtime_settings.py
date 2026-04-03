@@ -29,13 +29,13 @@ def test_phase_three_runtime_uses_translation_timeout_and_chunk_settings(
     captured_kwargs: dict[str, Any] = {}
 
     class StubTranslationAdapter:
-        provider_id = "openai"
-        model_id = "gpt-5.4-mini"
+        provider_id = "gemini"
+        model_id = "gemini-3-flash"
 
         def __init__(self, **kwargs: Any) -> None:
             captured_kwargs.update(kwargs)
 
-    monkeypatch.setattr(runtime_module, "OpenAITranslationAdapter", StubTranslationAdapter)
+    monkeypatch.setattr(runtime_module, "ChatCompletionTranslationAdapter", StubTranslationAdapter)
     settings = Settings(
         adapter_mode="real",
         allow_langgraph_py314_warning=True,
@@ -43,7 +43,7 @@ def test_phase_three_runtime_uses_translation_timeout_and_chunk_settings(
         assemblyai_api_key="assembly",  # pragma: allowlist secret
         speechmatics_api_key="speech",  # pragma: allowlist secret
         deepgram_api_key="deepgram",  # pragma: allowlist secret
-        openai_api_key="openai",  # pragma: allowlist secret
+        gemini_api_key="gemini",  # pragma: allowlist secret
         translation_timeout_seconds=95.0,
         translation_max_chunk_characters=4321,
         translation_max_chunk_segments=87,
@@ -59,6 +59,7 @@ def test_phase_three_runtime_uses_translation_timeout_and_chunk_settings(
     )
 
     assert captured_kwargs["timeout_seconds"] == 95.0
+    assert captured_kwargs["provider_id"] == "gemini"
     assert captured_kwargs["max_chunk_workers"] == 4
     assert captured_kwargs["max_chunk_characters"] == 4321
     assert captured_kwargs["max_chunk_segments"] == 87
@@ -79,7 +80,7 @@ def test_phase_three_runtime_wires_parallelism_settings(
         state_db_dsn="postgresql://user:pass@db.example.com:5432/app",  # pragma: allowlist secret
         assemblyai_api_key="assembly",  # pragma: allowlist secret
         speechmatics_api_key="speech",  # pragma: allowlist secret
-        openai_api_key="openai",  # pragma: allowlist secret
+        gemini_api_key="gemini",  # pragma: allowlist secret
         transcription_providers="assemblyai,speechmatics",
         transcription_max_workers=2,
         translation_candidate_max_workers=3,
@@ -119,7 +120,7 @@ def test_phase_three_runtime_defaults_transcription_workers_to_selected_provider
         state_db_dsn="postgresql://user:pass@db.example.com:5432/app",  # pragma: allowlist secret
         assemblyai_api_key="assembly",  # pragma: allowlist secret
         deepgram_api_key="deepgram",  # pragma: allowlist secret
-        openai_api_key="openai",  # pragma: allowlist secret
+        gemini_api_key="gemini",  # pragma: allowlist secret
         transcription_providers="assemblyai,deepgram",
     )
 
@@ -132,3 +133,34 @@ def test_phase_three_runtime_defaults_transcription_workers_to_selected_provider
     )
 
     assert runtime.parallelism.transcription_max_workers == 2
+
+
+def test_phase_three_runtime_exposes_default_reasoning_profile(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        "translation_agent.graph.runtime.ensure_langgraph_runtime_supported",
+        lambda: None,
+    )
+    settings = Settings(
+        adapter_mode="real",
+        allow_langgraph_py314_warning=True,
+        state_db_dsn="postgresql://user:pass@db.example.com:5432/app",  # pragma: allowlist secret
+        assemblyai_api_key="assembly",  # pragma: allowlist secret
+        deepgram_api_key="deepgram",  # pragma: allowlist secret
+        gemini_api_key="gemini",  # pragma: allowlist secret
+        transcription_providers="assemblyai,deepgram",
+    )
+
+    runtime = build_phase_three_runtime(
+        settings=settings,
+        blob_store=LocalBlobStore(tmp_path / "blobs"),
+        run_store=cast(Any, InMemoryRunStore()),
+        trace_sink=NoOpTraceSink(),
+        source_artifact_ref="jobs/request.json",
+    )
+
+    assert runtime.reasoning_profile.provider_id == "openai"
+    assert runtime.reasoning_profile.model_id == "gpt-5.4"
+    assert runtime.reasoning_profile.base_url_source == "openai-sdk-default"
