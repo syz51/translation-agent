@@ -18,6 +18,7 @@ from translation_agent.memory.staging import (
     project_pair_scope_key,
 )
 from translation_agent.models import (
+    AssetContext,
     FailureTag,
     FinalTranslationDecision,
     HumanApprovalRecord,
@@ -27,6 +28,7 @@ from translation_agent.models import (
     JobContext,
     MemoryWrite,
     MemoryWriteBatch,
+    PromotionGateOutcome,
     PromptChange,
     PromptCompatibilityTuple,
     PromptEvolutionProposal,
@@ -874,6 +876,10 @@ def _job_context_from_run(
         asset_id=_optional_string(input_data.get("asset_id")),
         media_fingerprint=_optional_string(input_data.get("media_fingerprint")),
         media_key=str(input_data.get("media_key") or f"source-ref:{run_record.run_id}"),
+        asset_context=_asset_context_from_payload(
+            input_data.get("media_key"),
+            request_payload.get("asset_context"),
+        ),
         reference_transcript_source=_optional_string(
             request_payload.get("reference_transcript_source")
         ),
@@ -2901,6 +2907,12 @@ def _build_feedback_prompt_proposal(
             PromptChange(section="system", instruction=_failure_tag_instruction(dominant_tag)),
         ),
         evidence_refs=(resolution_ref,),
+        promotion_status="candidate",
+        gate_outcome=PromotionGateOutcome(
+            human_support_pass=True,
+            quality_gate_status="pending",
+            notes=("human_review_feedback",),
+        ),
         metadata={
             "proposal_origin": "human_review_feedback",
             "dominant_failure_tag": dominant_tag,
@@ -2942,8 +2954,20 @@ def _updated_feedback_proposal_status(
     control_score = _average_score(control_scores)
     canary_rejected_rate = _rejected_rate(canary_scores)
     control_rejected_rate = _rejected_rate(control_scores)
+    supported_resolutions = [
+        resolution
+        for resolution in resolutions
+        if _resolution_failure_weight(resolution, compatibility) > 0.0
+    ]
+    distinct_projects = {
+        (resolution.tenant_id, resolution.project_id) for resolution in supported_resolutions
+    }
+    human_support_pass = len(supported_resolutions) >= 3
     status = proposal.status
     rollback_reason = proposal.rollback_reason
+    promotion_status = proposal.promotion_status
+    if status == "proposed" and human_support_pass:
+        status = "canary"
     if status == "canary":
         if (
             canary_count >= 5
@@ -2961,18 +2985,58 @@ def _updated_feedback_proposal_status(
         ):
             status = "rolled_back"
             rollback_reason = "active proposal regressed on human-feedback score"
+            promotion_status = "blocked"
+    eligible_for_pair_promotion = bool(
+        status == "active"
+        and human_support_pass
+        and len(distinct_projects) >= 2
+        and canary_count >= 5
+        and canary_score >= max(control_score, 0.35) + 0.10
+        and canary_rejected_rate <= min(control_rejected_rate + 0.05, 0.25)
+    )
+    if eligible_for_pair_promotion:
+        promotion_status = "promoted"
+    notes = ["human_review_feedback"]
+    if eligible_for_pair_promotion:
+        notes.append("eligible_for_pair_promotion")
+    if rollback_reason is not None:
+        notes.append("rollback_signal_present")
+    quality_gate_status = (
+        "passed"
+        if human_support_pass and (status in {"canary", "active"} or eligible_for_pair_promotion)
+        else "failed"
+        if rollback_reason is not None
+        else "pending"
+    )
     return proposal.model_copy(
         update={
             "status": status,
             "rollback_reason": rollback_reason,
+            "promotion_status": promotion_status,
             "canary_run_count": canary_count,
             "control_run_count": control_count,
+            "gate_outcome": PromotionGateOutcome(
+                heuristic_gate_pass=canary_score >= control_score,
+                stronger_grader_pass=False,
+                human_support_pass=human_support_pass,
+                rollback_signal_present=rollback_reason is not None,
+                material_disagreement=False,
+                eligible_for_pair_promotion=eligible_for_pair_promotion,
+                quality_gate_status=quality_gate_status,  # type: ignore[arg-type]
+                notes=tuple(notes),
+            ),
             "metadata": {
                 **proposal.metadata,
                 "canary_feedback_score": canary_score,
                 "control_feedback_score": control_score,
                 "canary_rejected_all_rate": canary_rejected_rate,
                 "control_rejected_all_rate": control_rejected_rate,
+                "promoted_scope_kind": "pair" if eligible_for_pair_promotion else None,
+                "promoted_scope_key": (
+                    f"{compatibility.source_language}::{compatibility.target_language}"
+                    if eligible_for_pair_promotion
+                    else None
+                ),
             },
         }
     )
@@ -3050,6 +3114,14 @@ def _optional_string(value: Any) -> str | None:
     if isinstance(value, str) and value:
         return value
     return None
+
+
+def _asset_context_from_payload(media_key: Any, payload: Any) -> AssetContext | None:
+    if not isinstance(media_key, str) or not media_key:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return AssetContext.model_validate({"media_key": media_key, **payload})
 
 
 def _normalized_approved_by(approved_by: str | None) -> str:

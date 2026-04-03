@@ -7,6 +7,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import Field, model_validator
 
+from .assets import AssetContext
 from .base import ContractModel
 from .jobs import JobContext
 
@@ -21,9 +22,21 @@ MemorySubtype = Literal[
     "failure_pattern",
     "escalation_pattern",
     "prompt_guidance",
+    "terminology_rule",
+    "entity_alias",
+    "speaker_style",
+    "show_style",
+    "series_context",
+    "content_type_rule",
+    "translation_combo_guidance",
+    "anti_pattern",
 ]
 MemoryScopeKind = Literal[
     "asset",
+    "series",
+    "speaker_cluster",
+    "franchise",
+    "channel",
     "project_pair",
     "pair",
     "source_language",
@@ -47,6 +60,7 @@ QualityGateStatus = Literal[
     "failed",
     "disagreed",
 ]
+ValidationStatus = Literal["pending", "validated", "contradicted", "failed"]
 PromptEvolutionStatus = Literal[
     "proposed",
     "canary",
@@ -84,8 +98,23 @@ class MemoryEntry(ContractModel):
     supporting_asset_count: int = Field(default=0, ge=0)
     supporting_project_count: int = Field(default=0, ge=0)
     contradiction_count: int = Field(default=0, ge=0)
+    series_id: str | None = None
+    franchise_id: str | None = None
+    speaker_ids: tuple[str, ...] = ()
+    content_type: str | None = None
+    topic_tags: tuple[str, ...] = ()
+    style_profile_id: str | None = None
+    entity_keys: tuple[str, ...] = ()
+    term_keys: tuple[str, ...] = ()
+    applicability_scope: str | None = None
+    evidence_refs: tuple[str, ...] = ()
+    last_validated_at: datetime | None = None
+    success_count: int = Field(default=0, ge=0)
+    failure_count: int = Field(default=0, ge=0)
+    validation_status: ValidationStatus = "pending"
     promotion_ref: str | None = None
     quality_gate_status: QualityGateStatus = "not_evaluated"
+    typed_metadata: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
@@ -119,11 +148,20 @@ class MemoryQuery(ContractModel):
     job: JobContext
     stage: NonEmptyStr
     query_text: NonEmptyStr
+    asset_context: AssetContext | None = None
     candidate_ids: tuple[str, ...] = ()
     provider_ids: tuple[str, ...] = ()
     prompt_variant_ids: tuple[str, ...] = ()
     model_ids: tuple[str, ...] = ()
     disagreement_bucket: str | None = None
+    series_id: str | None = None
+    franchise_id: str | None = None
+    speaker_ids: tuple[str, ...] = ()
+    content_type: str | None = None
+    topic_tags: tuple[str, ...] = ()
+    style_profile_id: str | None = None
+    entity_keys: tuple[str, ...] = ()
+    term_keys: tuple[str, ...] = ()
     glossary_misses: tuple[str, ...] = ()
     entities: tuple[str, ...] = ()
     numbers_dates: tuple[str, ...] = ()
@@ -161,8 +199,23 @@ class MemoryWrite(ContractModel):
     supporting_asset_count: int = Field(default=0, ge=0)
     supporting_project_count: int = Field(default=0, ge=0)
     contradiction_count: int = Field(default=0, ge=0)
+    series_id: str | None = None
+    franchise_id: str | None = None
+    speaker_ids: tuple[str, ...] = ()
+    content_type: str | None = None
+    topic_tags: tuple[str, ...] = ()
+    style_profile_id: str | None = None
+    entity_keys: tuple[str, ...] = ()
+    term_keys: tuple[str, ...] = ()
+    applicability_scope: str | None = None
+    evidence_refs: tuple[str, ...] = ()
+    last_validated_at: datetime | None = None
+    success_count: int = Field(default=0, ge=0)
+    failure_count: int = Field(default=0, ge=0)
+    validation_status: ValidationStatus = "pending"
     promotion_ref: str | None = None
     quality_gate_status: QualityGateStatus = "not_evaluated"
+    typed_metadata: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
@@ -221,6 +274,21 @@ class MemoryConsolidation(ContractModel):
     procedural_memory_ids: tuple[str, ...] = ()
     skipped_dedupe_keys: tuple[str, ...] = ()
     procedural_write_count: int = Field(default=0, ge=0)
+
+
+class MemoryEvidenceEvent(ContractModel):
+    """Evidence event attached to a persisted memory entry."""
+
+    event_id: NonEmptyStr
+    memory_id: NonEmptyStr
+    event_kind: NonEmptyStr
+    run_id: str | None = None
+    job_id: str | None = None
+    media_key: str | None = None
+    stage: str | None = None
+    source_ref: str | None = None
+    created_at: datetime = Field(default_factory=utc_now)
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class PromptChange(ContractModel):

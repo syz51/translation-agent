@@ -34,6 +34,7 @@ from translation_agent.errors import TranscriptionProvidersFailedError
 from translation_agent.graph import GraphState
 from translation_agent.graph.state import RoutingFact
 from translation_agent.models import (
+    AssetContextInput,
     CandidatePreference,
     JobContext,
     ReviewBundle,
@@ -47,6 +48,7 @@ from translation_agent.review_flow import _build_contradiction_summary
 from translation_agent.run_status import PhaseCounters, RecentRunEvent, RunStatusSnapshot
 from translation_agent.storage import (
     LocalBlobStore,
+    PostgresOperationalStore,
     PostgresRunStore,
     SQLiteOperationalStore,
     job_path,
@@ -1096,6 +1098,48 @@ def test_run_job_uses_configured_default_target_language(
             / Path(job_path(_job_context("job-default-target"), "exports", "translation.srt"))
         ).resolve()
     )
+
+
+@pytest.mark.integration
+def test_run_job_persists_request_asset_context_in_postgres_runtime(
+    migrated_postgres_dsn: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("TA_DATA_DIR", str(tmp_path / "runtime"))
+    monkeypatch.setenv("TA_STATE_DB_DSN", migrated_postgres_dsn)
+
+    request = RunJobRequest(
+        source="input.mp4",
+        job_id="job-asset-context",
+        asset_context=AssetContextInput(
+            canonical_title="Episode 1",
+            content_type="episode",
+            series_id="series-1",
+            franchise_id="franchise-1",
+            channel_id="channel-1",
+            speaker_ids=("speaker-1",),
+            topic_tags=("finance",),
+            style_profile_id="style-1",
+            metadata_confidence="high",
+            metadata_sources=("request",),
+        ),
+    )
+
+    result = run_job(request)
+    request_payload = json.loads(
+        (result.blob_root / "jobs" / f"{result.run_id}-request.json").read_text(encoding="utf-8")
+    )
+
+    with PostgresRunStore(migrated_postgres_dsn) as store:
+        record = store.get_run(result.run_id)
+
+    with PostgresOperationalStore(migrated_postgres_dsn) as store:
+        asset_context = store.get_asset_context(record.input_data["media_key"] if record else "")
+
+    assert request_payload["asset_context"]["series_id"] == "series-1"
+    assert asset_context is not None
+    assert asset_context.canonical_title == "Episode 1"
 
 
 @pytest.mark.integration

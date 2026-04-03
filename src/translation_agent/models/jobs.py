@@ -7,6 +7,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import Field
 
+from .assets import AssetContext
 from .base import ContractModel
 
 NonEmptyStr = Annotated[str, Field(min_length=1)]
@@ -29,6 +30,7 @@ class JobContext(ContractModel):
     asset_id: str | None = None
     media_fingerprint: str | None = None
     media_key: NonEmptyStr
+    asset_context: AssetContext | None = None
     reference_transcript_source: str | None = None
     reference_transcript_format: ReferenceTranscriptFormat | None = None
     reference_mode: ReferenceMode = "none"

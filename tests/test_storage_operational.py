@@ -7,10 +7,15 @@ import pytest
 
 from translation_agent.models import (
     AdjudicationScorecard,
+    AssetContext,
+    AssetRelation,
     FinalTranscriptDecision,
     FinalTranslationDecision,
     HistoricalRunLink,
     JobContext,
+    MemoryEntry,
+    MemoryEvidenceEvent,
+    MemoryQuery,
     MemoryWrite,
     MemoryWriteBatch,
     PromptEvolutionProposal,
@@ -165,6 +170,49 @@ def _memory_batch(job_id: str = "job-operational") -> MemoryWriteBatch:
             ),
         ),
         dedupe_keys=("semantic:workflow",),
+    )
+
+
+def _asset_context(media_key: str) -> AssetContext:
+    return AssetContext(
+        media_key=media_key,
+        canonical_title="Episode 1",
+        content_type="episode",
+        series_id="series-1",
+        season_number=1,
+        episode_number=1,
+        franchise_id="franchise-1",
+        channel_id="channel-1",
+        speaker_ids=("speaker-1", "speaker-2"),
+        topic_tags=("finance", "markets"),
+        style_profile_id="style-1",
+        metadata_confidence="high",
+        metadata_sources=("request",),
+    )
+
+
+def _memory_entry(memory_id: str, media_key: str) -> MemoryEntry:
+    return MemoryEntry(
+        memory_id=memory_id,
+        kind="semantic",
+        memory_subtype="series_context",
+        content="Keep series terminology stable.",
+        scope_kind="series",
+        scope_key="series-1",
+        updated_at=datetime(2026, 4, 2, 12, 0, tzinfo=UTC),
+        score=0.82,
+        series_id="series-1",
+        franchise_id="franchise-1",
+        speaker_ids=("speaker-1",),
+        content_type="episode",
+        topic_tags=("finance",),
+        style_profile_id="style-1",
+        term_keys=("workflow",),
+        entity_keys=("acme",),
+        evidence_refs=("reviews/rev-1.json",),
+        validation_status="validated",
+        metadata={"media_key": media_key},
+        typed_metadata={"channel_id": "channel-1"},
     )
 
 
@@ -477,6 +525,211 @@ def test_sqlite_operational_store_resolves_assets_and_persists_prompt_proposals(
     assert len(proposals) == 1
     assert proposals[0].status == "active"
     assert proposals[0].compatibility is not None
+
+
+@pytest.mark.unit
+def test_sqlite_operational_store_persists_asset_context_relations_and_memory_entries(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.sqlite3"
+
+    with SQLiteOperationalStore(db_path) as store:
+        asset = store.resolve_asset(
+            asset_id="asset-memory-1",
+            media_fingerprint="sha256:memory-1",
+            first_seen_run_id="run-memory-1",
+            source_language="en",
+            target_language="fr",
+        )
+        other_asset = store.resolve_asset(
+            asset_id="asset-memory-2",
+            media_fingerprint="sha256:memory-2",
+            first_seen_run_id="run-memory-2",
+            source_language="en",
+            target_language="fr",
+        )
+        asset_context = store.save_asset_context(_asset_context(asset.media_key))
+        relation = store.save_asset_relation(
+            AssetRelation(
+                relation_id="rel-1",
+                src_media_key=asset.media_key,
+                dst_media_key=other_asset.media_key,
+                relation_kind="same_series",
+                confidence=0.91,
+            )
+        )
+        memory_entry = _memory_entry("memory-1", asset.media_key)
+        inserted = store.put_memory_entry(memory_entry, dedupe_key="semantic:series-1")
+        skipped_duplicate = store.put_memory_entry(memory_entry, dedupe_key="semantic:series-1")
+        evidence_event = store.save_memory_evidence_event(
+            MemoryEvidenceEvent(
+                event_id="event-1",
+                memory_id=memory_entry.memory_id,
+                event_kind="validated_reuse",
+                run_id="run-memory-1",
+                job_id="job-memory-1",
+                media_key=asset.media_key,
+                stage="translation_review",
+            )
+        )
+
+    with SQLiteOperationalStore(db_path) as reopened:
+        stored_asset_context = reopened.get_asset_context(asset.media_key)
+        relations = reopened.list_asset_relations(asset.media_key)
+        stored_memory = reopened.get_memory_entry(memory_entry.memory_id)
+        memory_entries = reopened.list_memory_entries()
+
+    assert asset_context.media_key == asset.media_key
+    assert stored_asset_context is not None
+    assert stored_asset_context.series_id == "series-1"
+    assert relations == [relation]
+    assert inserted is True
+    assert skipped_duplicate is False
+    assert stored_memory == memory_entry
+    assert memory_entries == [memory_entry]
+    assert evidence_event.memory_id == memory_entry.memory_id
+
+
+@pytest.mark.integration
+def test_postgres_operational_store_persists_asset_context_relations_and_memory_entries(
+    migrated_postgres_dsn: str,
+) -> None:
+    with PostgresOperationalStore(migrated_postgres_dsn) as store:
+        asset = store.resolve_asset(
+            asset_id="asset-memory-postgres-1",
+            media_fingerprint="sha256:memory-postgres-1",
+            first_seen_run_id="run-memory-postgres-1",
+            source_language="en",
+            target_language="fr",
+        )
+        other_asset = store.resolve_asset(
+            asset_id="asset-memory-postgres-2",
+            media_fingerprint="sha256:memory-postgres-2",
+            first_seen_run_id="run-memory-postgres-2",
+            source_language="en",
+            target_language="fr",
+        )
+        store.save_asset_context(_asset_context(asset.media_key))
+        relation = store.save_asset_relation(
+            AssetRelation(
+                relation_id="rel-postgres-1",
+                src_media_key=asset.media_key,
+                dst_media_key=other_asset.media_key,
+                relation_kind="same_series",
+                confidence=0.88,
+            )
+        )
+        memory_entry = _memory_entry("memory-postgres-1", asset.media_key)
+        inserted = store.put_memory_entry(
+            memory_entry,
+            dedupe_key="semantic:series-postgres-1",
+        )
+        skipped_duplicate = store.put_memory_entry(
+            memory_entry,
+            dedupe_key="semantic:series-postgres-1",
+        )
+        store.save_memory_evidence_event(
+            MemoryEvidenceEvent(
+                event_id="event-postgres-1",
+                memory_id=memory_entry.memory_id,
+                event_kind="validated_reuse",
+                run_id="run-memory-postgres-1",
+                job_id="job-memory-postgres-1",
+                media_key=asset.media_key,
+                stage="translation_review",
+            )
+        )
+
+    with PostgresOperationalStore(migrated_postgres_dsn) as reopened:
+        stored_asset_context = reopened.get_asset_context(asset.media_key)
+        relations = reopened.list_asset_relations(asset.media_key)
+        stored_memory = reopened.get_memory_entry(memory_entry.memory_id)
+
+    assert stored_asset_context is not None
+    assert stored_asset_context.channel_id == "channel-1"
+    assert relations == [relation]
+    assert inserted is True
+    assert skipped_duplicate is False
+    assert stored_memory == memory_entry
+
+
+@pytest.mark.unit
+def test_sqlite_operational_store_hybrid_search_and_backfill_memory_embeddings(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.sqlite3"
+    job = _job("job-memory-search")
+
+    with SQLiteOperationalStore(db_path) as store:
+        asset = store.resolve_asset(
+            asset_id="asset-memory-search",
+            media_fingerprint="sha256:memory-search",
+            first_seen_run_id="run-memory-search",
+            source_language="en",
+            target_language="fr",
+        )
+        asset_context = _asset_context(asset.media_key)
+        scoped_job = job.model_copy(
+            update={"media_key": asset.media_key, "asset_context": asset_context}
+        )
+        query = MemoryQuery(
+            job=scoped_job,
+            stage="translation_review",
+            query_text="series terminology workflow stability",
+            asset_context=asset_context,
+            series_id="series-1",
+            content_type="episode",
+            style_profile_id="style-1",
+            media_key=asset.media_key,
+        )
+        store.save_asset_context(asset_context)
+        store.put_memory_entry(_memory_entry("memory-search-1", asset.media_key))
+        updated_entries = store.backfill_memory_embeddings()
+        recalled = store.search_memory_entries(query, limit=5)
+
+    assert updated_entries == 1
+    assert recalled
+    assert recalled[0][0].memory_id == "memory-search-1"
+    assert recalled[0][1] > 0.0
+
+
+@pytest.mark.integration
+def test_postgres_operational_store_hybrid_search_and_backfill_memory_embeddings(
+    migrated_postgres_dsn: str,
+) -> None:
+    job = _job("job-memory-search-postgres")
+
+    with PostgresOperationalStore(migrated_postgres_dsn) as store:
+        asset = store.resolve_asset(
+            asset_id="asset-memory-search-postgres",
+            media_fingerprint="sha256:memory-search-postgres",
+            first_seen_run_id="run-memory-search-postgres",
+            source_language="en",
+            target_language="fr",
+        )
+        asset_context = _asset_context(asset.media_key)
+        scoped_job = job.model_copy(
+            update={"media_key": asset.media_key, "asset_context": asset_context}
+        )
+        query = MemoryQuery(
+            job=scoped_job,
+            stage="translation_review",
+            query_text="series terminology workflow stability",
+            asset_context=asset_context,
+            series_id="series-1",
+            content_type="episode",
+            style_profile_id="style-1",
+            media_key=asset.media_key,
+        )
+        store.save_asset_context(asset_context)
+        store.put_memory_entry(_memory_entry("memory-search-postgres-1", asset.media_key))
+        updated_entries = store.backfill_memory_embeddings()
+        recalled = store.search_memory_entries(query, limit=5)
+
+    assert updated_entries == 1
+    assert recalled
+    assert recalled[0][0].memory_id == "memory-search-postgres-1"
+    assert recalled[0][1] > 0.0
 
 
 @pytest.mark.unit

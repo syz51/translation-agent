@@ -242,6 +242,60 @@ def test_active_prompt_proposals_affect_prompt_resolution(tmp_path: Path) -> Non
     assert resolved.scope_kind == "pair"
 
 
+def test_promoted_project_pair_proposals_widen_to_pair_scope_resolution(tmp_path: Path) -> None:
+    store = SQLiteOperationalStore(tmp_path / "state.sqlite3")
+    try:
+        proposal = PromptEvolutionProposal(
+            proposal_id="proposal-promoted-pair",
+            job_id="job-1",
+            source_consolidation_id="consolidation-1",
+            prompt_family="translation",
+            target_model_id="gpt-5.4-mini",
+            target_prompt_version="phase-5-v1",
+            target_prompt_variant_id="variant-a",
+            base_prompt_version="phase-5-v1",
+            status="active",
+            promotion_status="promoted",
+            rationale="Promoted after durable canary and approval evidence.",
+            suggested_changes=(
+                PromptChange(
+                    section="system",
+                    instruction="Carry promoted pair-level terminology stability.",
+                ),
+            ),
+            metadata={
+                "source_language": "en",
+                "target_language": "fr",
+                "scope_kind": "project_pair",
+                "scope_key": "tenant-a::project-a::en::fr",
+                "promoted_scope_kind": "pair",
+                "promoted_scope_key": "en::fr",
+                "proposal_ref": (
+                    "assets/asset-id:asset-1/improvement-proposals/proposal-promoted-pair.json"
+                ),
+            },
+        )
+        store.save_prompt_evolution_proposal(proposal)
+        resolver = ProposalBackedPromptResolver(store)
+
+        resolved = resolver.resolve_translation_prompt(
+            base_prompt_version="phase-5-v1",
+            prompt_variant_id="variant-a",
+            model_id="gpt-5.4-mini",
+            source_language="en",
+            target_language="fr",
+            tenant_id="tenant-b",
+            project_id="project-b",
+            media_key="asset-id:asset-2",
+        )
+    finally:
+        store.close()
+
+    assert "Carry promoted pair-level terminology stability." in resolved.instructions
+    assert resolved.resolution_mode == "active"
+    assert resolved.scope_kind == "pair"
+
+
 def test_reference_evaluation_preserves_historical_link_order_under_parallel_loading(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

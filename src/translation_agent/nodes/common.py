@@ -68,10 +68,19 @@ def build_memory_query(
         job=state.job,
         stage=stage,
         query_text=" | ".join(query_parts),
+        asset_context=state.job.asset_context,
         candidate_ids=candidate_ids,
         provider_ids=provider_ids,
         prompt_variant_ids=prompt_variant_ids,
         model_ids=model_ids,
+        series_id=state.job.asset_context.series_id if state.job.asset_context else None,
+        franchise_id=state.job.asset_context.franchise_id if state.job.asset_context else None,
+        speaker_ids=state.job.asset_context.speaker_ids if state.job.asset_context else (),
+        content_type=state.job.asset_context.content_type if state.job.asset_context else None,
+        topic_tags=state.job.asset_context.topic_tags if state.job.asset_context else (),
+        style_profile_id=(
+            state.job.asset_context.style_profile_id if state.job.asset_context else None
+        ),
         failure_tags=failure_tags,
         media_key=state.job.media_key,
     )

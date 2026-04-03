@@ -1,6 +1,7 @@
 services:
   postgres:
-    image: postgres:18-alpine
+    build:
+      context: docker/postgres
     environment:
       POSTGRES_DB: ${TA_PG_DB:-translation_agent}
       POSTGRES_USER: ${TA_PG_USER:-translation_agent}
@@ -8,7 +9,7 @@ services:
     ports:
       - '${TA_PG_PORT:-55432}:5432'
     volumes:
-      - postgres-data:/var/lib/postgresql/data
+      - postgres-data:/var/lib/postgresql
     healthcheck:
       test:
         [

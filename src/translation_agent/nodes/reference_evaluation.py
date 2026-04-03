@@ -1116,6 +1116,8 @@ def _update_canary_status(
     )
     status = proposal.status
     rollback_reason = proposal.rollback_reason
+    promotion_status = proposal.promotion_status
+    metadata = dict(proposal.metadata)
     if control_metrics is not None:
         last_ten_canary_scores = [
             report.translation.primary_quality_score
@@ -1136,6 +1138,7 @@ def _update_canary_status(
         ) or rolling_canary <= control_metrics.primary_quality_score - 0.02:
             status = "rolled_back"
             rollback_reason = "canary underperformed control on quality or severe failures"
+            promotion_status = "blocked"
         elif (
             gate_outcome.material_disagreement is False
             and canary_metrics.run_count >= 30
@@ -1150,10 +1153,21 @@ def _update_canary_status(
         ):
             status = "active"
             rollback_reason = None
+            if gate_outcome.eligible_for_pair_promotion:
+                promotion_status = "promoted"
+                metadata["promoted_scope_kind"] = "pair"
+                metadata["promoted_scope_key"] = build_scope_key(
+                    scope_kind="pair",
+                    tenant_id=str(proposal.metadata.get("tenant_id", "")),
+                    project_id=str(proposal.metadata.get("project_id", "")),
+                    source_language=compatibility.source_language,
+                    target_language=compatibility.target_language,
+                )
     return proposal.model_copy(
         update={
             "status": status,
             "rollback_reason": rollback_reason,
+            "promotion_status": promotion_status,
             "canary_run_count": canary_metrics.run_count,
             "control_run_count": control_metrics.run_count if control_metrics is not None else 0,
             "canary_metrics": canary_metrics,
@@ -1161,6 +1175,7 @@ def _update_canary_status(
             "canary_stronger_grader": canary_stronger_grader,
             "control_stronger_grader": control_stronger_grader,
             "gate_outcome": gate_outcome,
+            "metadata": metadata,
         }
     )
 
@@ -1229,11 +1244,23 @@ def _evaluation_gate_outcome(
         )
     )
     material_disagreement = bool(heuristic_gate_pass) != bool(stronger_grader_pass)
+    eligible_for_pair_promotion = bool(
+        canary_metrics is not None
+        and control_metrics is not None
+        and canary_metrics.run_count >= 30
+        and control_metrics.run_count >= 30
+        and not material_disagreement
+        and heuristic_gate_pass
+        and stronger_grader_pass
+        and canary_metrics.primary_quality_score >= control_metrics.primary_quality_score + 0.02
+    )
     notes = []
     if proposal_refs:
         notes.append("proposal_artifacts_attached")
     if material_disagreement:
         notes.append("heuristic_stronger_grader_disagreement")
+    if eligible_for_pair_promotion:
+        notes.append("eligible_for_pair_promotion")
     quality_gate_status = (
         "disagreed"
         if material_disagreement
@@ -1247,7 +1274,7 @@ def _evaluation_gate_outcome(
         human_support_pass=False,
         rollback_signal_present=False,
         material_disagreement=material_disagreement,
-        eligible_for_pair_promotion=False,
+        eligible_for_pair_promotion=eligible_for_pair_promotion,
         quality_gate_status=quality_gate_status,  # type: ignore[arg-type]
         notes=tuple(notes),
     )
