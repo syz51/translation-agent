@@ -1618,7 +1618,7 @@ def test_cli_resume_translation_review_auto_non_tty_prints_resume_instructions(
 
 
 @pytest.mark.unit
-def test_review_job_json_exposes_candidates_and_review_diffs(
+def test_review_job_json_exposes_review_spans_and_legacy_review_diffs(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -1656,6 +1656,12 @@ def test_review_job_json_exposes_candidates_and_review_diffs(
     assert contradiction["evidence_text"]
     assert contradiction["time_range"]
     assert payload["human_review_summary"]["contradiction_count"] >= 1
+    assert payload["review_spans"]
+    review_span = payload["review_spans"][0]
+    assert review_span["source_span_id"]
+    assert review_span["variants"]
+    assert review_span["current_draft_decision"]["selected_base_variant_id"]
+    assert review_span["transcript_provenance_options"]
     assert payload["review_diffs"]
     review_diff = payload["review_diffs"][0]
     assert review_diff["diff_id"]
@@ -1672,10 +1678,9 @@ def test_review_job_json_exposes_candidates_and_review_diffs(
 
 
 @pytest.mark.unit
-def test_review_job_interactive_shows_one_diff_card_at_a_time(
+def test_review_job_interactive_launches_textual_app_when_tty_is_present(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
 ) -> None:
     monkeypatch.setenv("TA_DATA_DIR", str(tmp_path / "runtime"))
     monkeypatch.delenv("TA_STATE_DB_DSN", raising=False)
@@ -1688,102 +1693,30 @@ def test_review_job_interactive_shows_one_diff_card_at_a_time(
         )
     )
     payload = review_job(result.run_id)
-    review_diff = cast(dict[str, object], cast(list[object], payload["review_diffs"])[0])
-    payload["review_diffs"] = [
-        review_diff,
-        {
-            **review_diff,
-            "diff_id": "synthetic-diff-2",
-            "source_span_id": "span:999:1999",
-            "time_range": "00:00.999-00:01.999",
-        },
-    ]
+    captured: dict[str, object] = {}
+
+    class FakeReviewApp:
+        def __init__(self, **kwargs: object) -> None:
+            captured["kwargs"] = kwargs
+
+        def run(self) -> None:
+            captured["ran"] = True
+
     monkeypatch.setattr("translation_agent.cli.review_job", lambda run_id, settings=None: payload)
-    commands = iter(["q"])
-    monkeypatch.setattr("builtins.input", lambda _: next(commands))
+    monkeypatch.setattr("translation_agent.cli.ReviewTerminalApp", FakeReviewApp)
+    monkeypatch.setattr("translation_agent.cli._has_tty", lambda: True)
 
     exit_code = main(["review-job", result.run_id])
 
-    output = capsys.readouterr().out
     assert exit_code == 0
-    assert "review_summary: contradictions=" in output
-    assert "candidate_scoreboard:" in output
-    assert "diff 1/2" in output
-    assert "diff 2/2" not in output
-    assert "source:" in output
-    assert "source_excerpt:" in output
-    assert "LEFT candidate" in output
-    assert "RIGHT candidate" in output
+    assert captured["ran"] is True
+    kwargs = cast(dict[str, object], captured["kwargs"])
+    assert kwargs["run_id"] == result.run_id
+    assert kwargs["payload"] == payload
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize(
-    ("command", "side_key"),
-    [("a l", "left_candidate"), ("a r", "right_candidate")],
-)
-def test_review_job_interactive_approves_diff_side(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-    command: str,
-    side_key: str,
-) -> None:
-    monkeypatch.setenv("TA_DATA_DIR", str(tmp_path / "runtime"))
-    monkeypatch.delenv("TA_STATE_DB_DSN", raising=False)
-
-    result = run_job(
-        RunJobRequest(
-            source="input.mp4",
-            job_id=f"job-review-interactive-{side_key}",
-            metadata={"scenario": "translation_conflict_timeout"},
-        )
-    )
-    payload = review_job(result.run_id)
-    review_diff = cast(dict[str, object], cast(list[object], payload["review_diffs"])[0])
-    expected_candidate_id = cast(
-        str,
-        cast(dict[str, object], review_diff[side_key])["candidate_id"],
-    )
-    captured: dict[str, str | None] = {}
-
-    def _approve_review(
-        run_id: str,
-        *,
-        candidate_id: str,
-        approved_by: str | None,
-        note: str | None,
-        settings,
-    ) -> dict[str, object]:
-        captured["run_id"] = run_id
-        captured["candidate_id"] = candidate_id
-        captured["approved_by"] = approved_by
-        captured["note"] = note
-        return {
-            "status": "completed_after_human_review",
-            "approval_ref": "approvals/translation.json",
-            "default_output_path": "/tmp/output.srt",
-        }
-
-    monkeypatch.setattr("translation_agent.cli.review_job", lambda run_id, settings=None: payload)
-    monkeypatch.setattr("translation_agent.cli.approve_review", _approve_review)
-    commands = iter([command, "y", "", ""])
-    monkeypatch.setattr("builtins.input", lambda _: next(commands))
-
-    exit_code = main(["review-job", result.run_id])
-
-    output = capsys.readouterr().out
-    assert exit_code == 0
-    assert captured["run_id"] == result.run_id
-    assert captured["candidate_id"] == expected_candidate_id
-    assert captured["approved_by"] is None
-    assert captured["note"] is None
-    assert "final approval selects this candidate for the whole review" in output
-    assert "completed_after_human_review" in output
-    assert "approval_ref: approvals/translation.json" in output
-
-
-@pytest.mark.unit
-def test_review_job_interactive_cancelled_approval_returns_to_review(
+def test_review_job_interactive_requires_real_tty(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -1794,38 +1727,17 @@ def test_review_job_interactive_cancelled_approval_returns_to_review(
     result = run_job(
         RunJobRequest(
             source="input.mp4",
-            job_id="job-review-interactive-cancel",
+            job_id="job-review-no-tty",
             metadata={"scenario": "translation_conflict_timeout"},
         )
     )
-    payload = review_job(result.run_id)
-    approve_calls = 0
-
-    def _approve_review(
-        run_id: str,
-        *,
-        candidate_id: str,
-        approved_by: str | None,
-        note: str | None,
-        settings,
-    ) -> dict[str, object]:
-        nonlocal approve_calls
-        approve_calls += 1
-        return {}
-
-    monkeypatch.setattr("translation_agent.cli.review_job", lambda run_id, settings=None: payload)
-    monkeypatch.setattr("translation_agent.cli.approve_review", _approve_review)
-    commands = iter(["f l", "n", "n", "q"])
-    monkeypatch.setattr("builtins.input", lambda _: next(commands))
+    monkeypatch.setattr("translation_agent.cli._has_tty", lambda: False)
 
     exit_code = main(["review-job", result.run_id])
 
     output = capsys.readouterr().out
-    assert exit_code == 0
-    assert approve_calls == 0
-    assert "approval cancelled" in output
-    assert "diff 1/" in output
-    assert "diff 2/" in output
+    assert exit_code == 2
+    assert "interactive review requires a real TTY" in output
 
 
 @pytest.mark.unit
@@ -2051,10 +1963,18 @@ def test_approve_review_json_republishes_outputs_and_updates_provider_stats(
     approved_transcript = TranscriptCandidate.model_validate_json(
         blob_store.read_bytes(str(transcript_path))
     )
-    assert approved_translation.source_transcript_candidate_id == approved_transcript.candidate_id
+    assert approved_translation.candidate_id.startswith("human-reviewed-")
+    assert approved_translation.metadata["review_mode"] == "human_review_synthesis"
+    assert approved_translation.metadata["provenance_summary"]["translation_candidate_ids"] == [
+        cast(str, first_candidate["candidate_id"])
+    ]
+    assert approved_translation.final_transcript_ref is not None or (
+        approved_translation.source_transcript_candidate_id == approved_transcript.candidate_id
+    )
 
     with SQLiteOperationalStore(tmp_path / "runtime" / "state.sqlite3") as store:
         first_record = store.get_run(first.run_id)
+        resolution_record = store.get_human_review_resolution(first.run_id)
         stats = store.get_transcript_provider_quality_stats(
             provider_id=cast(
                 str,
@@ -2068,6 +1988,13 @@ def test_approve_review_json_republishes_outputs_and_updates_provider_stats(
     assert first_record.status == "completed_after_human_review"
     assert first_record.output_data["approval_ref"] == str(approval_path)
     assert first_record.output_data["resolution_kind"] == "approved_good"
+    assert (
+        first_record.output_data["final_translation_candidate_id"]
+        == approved_translation.candidate_id
+    )
+    assert resolution_record is not None
+    assert resolution_record.final_translation_candidate_id == approved_translation.candidate_id
+    assert resolution_record.reviewed_span_count >= 1
     assert stats is not None
     assert stats.total_approved_outcomes == 2
     assert stats.total_review_escalations == 2
@@ -2095,10 +2022,10 @@ def test_resolve_review_validation_enforces_candidate_and_failure_tag_rules(
         cast(list[dict[str, object]], payload["candidates"])[0]["candidate_id"],
     )
 
-    with pytest.raises(ValueError, match="candidate_id is required"):
+    with pytest.raises(ValueError, match="candidate_id or reviewed_span_decisions is required"):
         resolve_review(result.run_id, resolution="approved_best_available")
 
-    with pytest.raises(ValueError, match="candidate_id is forbidden"):
+    with pytest.raises(ValueError, match="forbidden for rejected_all"):
         resolve_review(
             result.run_id,
             resolution="rejected_all",
@@ -2108,6 +2035,94 @@ def test_resolve_review_validation_enforces_candidate_and_failure_tag_rules(
 
     with pytest.raises(ValueError, match="at least one failure_tag"):
         resolve_review(result.run_id, resolution="rejected_all")
+
+
+@pytest.mark.unit
+def test_resolve_review_with_structured_span_decisions_builds_synthetic_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("TA_DATA_DIR", str(tmp_path / "runtime"))
+    monkeypatch.delenv("TA_STATE_DB_DSN", raising=False)
+
+    result = run_job(
+        RunJobRequest(
+            source="input.mp4",
+            job_id="job-review-structured-resolution",
+            metadata={"scenario": "translation_conflict_timeout"},
+        )
+    )
+    review_payload = review_job(result.run_id)
+    review_spans = cast(list[dict[str, object]], review_payload["review_spans"])
+
+    decisions: list[dict[str, object]] = []
+    selected_candidate_ids: set[str] = set()
+    selected_transcript_ids: set[str] = set()
+    for index, span in enumerate(review_spans):
+        variants = cast(list[dict[str, object]], span["variants"])
+        selected_variant = variants[index % len(variants)]
+        selected_candidate_ids.add(cast(str, selected_variant["candidate_id"]))
+        transcript_candidate_id = cast(
+            str | None, selected_variant["source_transcript_candidate_id"]
+        )
+        if transcript_candidate_id is not None:
+            selected_transcript_ids.add(transcript_candidate_id)
+        decisions.append(
+            {
+                "source_span_id": span["source_span_id"],
+                "start_ms": span["start_ms"],
+                "end_ms": span["end_ms"],
+                "selected_candidate_id": selected_variant["candidate_id"],
+                "selected_source_transcript_candidate_id": selected_variant[
+                    "source_transcript_candidate_id"
+                ],
+                "selected_transcript_provider_id": selected_variant["transcript_provider_id"],
+                "base_target_text": selected_variant["target_excerpt"],
+                "final_target_text": selected_variant["target_excerpt"],
+                "edited": False,
+                "reviewer_note": "",
+            }
+        )
+
+    payload = resolve_review(
+        result.run_id,
+        resolution="approved_good",
+        reviewed_span_decisions=tuple(decisions),
+        approved_by="tester",
+        note="structured review",
+    )
+
+    assert payload["status"] == "completed_after_human_review"
+    assert cast(str, payload["final_translation_candidate_id"]).startswith("human-reviewed-")
+
+    blob_store = LocalBlobStore(tmp_path / "runtime" / "blobs")
+    translation_path = Path(
+        job_path(
+            _job_context("job-review-structured-resolution"),
+            "published",
+            "translation.json",
+        )
+    )
+    approved_translation = TranslationCandidate.model_validate_json(
+        blob_store.read_bytes(str(translation_path))
+    )
+    assert approved_translation.candidate_id == payload["final_translation_candidate_id"]
+    assert (
+        set(approved_translation.metadata["provenance_summary"]["translation_candidate_ids"])
+        == selected_candidate_ids
+    )
+    assert (
+        set(approved_translation.metadata["provenance_summary"]["source_transcript_candidate_ids"])
+        == selected_transcript_ids
+    )
+
+    with SQLiteOperationalStore(tmp_path / "runtime" / "state.sqlite3") as store:
+        record = store.get_human_review_resolution(result.run_id)
+
+    assert record is not None
+    assert record.final_translation_candidate_id == approved_translation.candidate_id
+    assert set(record.contributing_translation_candidate_ids) == selected_candidate_ids
+    assert set(record.contributing_source_transcript_candidate_ids) == selected_transcript_ids
 
 
 @pytest.mark.unit
@@ -2140,6 +2155,7 @@ def test_resolve_review_approved_best_available_persists_soft_feedback(
     assert payload["resolution_kind"] == "approved_best_available"
     assert payload["approval_ref"] is not None
     assert payload["approved_candidate_id"] == selected["candidate_id"]
+    assert cast(str, payload["final_translation_candidate_id"]).startswith("human-reviewed-")
 
     refreshed_review = review_job(result.run_id)
     assert refreshed_review["resolution_kind"] == "approved_best_available"
@@ -2215,6 +2231,7 @@ def test_resolve_review_rejected_all_persists_negative_feedback(
 
     assert record is not None
     assert record.resolution_kind == "rejected_all"
+    assert record.reviewed_span_count == 0
     assert combo_stats is not None
     assert combo_stats.rejected_all_count == 1
     assert combo_stats.failure_tag_counts["subtitle_gibberish"] == 1

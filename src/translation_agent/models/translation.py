@@ -33,6 +33,8 @@ class TranslationCandidate(ContractModel):
     def validate_source_reference(self) -> TranslationCandidate:
         if self.source_transcript_candidate_id or self.final_transcript_ref:
             return self
+        if self.metadata.get("review_mode") == "human_review_synthesis":
+            return self
         raise ValueError(
             "translation candidates require source_transcript_candidate_id or final_transcript_ref"
         )

@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import shutil
 import sys
-import textwrap
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -21,13 +19,11 @@ from translation_agent.api import (
     resume_translation,
     review_job,
     run_job,
+    save_review_draft,
 )
 from translation_agent.config import load_settings, sanitize_db_target, validate_environment
 from translation_agent.storage.migrations import upgrade_database
-
-_NO_OVERLAPPING_EXCERPT = "[no overlapping excerpt]"
-_REVIEW_DIFF_SEPARATOR = " | "
-_MIN_REVIEW_PANE_WIDTH = 40
+from translation_agent.tui import ReviewTerminalApp
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -135,6 +131,10 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         dest="failure_tags",
         default=[],
+    )
+    resolve_parser.add_argument(
+        "--reviewed-span-decisions-path",
+        help="Path to a JSON array of ReviewedSpanDecision payloads",
     )
     resolve_parser.add_argument("--approved-by")
     resolve_parser.add_argument("--note")
@@ -361,10 +361,20 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "resolve-review":
         settings = load_settings()
+        reviewed_span_decisions = ()
+        if args.reviewed_span_decisions_path:
+            reviewed_span_decisions = tuple(
+                item
+                for item in json.loads(
+                    Path(args.reviewed_span_decisions_path).read_text(encoding="utf-8")
+                )
+                if isinstance(item, dict)
+            )
         payload = resolve_review(
             args.run_id,
             resolution=args.resolution,
             candidate_id=args.candidate_id,
+            reviewed_span_decisions=reviewed_span_decisions,
             failure_tags=tuple(args.failure_tags),
             approved_by=args.approved_by,
             note=args.note,
@@ -399,268 +409,19 @@ def _interactive_review_flow(
     settings,
     initial_payload: dict[str, Any] | None = None,
 ) -> int:
+    if not _has_tty():
+        print("interactive review requires a real TTY")
+        return 2
     payload = initial_payload or review_job(run_id, settings=settings)
-    candidates = payload.get("candidates", [])
-    if not isinstance(candidates, list) or not candidates:
-        if payload.get("review_available") is False:
-            print("no pending translation review")
-        return 0
-    review_diffs = payload.get("review_diffs", [])
-    if not isinstance(review_diffs, list):
-        review_diffs = []
-    if not review_diffs:
-        _print_review_header(payload)
-        _print_candidate_list(candidates, review_diffs)
-        print("no review diffs available")
-        return 0
-
-    diff_index = 0
-    while True:
-        diff = review_diffs[diff_index]
-        if not isinstance(diff, dict):
-            print("review diff payload is invalid")
-            return 1
-        _print_review_header(payload)
-        _print_candidate_list(candidates, review_diffs)
-        _print_review_diff(diff, diff_index=diff_index, diff_count=len(review_diffs))
-        raw_command = input(
-            "review command (n=next, p=previous, l=scoreboard, f l=finalize with left, "
-            "f r=finalize with right, q=quit): "
-        )
-        raw_command = raw_command.strip()
-        if raw_command.lower() in {"q", "quit", "exit"}:
-            return 0
-        if raw_command.lower() == "n":
-            if diff_index >= len(review_diffs) - 1:
-                print("already at last diff")
-                continue
-            diff_index += 1
-            continue
-        if raw_command.lower() == "p":
-            if diff_index <= 0:
-                print("already at first diff")
-                continue
-            diff_index -= 1
-            continue
-        if raw_command.lower() == "l":
-            _print_candidate_list(candidates, review_diffs)
-            continue
-        normalized_command = raw_command.lower()
-        if normalized_command in {"f l", "f r", "a l", "a r"}:
-            side_key = "left_candidate" if normalized_command.endswith("l") else "right_candidate"
-            side = diff.get(side_key)
-            if not isinstance(side, dict) or not side.get("candidate_id"):
-                print("approval target is unavailable for this diff")
-                continue
-            print(
-                "final approval selects this candidate for the whole review; "
-                "it does not advance to the next diff"
-            )
-            confirm = input("finalize review with this candidate? [y/N]: ").strip().lower()
-            if confirm not in {"y", "yes"}:
-                print("approval cancelled")
-                continue
-            approved_by = input("approved_by (blank uses current user): ").strip() or None
-            note = input("note (optional): ").strip() or None
-            approved = approve_review(
-                run_id,
-                candidate_id=str(side["candidate_id"]),
-                approved_by=approved_by,
-                note=note,
-                settings=settings,
-            )
-            print(approved["status"])
-            print(f"approval_ref: {approved['approval_ref']}")
-            print(f"default_output_path: {approved['default_output_path']}")
-            return 0
-        print("unknown command")
-
-
-def _print_review_header(payload: dict[str, Any]) -> None:
-    print(payload["run_id"])
-    print(payload["status"])
-    if payload.get("summary"):
-        print(payload["summary"])
-    _print_human_review_summary(payload)
-
-
-def _print_candidate_list(
-    candidates: list[dict[str, Any]],
-    review_diffs: list[dict[str, Any]],
-) -> None:
-    diff_counts = _candidate_diff_counts(review_diffs)
-    print("candidate_scoreboard:")
-    for candidate in candidates:
-        source = candidate.get("source_transcript", {})
-        provider = source.get("provider_id") if isinstance(source, dict) else None
-        contradiction_count = candidate.get("contradiction_count", 0)
-        blocking_count = candidate.get("blocking_hard_contradiction_count", 0)
-        diff_count = diff_counts.get(str(candidate["candidate_id"]), 0)
-        print(
-            f"{candidate['rank']}. {candidate['candidate_id']} "
-            f"prompt={candidate['prompt_variant_id']} "
-            f"provider={provider or 'unknown'} "
-            f"transcript={candidate['source_transcript_candidate_id']} "
-            f"contradictions={contradiction_count} "
-            f"blocking={blocking_count} "
-            f"diffs={diff_count}"
-        )
-
-
-def _candidate_diff_counts(review_diffs: list[dict[str, Any]]) -> dict[str, int]:
-    counts: dict[str, int] = {}
-    for diff in review_diffs:
-        if not isinstance(diff, dict):
-            continue
-        for side_key in ("left_candidate", "right_candidate"):
-            side = diff.get(side_key)
-            if not isinstance(side, dict):
-                continue
-            candidate_id = side.get("candidate_id")
-            if not isinstance(candidate_id, str):
-                continue
-            counts[candidate_id] = counts.get(candidate_id, 0) + 1
-    return counts
-
-
-def _print_review_diff(
-    diff: dict[str, Any],
-    *,
-    diff_index: int,
-    diff_count: int,
-) -> None:
-    print(f"diff {diff_index + 1}/{diff_count}")
-    print(
-        f"source: {diff.get('time_range') or diff.get('source_span_id') or 'unknown'} "
-        f"| dimension={diff.get('dimension')} "
-        f"| severity={diff.get('severity')} "
-        f"| blocking_hard={diff.get('blocking_hard_contradiction')}"
+    app = ReviewTerminalApp(
+        run_id=run_id,
+        payload=payload,
+        settings=settings,
+        save_review_draft=save_review_draft,
+        resolve_review=resolve_review,
     )
-    reviewer_roles = diff.get("reviewer_roles")
-    if isinstance(reviewer_roles, list) and reviewer_roles:
-        print(f"reviewers: {', '.join(str(role) for role in reviewer_roles)}")
-    if diff.get("normalized_value"):
-        print(f"normalized_value: {diff['normalized_value']}")
-    print(f"evidence: {diff.get('evidence_text')}")
-    print(f"source_excerpt: {diff.get('source_excerpt') or _NO_OVERLAPPING_EXCERPT}")
-    left_candidate = diff.get("left_candidate", {})
-    right_candidate = diff.get("right_candidate", {})
-    if not isinstance(left_candidate, dict) or not isinstance(right_candidate, dict):
-        return
-    _print_candidate_panes(left_candidate, right_candidate)
-    print("commands: n=next p=previous l=scoreboard f l=finalize left f r=finalize right q=quit")
-
-
-def _print_candidate_panes(
-    left_candidate: dict[str, Any],
-    right_candidate: dict[str, Any],
-) -> None:
-    terminal_width = shutil.get_terminal_size(fallback=(120, 24)).columns
-    pane_width = (terminal_width - len(_REVIEW_DIFF_SEPARATOR)) // 2
-    if pane_width < _MIN_REVIEW_PANE_WIDTH:
-        _print_candidate_panes_stacked(left_candidate, right_candidate)
-        return
-
-    left_lines = _pane_lines("- ", "LEFT", left_candidate, pane_width)
-    right_lines = _pane_lines("+ ", "RIGHT", right_candidate, pane_width)
-    row_count = max(len(left_lines), len(right_lines))
-    for index in range(row_count):
-        left = left_lines[index] if index < len(left_lines) else ""
-        right = right_lines[index] if index < len(right_lines) else ""
-        print(f"{left.ljust(pane_width)}{_REVIEW_DIFF_SEPARATOR}{right.ljust(pane_width)}".rstrip())
-
-
-def _print_candidate_panes_stacked(
-    left_candidate: dict[str, Any],
-    right_candidate: dict[str, Any],
-) -> None:
-    for line in _pane_lines("", "LEFT", left_candidate, 120):
-        print(line)
-    for line in _pane_lines("", "RIGHT", right_candidate, 120):
-        print(line)
-
-
-def _pane_lines(
-    prefix: str,
-    title: str,
-    side: dict[str, Any],
-    width: int,
-) -> list[str]:
-    lines: list[str] = []
-    lines.extend(_wrap_prefixed(f"{prefix}{title} candidate", width))
-    lines.extend(_wrap_prefixed(f"{prefix}candidate_id: {side.get('candidate_id')}", width))
-    lines.extend(_wrap_prefixed(f"{prefix}rank: {side.get('rank')}", width))
-    lines.extend(
-        _wrap_prefixed(f"{prefix}prompt_variant_id: {side.get('prompt_variant_id')}", width)
-    )
-    lines.extend(_wrap_prefixed(f"{prefix}model_id: {side.get('model_id')}", width))
-    lines.extend(
-        _wrap_prefixed(
-            f"{prefix}source_transcript_candidate_id: {side.get('source_transcript_candidate_id')}",
-            width,
-        )
-    )
-    lines.extend(
-        _wrap_prefixed(
-            f"{prefix}target_excerpt: {side.get('target_excerpt') or _NO_OVERLAPPING_EXCERPT}",
-            width,
-        )
-    )
-    return lines
-
-
-def _wrap_prefixed(text: str, width: int) -> list[str]:
-    wrapped = textwrap.wrap(
-        text,
-        width=max(width, 20),
-        break_long_words=False,
-        break_on_hyphens=False,
-    )
-    return wrapped or [text]
-
-
-def _print_human_review_summary(payload: dict[str, Any]) -> None:
-    summary = payload.get("human_review_summary", {})
-    if not isinstance(summary, dict):
-        return
-    contradiction_count = summary.get("contradiction_count")
-    blocking_count = summary.get("blocking_hard_contradiction_count")
-    if contradiction_count is not None or blocking_count is not None:
-        print(
-            "review_summary: "
-            f"contradictions={contradiction_count or 0} "
-            f"blocking_hard={blocking_count or 0}"
-        )
-    preferences = summary.get("reviewer_preferences")
-    if not isinstance(preferences, list) or not preferences:
-        return
-    print("reviewer_preferences:")
-    for preference in preferences:
-        if not isinstance(preference, dict):
-            continue
-        preferred_candidate_id = preference.get("preferred_candidate_id") or "none"
-        print(
-            f"- {preference.get('reviewer_role')}: "
-            f"preferred={preferred_candidate_id} "
-            f"confidence={preference.get('confidence')}"
-        )
-
-
-def _print_reviewer_preferences(candidate: dict[str, Any]) -> None:
-    preferences = candidate.get("reviewer_preferences", [])
-    if not isinstance(preferences, list) or not preferences:
-        return
-    print("candidate_reviewer_preferences:")
-    for preference in preferences:
-        if not isinstance(preference, dict):
-            continue
-        rationale = preference.get("rationale")
-        rationale_suffix = f" rationale={rationale}" if rationale else ""
-        print(
-            f"- {preference.get('reviewer_role')}: "
-            f"rank={preference.get('rank')} "
-            f"confidence={preference.get('confidence')}{rationale_suffix}"
-        )
+    app.run()
+    return 0
 
 
 def _should_enter_interactive_review(*, mode: str) -> bool:

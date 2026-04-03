@@ -1,4 +1,4 @@
-"""Human review-resolution, approval, and feedback aggregation models."""
+"""Human review-resolution, approval, draft, and feedback aggregation models."""
 
 from __future__ import annotations
 
@@ -40,6 +40,45 @@ class HumanReviewedCandidateContext(ContractModel):
     selected_proposal_id: str | None = None
 
 
+class ReviewedSpanDecision(ContractModel):
+    """Final operator decision for one aligned source span."""
+
+    source_span_id: NonEmptyStr
+    start_ms: int = Field(ge=0)
+    end_ms: int = Field(ge=0)
+    selected_candidate_id: NonEmptyStr
+    selected_source_transcript_candidate_id: str | None = None
+    selected_transcript_provider_id: str | None = None
+    base_target_text: str = ""
+    final_target_text: str = ""
+    edited: bool = False
+    reviewer_note: str = ""
+
+
+class ReviewDraftSpanDecision(ContractModel):
+    """In-progress operator decision state for one span."""
+
+    source_span_id: NonEmptyStr
+    selected_base_variant_id: str | None = None
+    edited_text: str | None = None
+    resolution_status: Literal["unresolved", "resolved"] = "unresolved"
+    dirty: bool = False
+    reviewer_note: str = ""
+
+
+class ReviewDraftResolution(ContractModel):
+    """Persisted in-progress draft for resumable span-level review."""
+
+    run_id: NonEmptyStr
+    job_id: NonEmptyStr
+    resolution_kind: HumanSupervisionKind = "approved_good"
+    failure_tags: tuple[FailureTag, ...] = ()
+    note: str = ""
+    approved_by: str | None = None
+    span_decisions: tuple[ReviewDraftSpanDecision, ...] = ()
+    updated_at: datetime
+
+
 class HumanReviewResolutionRecord(ContractModel):
     """Canonical human review resolution, regardless of approval outcome."""
 
@@ -48,6 +87,13 @@ class HumanReviewResolutionRecord(ContractModel):
     stage: ApprovalStage = "translation"
     resolution_kind: HumanSupervisionKind
     candidate_id: str | None = None
+    final_translation_candidate_id: str | None = None
+    final_translation_ref: str | None = None
+    reviewed_span_count: int = Field(default=0, ge=0)
+    reviewed_span_decisions: tuple[ReviewedSpanDecision, ...] = ()
+    contributing_translation_candidate_ids: tuple[str, ...] = ()
+    contributing_source_transcript_candidate_ids: tuple[str, ...] = ()
+    contributing_transcript_provider_ids: tuple[str, ...] = ()
     approved_by: NonEmptyStr
     note: str = ""
     failure_tags: tuple[FailureTag, ...] = ()
@@ -85,8 +131,9 @@ class HumanApprovalRecord(ContractModel):
     run_id: NonEmptyStr
     job_id: NonEmptyStr
     stage: ApprovalStage = "translation"
-    approved_candidate_id: NonEmptyStr
-    approved_source_transcript_candidate_id: NonEmptyStr
+    approved_candidate_id: str | None = None
+    final_translation_candidate_id: str | None = None
+    approved_source_transcript_candidate_id: str | None = None
     approved_by: NonEmptyStr
     note: str = ""
     approved_at: datetime

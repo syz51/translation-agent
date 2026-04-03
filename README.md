@@ -200,11 +200,16 @@ uv run translation-agent approve-review <run-id> --candidate-id <candidate-id> -
 
 `review-job` now has two operator surfaces:
 
-- `--json` returns the existing candidate payload plus additive `review_diffs` cards for pairwise review
-- interactive mode opens a one-diff-at-a-time terminal viewer with left/right finalization shortcuts
+- `--json` returns ranked translation candidates, span-level `review_spans`, an optional
+  resumable `draft_resolution`, and legacy `review_diffs` for backward compatibility
+- interactive mode launches a Textual 8 TUI with a themed, tabbed review surface, toast
+  notifications, and the built-in command palette on `Ctrl+P`; operators still review one aligned
+  span at a time, pick a base variant with number keys, lightly edit the chosen text, save a
+  resumable draft, and finalize a synthetic human-reviewed translation candidate
 
-In interactive mode, choosing left or right finalizes the whole review with that candidate. It does
-not mark only the current diff as accepted and continue to the next conflict.
+Interactive review is now span-centric. `approve-review` remains available as a legacy convenience
+path that auto-resolves every span to one base candidate and still publishes a synthetic reviewed
+translation artifact instead of promoting the selected machine candidate wholesale.
 
 The public result payload contains:
 
