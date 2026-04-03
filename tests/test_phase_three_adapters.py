@@ -1172,7 +1172,7 @@ def test_openai_translation_adapter_tracks_prompt_metadata_for_variants(
         api_key="test-key",
         blob_store=blob_store,
         provider_id="gemini",
-        model_id="gemini-3-flash",
+        model_id="gemini-2.5-flash",
         prompt_version="phase-3-v1",
         transport=transport,
         retry_policy=_retry_policy(),

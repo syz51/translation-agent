@@ -30,7 +30,7 @@ def test_phase_three_runtime_uses_translation_timeout_and_chunk_settings(
 
     class StubTranslationAdapter:
         provider_id = "gemini"
-        model_id = "gemini-3-flash"
+        model_id = "gemini-2.5-flash"
 
         def __init__(self, **kwargs: Any) -> None:
             captured_kwargs.update(kwargs)

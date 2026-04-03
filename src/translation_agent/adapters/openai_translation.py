@@ -30,6 +30,8 @@ from translation_agent.storage import BlobStore, job_path, job_scope_token
 
 DEFAULT_GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1/"
+RESPONSES_API_VARIANT = "responses"
+CHAT_COMPLETIONS_API_VARIANT = "chat_completions"
 DEFAULT_MAX_CHUNK_CHARACTERS = 5_000
 DEFAULT_MAX_CHUNK_SEGMENTS = 100
 DEFAULT_CONTEXT_SEGMENT_WINDOW = 2
@@ -71,11 +73,11 @@ class _ChunkExecutionResult:
     response_ids: tuple[str, ...]
 
 
-class _ResponsesClient(Protocol):
+class _InferenceClient(Protocol):
     def create(self, **kwargs: Any) -> object: ...
 
 
-class _TransportBackedResponsesClient:
+class _TransportBackedInferenceClient:
     """Small OpenAI-compatible shim used by deterministic adapter tests."""
 
     def __init__(
@@ -89,7 +91,8 @@ class _TransportBackedResponsesClient:
     ) -> None:
         self._provider_id = provider_id
         self._api_key = api_key
-        self._endpoint = _responses_endpoint(provider_id, base_url)
+        self._api_variant = _api_variant(provider_id)
+        self._endpoint = _api_endpoint(provider_id, base_url)
         self._timeout_seconds = timeout_seconds
         self._transport = transport
 
@@ -135,7 +138,7 @@ class ChatCompletionTranslationAdapter:
         provider_id: str = "openai",
         api_key: str,
         blob_store: BlobStore,
-        model_id: str = "gemini-3-flash",
+        model_id: str = "gemini-2.5-flash",
         prompt_version: str = "phase-3-v1",
         base_url: str | None = None,
         timeout_seconds: float = 60.0,
@@ -160,24 +163,32 @@ class ChatCompletionTranslationAdapter:
         self._max_chunk_characters = max(1, max_chunk_characters)
         self._max_chunk_segments = max(1, max_chunk_segments)
         self._context_segment_window = max(0, context_segment_window)
-        self._responses_client = self._build_responses_client(
+        self._api_variant = _api_variant(provider_id)
+        self._inference_client = self._build_inference_client(
             api_key=api_key,
             client=client,
             transport=transport,
         )
 
-    def _build_responses_client(
+    def _build_inference_client(
         self,
         *,
         api_key: str,
         client: object | None,
         transport: HttpTransport | None,
-    ) -> _ResponsesClient:
+    ) -> _InferenceClient:
         if client is not None:
-            responses = getattr(client, "responses", client)
-            return cast("_ResponsesClient", responses)
+            if self._api_variant == CHAT_COMPLETIONS_API_VARIANT:
+                chat = getattr(client, "chat", None)
+                completions = getattr(chat, "completions", None)
+                if completions is not None:
+                    return cast("_InferenceClient", completions)
+            responses = getattr(client, "responses", None)
+            if responses is not None:
+                return cast("_InferenceClient", responses)
+            return cast("_InferenceClient", client)
         if transport is not None:
-            return _TransportBackedResponsesClient(
+            return _TransportBackedInferenceClient(
                 provider_id=self.provider_id,
                 api_key=api_key,
                 base_url=self._base_url,
@@ -185,22 +196,28 @@ class ChatCompletionTranslationAdapter:
                 transport=transport,
             )
         if self._base_url is None:
-            return cast(
-                "_ResponsesClient",
-                OpenAI(
-                    api_key=api_key,
-                    timeout=self._timeout_seconds,
-                    max_retries=0,
-                ).responses,
-            )
-        return cast(
-            "_ResponsesClient",
-            OpenAI(
+            client = OpenAI(
                 api_key=api_key,
-                base_url=self._base_url,
                 timeout=self._timeout_seconds,
                 max_retries=0,
-            ).responses,
+            )
+            if self._api_variant == CHAT_COMPLETIONS_API_VARIANT:
+                return cast("_InferenceClient", client.chat.completions)
+            return cast(
+                "_InferenceClient",
+                client.responses,
+            )
+        client = OpenAI(
+            api_key=api_key,
+            base_url=self._base_url,
+            timeout=self._timeout_seconds,
+            max_retries=0,
+        )
+        if self._api_variant == CHAT_COMPLETIONS_API_VARIANT:
+            return cast("_InferenceClient", client.chat.completions)
+        return cast(
+            "_InferenceClient",
+            client.responses,
         )
 
     def generate_translation(
@@ -313,48 +330,16 @@ class ChatCompletionTranslationAdapter:
         prompt_variant_id: str,
         request_context: RequestContext,
     ) -> dict[str, Any]:
-        body = {
-            "model": self.model_id,
-            "input": [
-                {
-                    "role": "system",
-                    "content": [
-                        {
-                            "type": "input_text",
-                            "text": _system_prompt(
-                                source_language=request_context.job.source_language,
-                                target_language=request_context.job.target_language,
-                                prompt_variant_id=prompt_variant_id,
-                                resolved_prompt=request_context.metadata.get(
-                                    "resolved_translation_prompt"
-                                ),
-                                historical_instructions=_historical_instructions(request_context),
-                            ),
-                        }
-                    ],
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "input_text",
-                            "text": _user_prompt(chunk),
-                        }
-                    ],
-                },
-            ],
-            "text": {
-                "format": {
-                    "type": "json_schema",
-                    "name": "translation_chunk",
-                    "strict": True,
-                    "schema": _translation_schema(),
-                }
-            },
-            "timeout": self._timeout_seconds,
-        }
+        body = _request_body(
+            provider_id=self.provider_id,
+            model_id=self.model_id,
+            chunk=chunk,
+            prompt_variant_id=prompt_variant_id,
+            request_context=request_context,
+            timeout_seconds=self._timeout_seconds,
+        )
         try:
-            response = self._responses_client.create(**body)
+            response = self._inference_client.create(**body)
         except AdapterError:
             raise
         except APIStatusError as exc:
@@ -472,16 +457,85 @@ def _normalized_api_base_url(base_url: str | None) -> str | None:
     if not normalized:
         return None
     normalized = normalized.rstrip("/")
-    if normalized.endswith("/responses"):
-        normalized = normalized[: -len("/responses")]
+    for suffix in ("/responses", "/chat/completions"):
+        if normalized.endswith(suffix):
+            normalized = normalized[: -len(suffix)]
     return normalized.rstrip("/") + "/"
 
 
-def _responses_endpoint(provider_id: str, base_url: str | None) -> str:
+def _api_variant(provider_id: str) -> str:
+    return CHAT_COMPLETIONS_API_VARIANT if provider_id == "gemini" else RESPONSES_API_VARIANT
+
+
+def _api_endpoint(provider_id: str, base_url: str | None) -> str:
     normalized = _normalized_api_base_url(base_url)
     if normalized is None:
         normalized = DEFAULT_GEMINI_BASE_URL if provider_id == "gemini" else DEFAULT_OPENAI_BASE_URL
-    return urllib.parse.urljoin(normalized, "responses")
+    endpoint_path = (
+        "chat/completions"
+        if _api_variant(provider_id) == CHAT_COMPLETIONS_API_VARIANT
+        else "responses"
+    )
+    return urllib.parse.urljoin(normalized, endpoint_path)
+
+
+def _request_body(
+    *,
+    provider_id: str,
+    model_id: str,
+    chunk: _TranslationChunk,
+    prompt_variant_id: str,
+    request_context: RequestContext,
+    timeout_seconds: float,
+) -> dict[str, Any]:
+    system_prompt = _system_prompt(
+        source_language=request_context.job.source_language,
+        target_language=request_context.job.target_language,
+        prompt_variant_id=prompt_variant_id,
+        resolved_prompt=request_context.metadata.get("resolved_translation_prompt"),
+        historical_instructions=_historical_instructions(request_context),
+    )
+    user_prompt = _user_prompt(chunk)
+    schema = _translation_schema()
+    if _api_variant(provider_id) == CHAT_COMPLETIONS_API_VARIANT:
+        return {
+            "model": model_id,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "translation_chunk",
+                    "strict": True,
+                    "schema": schema,
+                },
+            },
+            "timeout": timeout_seconds,
+        }
+    return {
+        "model": model_id,
+        "input": [
+            {
+                "role": "system",
+                "content": [{"type": "input_text", "text": system_prompt}],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": user_prompt}],
+            },
+        ],
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "translation_chunk",
+                "strict": True,
+                "schema": schema,
+            }
+        },
+        "timeout": timeout_seconds,
+    }
 
 
 def _response_payload(response: object, *, provider_id: str) -> dict[str, Any]:
@@ -925,12 +979,49 @@ def _extract_translation_payload(
                 if isinstance(text, str) and text.strip():
                     return _parse_model_json(text, provider_id=provider_id)
 
+    choices = response_payload.get("choices")
+    if isinstance(choices, list):
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+            message = choice.get("message")
+            if not isinstance(message, dict):
+                continue
+            parsed = message.get("parsed")
+            if isinstance(parsed, dict):
+                return parsed
+            content = message.get("content")
+            content_text = _chat_message_content_text(content)
+            if content_text is not None:
+                return _parse_model_json(content_text, provider_id=provider_id)
+
     raise AdapterError(
         provider_id=provider_id,
         message="provider response did not contain output text",
         category="malformed_response",
         retryable=False,
     )
+
+
+def _chat_message_content_text(content: object) -> str | None:
+    if isinstance(content, str) and content.strip():
+        return content
+    if not isinstance(content, list):
+        return None
+    collected: list[str] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        text = block.get("text")
+        if isinstance(text, str) and text.strip():
+            collected.append(text)
+            continue
+        nested_text = block.get("content")
+        if isinstance(nested_text, str) and nested_text.strip():
+            collected.append(nested_text)
+    if not collected:
+        return None
+    return "\n".join(collected)
 
 
 def _parse_model_json(text: str, *, provider_id: str = "openai") -> dict[str, Any]:
