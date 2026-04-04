@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -30,6 +32,7 @@ from translation_agent.models import (
 )
 from translation_agent.nodes.memory_pipeline import drain_background_memory
 from translation_agent.observability import NoOpTraceSink
+from translation_agent.parallelism import GlobalConcurrencyLimiter, RuntimeParallelismPolicy
 from translation_agent.publish.outputs import publish_outputs
 from translation_agent.storage import (
     LocalBlobStore,
@@ -242,7 +245,7 @@ def test_phase_five_happy_path_publishes_audit_ready_outputs(tmp_path: Path) -> 
         format_="srt",
     )
     assert scorecard["translation_decision"]["disagreement_bucket"] == "low"
-    assert scorecard["translation_decision"]["adjudication_scorecard"]["candidate_count"] == 2
+    assert scorecard["translation_decision"]["adjudication_scorecard"]["candidate_count"] == 1
     assert scorecard["export_refs"] == [
         _artifact_path("exports", "translation.srt"),
         _artifact_path("exports", "translation.json"),
@@ -283,6 +286,170 @@ def test_phase_five_memory_drain_preserves_batch_order_in_routing_and_manifest(
     ]
 
 
+def test_memory_drain_stays_serial_when_backend_is_not_parallel_safe(tmp_path: Path) -> None:
+    run_store = InMemoryRunStore()
+    run_store.create_run(run_id="run-memory-unsafe", status="running")
+    blob_store = LocalBlobStore(tmp_path / "blobs")
+    source_ref = "jobs/run-memory-unsafe-request.json"
+    blob_store.put_bytes(source_ref, b"{}\n")
+    runtime = build_phase_two_runtime(
+        blob_store=blob_store,
+        run_store=run_store,
+        trace_sink=NoOpTraceSink(),
+        source_artifact_ref=source_ref,
+        scenario="happy",
+    )
+    runtime.parallelism = RuntimeParallelismPolicy(
+        global_max_parallel_tokens=4,
+        provider_io_token_cost=2,
+        local_compute_token_cost=1,
+        transcription_max_workers=None,
+        translation_candidate_max_workers=None,
+        translation_chunk_max_workers=None,
+        review_max_workers=None,
+        reference_evaluation_max_workers=None,
+        memory_drain_max_workers=4,
+    )
+    runtime.global_concurrency_limiter = GlobalConcurrencyLimiter(4)
+    job = _job_context(job_id="job-memory-unsafe")
+    storage_job_id = operational_job_key(job)
+
+    active = 0
+    max_active = 0
+    lock = threading.Lock()
+
+    class UnsafeBackend:
+        _store = object()
+
+        def consolidate_batch(self, batch: MemoryWriteBatch) -> MemoryConsolidation:
+            nonlocal active, max_active
+            with lock:
+                active += 1
+                max_active = max(max_active, active)
+            try:
+                time.sleep(0.05)
+                return MemoryConsolidation(
+                    consolidation_id=f"consolidation-{batch.batch_id}",
+                    batch_id=batch.batch_id,
+                    job_id=batch.job_id,
+                    source_stage=batch.source_stage,
+                )
+            finally:
+                with lock:
+                    active -= 1
+
+    class NoProposalBackend:
+        def propose_prompt_evolution(self, consolidation, **kwargs):  # noqa: ANN001
+            del consolidation, kwargs
+            return None
+
+    runtime.memory_consolidation_backend = UnsafeBackend()
+    runtime.prompt_evolution_backend = NoProposalBackend()
+
+    batches = (
+        MemoryWriteBatch(batch_id="batch-a", job_id=job.job_id, source_stage="translation"),
+        MemoryWriteBatch(batch_id="batch-b", job_id=job.job_id, source_stage="translation"),
+    )
+    for batch in batches:
+        runtime.memory_batch_store.save_batch(batch, storage_job_id=storage_job_id)
+
+    drain_background_memory(
+        GraphState(
+            run_id="run-memory-unsafe",
+            job=job,
+            current_stage="background_memory_pipeline",
+            source_video_ref="input.mp4",
+            source_artifact_ref=source_ref,
+            memory_batch_ids=tuple(batch.batch_id for batch in batches),
+        ),
+        runtime,
+    )
+
+    assert max_active == 1
+
+
+def test_parallel_safe_memory_drain_respects_global_limiter(tmp_path: Path) -> None:
+    run_store = InMemoryRunStore()
+    run_store.create_run(run_id="run-memory-safe", status="running")
+    blob_store = LocalBlobStore(tmp_path / "blobs")
+    source_ref = "jobs/run-memory-safe-request.json"
+    blob_store.put_bytes(source_ref, b"{}\n")
+    runtime = build_phase_two_runtime(
+        blob_store=blob_store,
+        run_store=run_store,
+        trace_sink=NoOpTraceSink(),
+        source_artifact_ref=source_ref,
+        scenario="happy",
+    )
+    runtime.parallelism = RuntimeParallelismPolicy(
+        global_max_parallel_tokens=1,
+        provider_io_token_cost=2,
+        local_compute_token_cost=1,
+        transcription_max_workers=None,
+        translation_candidate_max_workers=None,
+        translation_chunk_max_workers=None,
+        review_max_workers=None,
+        reference_evaluation_max_workers=None,
+        memory_drain_max_workers=4,
+    )
+    runtime.global_concurrency_limiter = GlobalConcurrencyLimiter(1)
+    job = _job_context(job_id="job-memory-safe")
+    storage_job_id = operational_job_key(job)
+
+    active = 0
+    max_active = 0
+    lock = threading.Lock()
+
+    class ParallelSafeBackend:
+        supports_parallel_compute = True
+
+        def consolidate_batch(self, batch: MemoryWriteBatch) -> MemoryConsolidation:
+            nonlocal active, max_active
+            with lock:
+                active += 1
+                max_active = max(max_active, active)
+            try:
+                time.sleep(0.05)
+                return MemoryConsolidation(
+                    consolidation_id=f"consolidation-{batch.batch_id}",
+                    batch_id=batch.batch_id,
+                    job_id=batch.job_id,
+                    source_stage=batch.source_stage,
+                )
+            finally:
+                with lock:
+                    active -= 1
+
+    class NoProposalBackend:
+        def propose_prompt_evolution(self, consolidation, **kwargs):  # noqa: ANN001
+            del consolidation, kwargs
+            return None
+
+    runtime.memory_consolidation_backend = ParallelSafeBackend()
+    runtime.prompt_evolution_backend = NoProposalBackend()
+
+    batches = (
+        MemoryWriteBatch(batch_id="batch-a", job_id=job.job_id, source_stage="translation"),
+        MemoryWriteBatch(batch_id="batch-b", job_id=job.job_id, source_stage="translation"),
+    )
+    for batch in batches:
+        runtime.memory_batch_store.save_batch(batch, storage_job_id=storage_job_id)
+
+    drain_background_memory(
+        GraphState(
+            run_id="run-memory-safe",
+            job=job,
+            current_stage="background_memory_pipeline",
+            source_video_ref="input.mp4",
+            source_artifact_ref=source_ref,
+            memory_batch_ids=tuple(batch.batch_id for batch in batches),
+        ),
+        runtime,
+    )
+
+    assert max_active == 1
+
+
 def test_phase_five_translation_failure_publishes_recoverable_manifest(tmp_path: Path) -> None:
     _, _, blob_store = _run_workflow(tmp_path, scenario="translation_failed")
 
@@ -308,7 +475,6 @@ def test_phase_five_translation_failure_publishes_recoverable_manifest(tmp_path:
     )
     assert failure_manifest["failure_reasons"] == [
         "variant-a: simulated translation failure for variant-a",
-        "variant-b: simulated translation failure for variant-b",
     ]
     assert scorecard["translation_failed"] is True
     assert export_payload["status"] == "translation_failed"
@@ -337,7 +503,6 @@ def test_phase_five_translation_failure_manifest_dedupes_duplicate_reasons(tmp_p
     )
     assert failure_manifest["failure_reasons"] == [
         "variant-a: simulated translation failure for variant-a",
-        "variant-b: simulated translation failure for variant-b",
     ]
 
 

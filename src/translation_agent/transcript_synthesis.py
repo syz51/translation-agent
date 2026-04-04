@@ -25,6 +25,11 @@ from translation_agent.models import (
     TranscriptSynthesisReview,
     TranscriptUnresolvedSpan,
 )
+from translation_agent.observability import TraceEvent
+from translation_agent.parallelism import (
+    ParallelTaskClass,
+    concurrency_trace_attributes,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - import only for typing
     from translation_agent.graph.runtime import WorkflowRuntime
@@ -184,6 +189,7 @@ def run_selector_agent(
 
     if _should_use_live_reasoning(runtime):
         decisions = _live_selector_decisions(
+            run_id=run_id,
             runtime=runtime,
             spans=spans,
             span_candidates=span_candidates,
@@ -374,6 +380,7 @@ def run_global_adjudicator(
 
     if _should_use_live_reasoning(runtime):
         decisions = _live_global_decisions(
+            run_id=run_id,
             runtime=runtime,
             spans=spans,
             span_candidates=span_candidates,
@@ -938,12 +945,14 @@ def _reasoning_client(runtime: WorkflowRuntime) -> OpenAI:
 
 def _live_selector_decisions(
     *,
+    run_id: str,
     runtime: WorkflowRuntime,
     spans: tuple[CanonicalTranscriptSpan, ...],
     span_candidates: tuple[TranscriptSpanCandidate, ...],
 ) -> tuple[TranscriptSpanDecision, ...]:
     response = _invoke_reasoning_json(
         runtime=runtime,
+        run_id=run_id,
         schema_name="transcript_selector",
         schema=_selector_output_schema(),
         system_prompt=(
@@ -960,6 +969,11 @@ def _live_selector_decisions(
             ensure_ascii=True,
             sort_keys=True,
         ),
+        trace_name_prefix="transcript_synthesis.selector",
+        trace_attributes={
+            "canonical_span_count": len(spans),
+            "span_candidate_count": len(span_candidates),
+        },
     )
     fallback_map = {
         span.canonical_span_id: _selector_decision_for_span(
@@ -986,6 +1000,7 @@ def _live_reviewer_review(
 ) -> TranscriptSynthesisReview:
     response = _invoke_reasoning_json(
         runtime=runtime,
+        run_id=run_id,
         schema_name="transcript_reviewer",
         schema=_reviewer_output_schema(),
         system_prompt=(
@@ -1004,6 +1019,13 @@ def _live_reviewer_review(
             ensure_ascii=True,
             sort_keys=True,
         ),
+        trace_name_prefix="transcript_synthesis.reviewer",
+        trace_attributes={
+            "canonical_span_count": len(spans),
+            "span_candidate_count": len(span_candidates),
+            "selector_decision_count": len(selector_record.decisions),
+            "selector_unresolved_span_count": len(selector_record.unresolved_span_ids),
+        },
     )
     corrected_decisions = _normalized_decisions(
         spans=spans,
@@ -1037,6 +1059,7 @@ def _live_reviewer_review(
 
 def _live_global_decisions(
     *,
+    run_id: str,
     runtime: WorkflowRuntime,
     spans: tuple[CanonicalTranscriptSpan, ...],
     span_candidates: tuple[TranscriptSpanCandidate, ...],
@@ -1045,6 +1068,7 @@ def _live_global_decisions(
 ) -> tuple[TranscriptSpanDecision, ...]:
     response = _invoke_reasoning_json(
         runtime=runtime,
+        run_id=run_id,
         schema_name="transcript_global_adjudicator",
         schema=_selector_output_schema(),
         system_prompt=(
@@ -1072,6 +1096,15 @@ def _live_global_decisions(
             ensure_ascii=True,
             sort_keys=True,
         ),
+        trace_name_prefix="transcript_synthesis.global_adjudicator",
+        trace_attributes={
+            "canonical_span_count": len(spans),
+            "span_candidate_count": len(span_candidates),
+            "selector_decision_count": len(selector_record.decisions),
+            "selector_unresolved_span_count": len(selector_record.unresolved_span_ids),
+            "review_corrected_decision_count": len(review.corrected_decisions),
+            "review_unresolved_span_count": len(review.unresolved_span_ids),
+        },
     )
     fallback_map = {}
     for span in spans:
@@ -1099,42 +1132,125 @@ def _live_global_decisions(
 def _invoke_reasoning_json(
     *,
     runtime: WorkflowRuntime,
+    run_id: str,
     schema_name: str,
     schema: dict[str, object],
     system_prompt: str,
     user_prompt: str,
+    trace_name_prefix: str,
+    trace_attributes: dict[str, object],
 ) -> dict[str, object]:
+    request_trace_attributes = {
+        "schema_name": schema_name,
+        "reasoning_provider": runtime.reasoning_profile.provider_id,
+        "reasoning_model_id": runtime.reasoning_profile.model_id,
+        **trace_attributes,
+    }
     try:
-        response = _reasoning_client(runtime).chat.completions.create(
-            model=runtime.reasoning_profile.model_id,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            response_format={
-                "type": "json_schema",
-                "json_schema": {
-                    "name": schema_name,
-                    "strict": True,
-                    "schema": schema,
+        with runtime.global_concurrency_limiter.acquire(
+            runtime.parallelism.token_cost(ParallelTaskClass.PROVIDER_IO),
+            task_class=ParallelTaskClass.PROVIDER_IO,
+        ) as acquisition:
+            request_trace_attributes = {
+                **request_trace_attributes,
+                **concurrency_trace_attributes(acquisition, effective_stage_workers=1),
+            }
+            runtime.trace_sink.record(
+                TraceEvent(
+                    run_id=run_id,
+                    name=f"{trace_name_prefix}.started",
+                    attributes=request_trace_attributes,
+                )
+            )
+            response = _reasoning_client(runtime).chat.completions.create(
+                model=runtime.reasoning_profile.model_id,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": schema_name,
+                        "strict": True,
+                        "schema": schema,
+                    },
                 },
-            },
-            timeout=60.0,
+                timeout=60.0,
+            )
+    except (APIConnectionError, APITimeoutError, APIStatusError, ValueError) as exc:
+        runtime.trace_sink.record(
+            TraceEvent(
+                run_id=run_id,
+                name=f"{trace_name_prefix}.failed",
+                attributes={
+                    **request_trace_attributes,
+                    "error": str(exc),
+                },
+            )
         )
-    except APIConnectionError, APITimeoutError, APIStatusError, ValueError:
         return {}
 
     payload = response.model_dump(mode="json")
     if not isinstance(payload, dict):
+        runtime.trace_sink.record(
+            TraceEvent(
+                run_id=run_id,
+                name=f"{trace_name_prefix}.failed",
+                attributes={
+                    **request_trace_attributes,
+                    "error": "response payload was not a JSON object",
+                },
+            )
+        )
         return {}
     try:
         content = payload["choices"][0]["message"]["content"]
         if not isinstance(content, str):
+            runtime.trace_sink.record(
+                TraceEvent(
+                    run_id=run_id,
+                    name=f"{trace_name_prefix}.failed",
+                    attributes={
+                        **request_trace_attributes,
+                        "error": "response content was not a string",
+                    },
+                )
+            )
             return {}
         parsed = json.loads(content)
     except Exception:
+        runtime.trace_sink.record(
+            TraceEvent(
+                run_id=run_id,
+                name=f"{trace_name_prefix}.failed",
+                attributes={
+                    **request_trace_attributes,
+                    "error": "response content was not valid JSON",
+                },
+            )
+        )
         return {}
-    return parsed if isinstance(parsed, dict) else {}
+    if not isinstance(parsed, dict):
+        runtime.trace_sink.record(
+            TraceEvent(
+                run_id=run_id,
+                name=f"{trace_name_prefix}.failed",
+                attributes={
+                    **request_trace_attributes,
+                    "error": "parsed response was not a JSON object",
+                },
+            )
+        )
+        return {}
+    runtime.trace_sink.record(
+        TraceEvent(
+            run_id=run_id,
+            name=f"{trace_name_prefix}.completed",
+            attributes=request_trace_attributes,
+        )
+    )
+    return parsed
 
 
 def _normalized_decisions(

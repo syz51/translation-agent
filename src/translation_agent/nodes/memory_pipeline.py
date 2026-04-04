@@ -19,7 +19,12 @@ from translation_agent.nodes.common import (
     prompt_evolution_key,
     write_model_artifact,
 )
-from translation_agent.parallelism import ordered_parallel_map
+from translation_agent.observability import TraceEvent
+from translation_agent.parallelism import (
+    ParallelTaskClass,
+    concurrency_trace_attributes,
+    ordered_parallel_map,
+)
 from translation_agent.publish.outputs import publish_outputs
 from translation_agent.storage import asset_path, job_scope_token, operational_job_key
 
@@ -94,15 +99,26 @@ def drain_background_memory(state: GraphState, runtime: WorkflowRuntime) -> Grap
     if not pending_batches:
         return state
 
-    max_workers = (
-        runtime.parallelism.memory_drain_max_workers
-        if _memory_drain_parallel_safe(runtime) and len(pending_batches) > 1
+    parallel_safe = _memory_drain_parallel_safe(runtime)
+    effective_stage_workers = (
+        runtime.parallelism.resolve_stage_workers(
+            runtime.parallelism.memory_drain_max_workers,
+            task_count=len(pending_batches),
+        )
+        if parallel_safe and len(pending_batches) > 1
         else 1
     )
     gathered = ordered_parallel_map(
         pending_batches,
-        max_workers=max_workers,
-        worker=lambda batch: _compute_memory_drain(batch, runtime, job=state.job),
+        max_workers=effective_stage_workers,
+        worker=lambda batch: _compute_memory_drain(
+            batch,
+            runtime,
+            job=state.job,
+            run_id=state.run_id,
+            parallel_safe=parallel_safe,
+            effective_stage_workers=effective_stage_workers,
+        ),
         sort_key=lambda input_index, _batch: (input_index,),
     )
 
@@ -264,14 +280,61 @@ def _compute_memory_drain(
     runtime: WorkflowRuntime,
     *,
     job: JobContext,
+    run_id: str,
+    parallel_safe: bool,
+    effective_stage_workers: int,
 ) -> _MemoryDrainComputed:
-    consolidation = runtime.memory_consolidation_backend.consolidate_batch(batch)
-    proposal = runtime.prompt_evolution_backend.propose_prompt_evolution(
-        consolidation,
-        translation_model_id=_translation_model_id(batch, runtime),
-        evidence_ref=memory_consolidation_key(job, consolidation.consolidation_id),
-    )
-    return _MemoryDrainComputed(
-        consolidation=consolidation,
-        proposal=proposal,
-    )
+    trace_attributes = {
+        "memory_batch_id": batch.batch_id,
+        "effective_stage_workers": effective_stage_workers,
+    }
+    if not parallel_safe:
+        consolidation = runtime.memory_consolidation_backend.consolidate_batch(batch)
+        proposal = runtime.prompt_evolution_backend.propose_prompt_evolution(
+            consolidation,
+            translation_model_id=_translation_model_id(batch, runtime),
+            evidence_ref=memory_consolidation_key(job, consolidation.consolidation_id),
+        )
+        return _MemoryDrainComputed(
+            consolidation=consolidation,
+            proposal=proposal,
+        )
+
+    with runtime.global_concurrency_limiter.acquire(
+        runtime.parallelism.token_cost(ParallelTaskClass.LOCAL_COMPUTE),
+        task_class=ParallelTaskClass.LOCAL_COMPUTE,
+    ) as acquisition:
+        trace_attributes = {
+            **trace_attributes,
+            **concurrency_trace_attributes(
+                acquisition,
+                effective_stage_workers=effective_stage_workers,
+            ),
+        }
+        runtime.trace_sink.record(
+            TraceEvent(
+                run_id=run_id,
+                name="memory.drain.started",
+                attributes=trace_attributes,
+            )
+        )
+        consolidation = runtime.memory_consolidation_backend.consolidate_batch(batch)
+        proposal = runtime.prompt_evolution_backend.propose_prompt_evolution(
+            consolidation,
+            translation_model_id=_translation_model_id(batch, runtime),
+            evidence_ref=memory_consolidation_key(job, consolidation.consolidation_id),
+        )
+        runtime.trace_sink.record(
+            TraceEvent(
+                run_id=run_id,
+                name="memory.drain.completed",
+                attributes={
+                    **trace_attributes,
+                    "consolidation_id": consolidation.consolidation_id,
+                },
+            )
+        )
+        return _MemoryDrainComputed(
+            consolidation=consolidation,
+            proposal=proposal,
+        )

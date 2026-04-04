@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from hashlib import sha256
@@ -11,6 +12,7 @@ import pytest
 
 from translation_agent.graph import GraphState, RoutingFact, build_phase_two_runtime, run_workflow
 from translation_agent.models import (
+    AudioArtifact,
     CanonicalTranscriptSpan,
     JobContext,
     RequestContext,
@@ -20,11 +22,14 @@ from translation_agent.models import (
     TranscriptQualityMetrics,
     TranslationCandidate,
 )
+from translation_agent.nodes.common import audio_artifact_key, write_model_artifact
+from translation_agent.nodes.transcription import fanout_transcription
 from translation_agent.nodes.translate import (
     _translation_candidate_id,
     generate_translation_candidates,
 )
 from translation_agent.observability import NoOpTraceSink
+from translation_agent.parallelism import GlobalConcurrencyLimiter, RuntimeParallelismPolicy
 from translation_agent.storage import (
     LocalBlobStore,
     NodeExecutionRecord,
@@ -552,6 +557,148 @@ def test_generate_translation_candidates_defaults_to_winner_first_single_variant
             "translations",
             f"{_translation_candidate_id('variant-a', final_transcript_ref, job.job_id)}.json",
         ),
+    )
+
+
+def test_transcription_provider_calls_respect_global_token_budget(
+    tmp_path: Path,
+) -> None:
+    class CollectingTraceSink(NoOpTraceSink):
+        def __init__(self) -> None:
+            self.events = []
+
+        def record(self, event) -> None:  # noqa: ANN001
+            self.events.append(event)
+
+    run_store = InMemoryRunStore()
+    run_store.create_run(run_id="run-transcription-budget", status="running")
+    blob_store = LocalBlobStore(tmp_path / "blobs")
+    source_ref = "jobs/run-transcription-budget-request.json"
+    blob_store.put_bytes(source_ref, b"{}\n")
+    trace_sink = CollectingTraceSink()
+    runtime = build_phase_two_runtime(
+        blob_store=blob_store,
+        run_store=run_store,
+        trace_sink=trace_sink,
+        source_artifact_ref=source_ref,
+        scenario="happy",
+    )
+    runtime.parallelism = RuntimeParallelismPolicy(
+        global_max_parallel_tokens=4,
+        provider_io_token_cost=2,
+        local_compute_token_cost=1,
+        transcription_max_workers=None,
+        translation_candidate_max_workers=None,
+        translation_chunk_max_workers=None,
+        review_max_workers=None,
+        reference_evaluation_max_workers=None,
+        memory_drain_max_workers=None,
+    )
+    runtime.global_concurrency_limiter = GlobalConcurrencyLimiter(4)
+
+    job = _job_context(job_id="job-transcription-budget")
+    write_model_artifact(
+        runtime,
+        audio_artifact_key(job),
+        AudioArtifact(
+            artifact_id="audio-1",
+            job_id=job.job_id,
+            blob_ref="audio/input.wav",
+            duration_ms=1_000,
+            sample_rate_hz=16_000,
+            channels=1,
+            codec="wav",
+            extraction_metadata={},
+        ),
+    )
+
+    active = 0
+    max_active = 0
+    lock = threading.Lock()
+
+    class SlowAdapter:
+        def __init__(self, provider_id: str, rank: int) -> None:
+            self.provider_id = provider_id
+            self.rank = rank
+
+        def transcribe(self, audio_artifact, request_context):  # noqa: ANN001
+            candidate, _ = self.transcribe_with_payload(audio_artifact, request_context)
+            return candidate
+
+        def transcribe_with_payload(self, audio_artifact, request_context):  # noqa: ANN001
+            del audio_artifact
+            nonlocal active, max_active
+            with lock:
+                active += 1
+                max_active = max(max_active, active)
+            try:
+                time.sleep(0.05)
+                return (
+                    TranscriptCandidate(
+                        candidate_id=f"tr-{self.provider_id}-{request_context.job.job_id}",
+                        job_id=request_context.job.job_id,
+                        provider_id=self.provider_id,
+                        provider_request_id=f"req-{self.provider_id}",
+                        language=request_context.job.source_language,
+                        segments=(
+                            Segment(
+                                segment_id=f"seg-{self.provider_id}-1",
+                                start_ms=0,
+                                end_ms=1000,
+                                speaker="speaker-1",
+                                source_text=f"text-{self.provider_id}",
+                            ),
+                        ),
+                        full_text=f"text-{self.provider_id}",
+                        speaker_map={"speaker-1": "Host"},
+                        timing_resolution="segment",
+                        raw_payload_ref=job_path(
+                            request_context.job,
+                            "raw",
+                            "provider-payloads",
+                            f"{self.provider_id}.json",
+                        ),
+                        normalization_version="test",
+                        metadata={"provider_rank": self.rank},
+                    ),
+                    {"provider": self.provider_id},
+                )
+            finally:
+                with lock:
+                    active -= 1
+
+    runtime.transcription_adapters = (
+        SlowAdapter("assemblyai", 0),
+        SlowAdapter("speechmatics", 1),
+        SlowAdapter("deepgram", 2),
+    )
+
+    output = fanout_transcription(
+        GraphState(
+            run_id="run-transcription-budget",
+            job=job,
+            current_stage="fanout_transcription",
+            source_video_ref="input.mp4",
+            source_artifact_ref=source_ref,
+        ),
+        runtime,
+    )
+
+    started_events = [
+        event for event in trace_sink.events if event.name == "transcription.provider.started"
+    ]
+    assert max_active == 2
+    assert len(cast(tuple[str, ...], output["raw_transcript_candidate_refs"])) == 3
+    assert len(started_events) == 3
+    assert all(event.attributes["effective_stage_workers"] == 3 for event in started_events)
+    assert all(event.attributes["parallel_task_class"] == "provider_io" for event in started_events)
+    assert all(event.attributes["global_parallel_tokens_total"] == 4 for event in started_events)
+    assert (
+        max(
+            int(event.attributes["max_concurrent_provider_calls_observed"])
+            for event in started_events
+        )
+        == 2
     )
 
 

@@ -63,6 +63,7 @@ Outputs:
 Purpose:
 
 - run all configured STT adapters in parallel
+- queue leaf work behind the shared global token limiter so nested fan-out stays within the run-wide budget
 - persist raw payloads and staged transcript candidates
 - tolerate partial provider failure
 

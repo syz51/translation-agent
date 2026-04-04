@@ -353,6 +353,13 @@ The settings model accepts more fields than most users need. These are the ones 
 | `TA_ADAPTER_MAX_BACKOFF_SECONDS` | max retry backoff |
 | `TA_ADAPTER_POLL_INTERVAL_SECONDS` | poll interval for async providers |
 | `TA_ADAPTER_POLL_ATTEMPTS` | max provider polling attempts |
+| `TA_GLOBAL_PARALLEL_TOKENS` | shared hard ceiling for run-wide in-flight leaf work; defaults to `8` |
+| `TA_TRANSCRIPTION_MAX_WORKERS` | optional local cap for transcription provider fan-out; unset means auto mode |
+| `TA_TRANSLATION_CANDIDATE_MAX_WORKERS` | optional local cap for outer translation-candidate fan-out; unset means auto mode |
+| `TA_TRANSLATION_CHUNK_MAX_WORKERS` | optional local cap for per-candidate translation chunk fan-out; unset means auto mode |
+| `TA_REVIEW_MAX_WORKERS` | optional local cap for review bundle fan-out; unset means auto mode |
+| `TA_REFERENCE_EVALUATION_MAX_WORKERS` | optional local cap for historical reference evaluation fan-out; unset means auto mode |
+| `TA_MEMORY_DRAIN_MAX_WORKERS` | optional local cap for parallel-safe memory drain fan-out; unset means auto mode |
 | `TA_ASSEMBLYAI_API_KEY` | AssemblyAI credential for real mode |
 | `TA_SPEECHMATICS_API_KEY` | Speechmatics credential for real mode |
 | `TA_DEEPGRAM_API_KEY` | Deepgram credential for real mode |
@@ -369,6 +376,12 @@ The settings model accepts more fields than most users need. These are the ones 
 | `TA_TRANSLATION_PROMPT_VERSION` | translation prompt version recorded in outputs |
 
 The settings model also exposes `TA_WORKSPACE_DIR`, `TA_LOG_LEVEL`, `TA_EMIT_CONSOLE_LOGS`, and provider base URL overrides. At the moment those are configuration surface area, but the repo’s behavior is primarily driven by the variables listed above.
+
+Parallelism behavior:
+
+- `TA_GLOBAL_PARALLEL_TOKENS` is the hard ceiling across nested fan-out for provider calls and local compute leaf work.
+- Stage worker caps are local ceilings only. When unset, each stage resolves at call time to `min(task_count, global_parallel_tokens)`.
+- Saturation uses queue-and-wait backpressure. Work is delayed until tokens free up rather than being dropped or failed fast.
 
 Environment loading order:
 

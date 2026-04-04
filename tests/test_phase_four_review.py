@@ -23,6 +23,7 @@ from translation_agent.models import (
 from translation_agent.models.review import ReviewStage
 from translation_agent.nodes.review import review_transcripts, review_translations
 from translation_agent.observability import NoOpTraceSink
+from translation_agent.parallelism import GlobalConcurrencyLimiter, RuntimeParallelismPolicy
 from translation_agent.review import (
     adjudicate_reviews,
     build_review_context,
@@ -410,6 +411,102 @@ def test_parallel_review_generation_preserves_review_id_order(
     assert translation_roles == [
         spec.reviewer_role for spec in reviewer_roles_for_stage("translation")
     ]
+
+
+def test_review_generation_blocks_then_resumes_when_global_tokens_are_exhausted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class CollectingTraceSink(NoOpTraceSink):
+        def __init__(self) -> None:
+            self.events = []
+
+        def record(self, event) -> None:  # noqa: ANN001
+            self.events.append(event)
+
+    run_store = InMemoryRunStore()
+    run_store.create_run(run_id="run-review-budget", status="running")
+    blob_store = LocalBlobStore(tmp_path / "blobs")
+    source_ref = "jobs/run-review-budget-request.json"
+    blob_store.put_bytes(source_ref, b"{}\n")
+    trace_sink = CollectingTraceSink()
+    runtime = build_phase_two_runtime(
+        blob_store=blob_store,
+        run_store=run_store,
+        trace_sink=trace_sink,
+        source_artifact_ref=source_ref,
+        scenario="happy",
+    )
+    runtime.parallelism = RuntimeParallelismPolicy(
+        global_max_parallel_tokens=1,
+        provider_io_token_cost=2,
+        local_compute_token_cost=1,
+        transcription_max_workers=None,
+        translation_candidate_max_workers=None,
+        translation_chunk_max_workers=None,
+        review_max_workers=4,
+        reference_evaluation_max_workers=None,
+        memory_drain_max_workers=None,
+    )
+    runtime.global_concurrency_limiter = GlobalConcurrencyLimiter(1)
+    job = _job_context(job_id="job-review-budget")
+    storage_job_id = operational_job_key(job)
+    transcript = _transcript_candidate("tr-final", "Hello world from provider A.")
+    runtime.decision_store.save_transcript_candidate(transcript, storage_job_id=storage_job_id)
+
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    second_entered = threading.Event()
+    errors: list[BaseException] = []
+    original_render = render_reviewer_output
+
+    def delayed_render(review_context, candidates, prompt_text, final_transcript):  # noqa: ANN001
+        if not first_entered.is_set():
+            first_entered.set()
+            assert release_first.wait(timeout=1)
+        else:
+            second_entered.set()
+        return original_render(
+            review_context,
+            candidates=candidates,
+            prompt_text=prompt_text,
+            final_transcript=final_transcript,
+        )
+
+    monkeypatch.setattr("translation_agent.nodes.review.render_reviewer_output", delayed_render)
+
+    def run_review() -> None:
+        try:
+            review_transcripts(
+                GraphState(
+                    run_id="run-review-budget",
+                    job=job,
+                    current_stage="review_transcripts",
+                    source_video_ref="input.mp4",
+                    source_artifact_ref=source_ref,
+                    transcript_candidate_ids=("tr-final",),
+                ),
+                runtime,
+            )
+        except BaseException as exc:  # pragma: no cover - test safety
+            errors.append(exc)
+
+    worker = threading.Thread(target=run_review)
+    worker.start()
+    assert first_entered.wait(timeout=1)
+    assert not second_entered.wait(timeout=0.05)
+    release_first.set()
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert not errors
+    assert second_entered.is_set()
+    started_events = [event for event in trace_sink.events if event.name == "review.bundle.started"]
+    assert started_events
+    assert all(
+        event.attributes["parallel_task_class"] == "local_compute" for event in started_events
+    )
+    assert all(event.attributes["global_parallel_tokens_total"] == 1 for event in started_events)
 
 
 def test_parse_reviewer_output_rejects_missing_sections() -> None:
