@@ -26,5 +26,9 @@
   ],
   "transcription_providers": null,
   "translation_variants": null,
-  "review_bundles": null
+  "review_bundles": null,
+  "transcript_synthesis_status": null,
+  "transcript_unresolved_span_count": null,
+  "transcript_provider_provenance": null,
+  "transcript_artifact_ref": null
 }

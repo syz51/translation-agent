@@ -2197,7 +2197,7 @@ def test_phase_three_runtime_completes_workflow_with_assemblyai_only_real_mode(
     assert final_state.final_transcript_candidate_id == final_state.transcript_candidate_ids[0]
     assert decision.winner_candidate_id == final_state.final_transcript_candidate_id
     assert decision.decision_mode == "automatic_finalize"
-    assert decision.escalated is True
+    assert decision.escalated is False
     assert decision.human_review_required is False
     assert decision.investigation_ref == _artifact_path("investigations", "transcript.json")
     assert blob_store.exists(_artifact_path("published", "transcript.json"))

@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from hashlib import sha256
 from pathlib import Path
 from typing import Any, cast
 
@@ -10,10 +11,13 @@ import pytest
 
 from translation_agent.graph import GraphState, RoutingFact, build_phase_two_runtime, run_workflow
 from translation_agent.models import (
+    CanonicalTranscriptSpan,
     JobContext,
     RequestContext,
     Segment,
+    SynthesizedTranscriptArtifact,
     TranscriptCandidate,
+    TranscriptQualityMetrics,
     TranslationCandidate,
 )
 from translation_agent.nodes.translate import (
@@ -27,7 +31,6 @@ from translation_agent.storage import (
     RunRecord,
     SQLiteOperationalStore,
     job_path,
-    operational_job_key,
 )
 
 pytestmark = pytest.mark.unit
@@ -215,7 +218,7 @@ def test_phase_two_happy_path_executes_full_graph(tmp_path: Path) -> None:
     assert final_state.translation_candidate_ids == (final_state.final_translation_candidate_id,)
     assert blob_store.exists(_artifact_path("published", "transcript.json"))
     assert blob_store.exists(_artifact_path("published", "translation.json"))
-    assert len(run_store.list_node_executions("run-123")) == 13
+    assert len(run_store.list_node_executions("run-123")) == 16
 
 
 def test_phase_two_degraded_stt_keeps_run_recoverable(tmp_path: Path) -> None:
@@ -227,7 +230,7 @@ def test_phase_two_degraded_stt_keeps_run_recoverable(tmp_path: Path) -> None:
         fact.fact_type == "transcription_provider_failed" and fact.value == "speechmatics"
         for fact in final_state.routing_facts
     )
-    assert len(run_store.list_node_executions("run-123")) == 13
+    assert len(run_store.list_node_executions("run-123")) == 16
 
 
 def test_phase_two_dual_experiment_single_surviving_variant_still_publishes(
@@ -269,14 +272,7 @@ def test_phase_two_escalation_skips_translation_path(tmp_path: Path) -> None:
     assert blob_store.exists(_artifact_path("published", "translation.json"))
     executed_nodes = [record.node_name for record in run_store.list_node_executions("run-123")]
     assert "generate_translation_candidates" in executed_nodes
-    assert len(executed_nodes) == 13
-    succeeded_translation_facts = [
-        fact.value
-        for fact in final_state.routing_facts
-        if fact.fact_type == "translation_variant_succeeded"
-    ]
-    assert len(succeeded_translation_facts) == len(final_state.transcript_candidate_ids)
-    assert all(value.startswith("variant-a:") for value in succeeded_translation_facts)
+    assert len(executed_nodes) == 16
 
 
 def test_phase_four_medium_disagreement_invokes_conflict_investigator(tmp_path: Path) -> None:
@@ -436,14 +432,25 @@ def test_generate_translation_candidates_defaults_to_winner_first_single_variant
         scenario="happy",
     )
     job = _job_context(job_id="job-translation-single")
-    storage_job_id = operational_job_key(job)
-    transcript_a = TranscriptCandidate(
-        candidate_id="tr-a",
+    synthesized = SynthesizedTranscriptArtifact(
+        artifact_id="synth-job-translation-single",
         job_id=job.job_id,
-        provider_id="assemblyai",
-        provider_request_id="req-a",
+        run_id="run-translation-single",
         language=job.source_language,
-        segments=(
+        transcript_metadata={"blocker_tags": []},
+        canonical_spans=(
+            CanonicalTranscriptSpan(
+                canonical_span_id="canonical-span-0001",
+                start_ms=0,
+                end_ms=1_000,
+                speaker="speaker-1",
+                supporting_candidate_ids=("tr-a",),
+                supporting_provider_ids=("assemblyai",),
+                metadata={},
+            ),
+        ),
+        span_candidates=(),
+        final_segments=(
             Segment(
                 segment_id="seg-a",
                 start_ms=0,
@@ -452,33 +459,27 @@ def test_generate_translation_candidates_defaults_to_winner_first_single_variant
                 source_text="Alpha",
             ),
         ),
+        provenance=(),
+        unresolved_spans=(),
+        quality_metrics=TranscriptQualityMetrics(
+            canonical_span_count=1,
+            supported_span_count=1,
+            emitted_span_count=1,
+            unresolved_span_count=0,
+            overlap_count=0,
+            non_monotonic_count=0,
+            zero_length_count=0,
+            dropped_supported_span_count=0,
+            provider_support_summary={"assemblyai": 1},
+        ),
         full_text="Alpha",
-        speaker_map={"speaker-1": "Host"},
-        timing_resolution="segment",
-        raw_payload_ref="raw/tr-a.json",
-        normalization_version="test",
-        metadata={"provider_rank": 0},
+        status="ready",
     )
-    transcript_b = transcript_a.model_copy(
-        update={
-            "candidate_id": "tr-b",
-            "provider_request_id": "req-b",
-            "full_text": "Beta",
-            "segments": (
-                Segment(
-                    segment_id="seg-b",
-                    start_ms=0,
-                    end_ms=1_000,
-                    speaker="speaker-1",
-                    source_text="Beta",
-                ),
-            ),
-            "raw_payload_ref": "raw/tr-b.json",
-            "metadata": {"provider_rank": 1},
-        }
+    final_transcript_ref = job_path(job, "artifacts", "final-transcript.json")
+    blob_store.put_bytes(
+        final_transcript_ref,
+        (synthesized.model_dump_json(indent=2) + "\n").encode(),
     )
-    runtime.decision_store.save_transcript_candidate(transcript_a, storage_job_id=storage_job_id)
-    runtime.decision_store.save_transcript_candidate(transcript_b, storage_job_id=storage_job_id)
 
     class RawAdapter:
         model_id = "gpt-5.4-mini"
@@ -506,13 +507,13 @@ def test_generate_translation_candidates_defaults_to_winner_first_single_variant
             prompt_variant_id: str,
             request_context: RequestContext,
         ) -> tuple[TranslationCandidate, dict[str, object]]:
-            del request_context
+            assert request_context.metadata["transcript_synthesis"]["transcript_blockers"] == []
             self.calls.append((transcript.candidate_id, prompt_variant_id))
             target_text = f"{transcript.full_text}-{prompt_variant_id}"
             candidate = TranslationCandidate(
                 candidate_id=f"raw-{transcript.candidate_id}-{prompt_variant_id}",
                 job_id=job.job_id,
-                source_transcript_candidate_id=transcript.candidate_id,
+                source_transcript_ref=final_transcript_ref,
                 model_id=self.model_id,
                 prompt_variant_id=prompt_variant_id,
                 prompt_version="raw-prompt",
@@ -533,28 +534,28 @@ def test_generate_translation_candidates_defaults_to_winner_first_single_variant
         current_stage="generate_translation_candidates",
         source_video_ref="input.mp4",
         source_artifact_ref=source_ref,
-        transcript_candidate_ids=("tr-a", "tr-b"),
-        final_transcript_candidate_id="tr-b",
+        final_transcript_ref=final_transcript_ref,
     )
 
     output = generate_translation_candidates(state, runtime)
+    source_token = sha256(final_transcript_ref.encode()).hexdigest()[:12]
 
     assert output["translation_failed"] is False
-    assert adapter.calls == [("tr-b", "variant-a")]
+    assert adapter.calls == [("synth-job-translation-single", "variant-a")]
     assert output["raw_translation_payload_refs"] == (
-        job_path(job, "raw", "translation-candidates", "variant-a-tr-b.json"),
+        job_path(job, "raw", "translation-candidates", f"variant-a-{source_token}.json"),
     )
     assert output["raw_translation_candidate_refs"] == (
         job_path(
             job,
             "staging",
             "translations",
-            f"{_translation_candidate_id('variant-a', 'tr-b', job.job_id)}.json",
+            f"{_translation_candidate_id('variant-a', final_transcript_ref, job.job_id)}.json",
         ),
     )
 
 
-def test_generate_translation_candidates_defers_to_survivor_fanout_when_requested(
+def test_generate_translation_candidates_preserves_task_order_and_partial_failures(
     tmp_path: Path,
 ) -> None:
     run_store = InMemoryRunStore()
@@ -569,57 +570,66 @@ def test_generate_translation_candidates_defers_to_survivor_fanout_when_requeste
         source_artifact_ref=source_ref,
         scenario="happy",
     )
-    job = _job_context(job_id="job-translation-order")
-    storage_job_id = operational_job_key(job)
-    transcript_a = TranscriptCandidate(
-        candidate_id="tr-a",
+    job = _job_context(job_id="job-translation-order").model_copy(
+        update={"translation_variant_policy": "dual_experiment"}
+    )
+    synthesized_segments = (
+        Segment(
+            segment_id="seg-a",
+            start_ms=0,
+            end_ms=1_000,
+            speaker="speaker-1",
+            source_text="Alpha",
+        ),
+    )
+    synthesized = SynthesizedTranscriptArtifact(
+        artifact_id="synth-job-translation-order",
         job_id=job.job_id,
-        provider_id="assemblyai",
-        provider_request_id="req-a",
+        run_id="run-translation-order",
         language=job.source_language,
-        segments=(
-            Segment(
-                segment_id="seg-a",
+        transcript_metadata={"blocker_tags": ["transcript_overlaps"]},
+        canonical_spans=(
+            CanonicalTranscriptSpan(
+                canonical_span_id="canonical-span-0001",
                 start_ms=0,
                 end_ms=1_000,
                 speaker="speaker-1",
-                source_text="Alpha",
+                supporting_candidate_ids=("tr-a", "tr-b"),
+                supporting_provider_ids=("assemblyai", "speechmatics"),
+                metadata={},
             ),
         ),
+        span_candidates=(),
+        final_segments=synthesized_segments,
+        provenance=(),
+        unresolved_spans=(),
+        quality_metrics=TranscriptQualityMetrics(
+            canonical_span_count=1,
+            supported_span_count=1,
+            emitted_span_count=1,
+            unresolved_span_count=0,
+            overlap_count=0,
+            non_monotonic_count=0,
+            zero_length_count=0,
+            dropped_supported_span_count=0,
+            provider_support_summary={"assemblyai": 1, "speechmatics": 1},
+        ),
         full_text="Alpha",
-        speaker_map={"speaker-1": "Host"},
-        timing_resolution="segment",
-        raw_payload_ref="raw/tr-a.json",
-        normalization_version="test",
-        metadata={"provider_rank": 0},
+        status="ready",
     )
-    transcript_b = transcript_a.model_copy(
-        update={
-            "candidate_id": "tr-b",
-            "provider_request_id": "req-b",
-            "full_text": "Beta",
-            "segments": (
-                Segment(
-                    segment_id="seg-b",
-                    start_ms=0,
-                    end_ms=1_000,
-                    speaker="speaker-1",
-                    source_text="Beta",
-                ),
-            ),
-            "raw_payload_ref": "raw/tr-b.json",
-            "metadata": {"provider_rank": 1},
-        }
+    final_transcript_ref = job_path(job, "artifacts", "final-transcript.json")
+    blob_store.put_bytes(
+        final_transcript_ref,
+        (synthesized.model_dump_json(indent=2) + "\n").encode(),
     )
-    runtime.decision_store.save_transcript_candidate(transcript_a, storage_job_id=storage_job_id)
-    runtime.decision_store.save_transcript_candidate(transcript_b, storage_job_id=storage_job_id)
 
     class RawAdapter:
         model_id = "gpt-5.4-mini"
         _prompt_version = "phase-3-v1"
 
         def __init__(self) -> None:
-            self.calls: list[tuple[str, str]] = []
+            self._first_variant_started = threading.Event()
+            self._second_variant_released = threading.Event()
 
         def generate_translation(
             self,
@@ -640,13 +650,22 @@ def test_generate_translation_candidates_defers_to_survivor_fanout_when_requeste
             prompt_variant_id: str,
             request_context: RequestContext,
         ) -> tuple[TranslationCandidate, dict[str, object]]:
-            del request_context
-            self.calls.append((transcript.candidate_id, prompt_variant_id))
+            if prompt_variant_id == "variant-a":
+                self._first_variant_started.set()
+                assert self._second_variant_released.wait(timeout=1)
+            if prompt_variant_id == "variant-b":
+                assert self._first_variant_started.wait(timeout=1)
+                self._second_variant_released.set()
+            if prompt_variant_id == "variant-a":
+                raise RuntimeError("boom-tr-b-variant-a")
+            assert request_context.metadata["transcript_synthesis"]["transcript_blockers"] == [
+                "transcript_overlaps"
+            ]
             target_text = f"{transcript.full_text}-{prompt_variant_id}"
             candidate = TranslationCandidate(
                 candidate_id=f"raw-{transcript.candidate_id}-{prompt_variant_id}",
-                job_id=job.job_id,
-                source_transcript_candidate_id=transcript.candidate_id,
+                job_id=request_context.job.job_id,
+                source_transcript_ref=final_transcript_ref,
                 model_id=self.model_id,
                 prompt_variant_id=prompt_variant_id,
                 prompt_version="raw-prompt",
@@ -667,43 +686,34 @@ def test_generate_translation_candidates_defers_to_survivor_fanout_when_requeste
         current_stage="generate_translation_candidates",
         source_video_ref="input.mp4",
         source_artifact_ref=source_ref,
-        transcript_candidate_ids=("tr-a", "tr-b"),
-        final_transcript_candidate_id="tr-a",
-        routing_facts=(
-            RoutingFact(
-                stage="adjudicate_transcript",
-                fact_type="transcript_review_deferred_to_translation",
-                value="tr-a",
-                source_ref="jobs/test/investigation.json",
-            ),
-        ),
+        final_transcript_ref=final_transcript_ref,
     )
 
     output = generate_translation_candidates(state, runtime)
+    source_token = sha256(final_transcript_ref.encode()).hexdigest()[:12]
 
     assert output["translation_failed"] is False
-    assert adapter.calls == [("tr-a", "variant-a"), ("tr-b", "variant-a")]
     assert output["raw_translation_payload_refs"] == (
-        job_path(job, "raw", "translation-candidates", "variant-a-tr-a.json"),
-        job_path(job, "raw", "translation-candidates", "variant-a-tr-b.json"),
+        job_path(job, "raw", "translation-candidates", f"variant-b-{source_token}.json"),
     )
     assert output["raw_translation_candidate_refs"] == (
         job_path(
             job,
             "staging",
             "translations",
-            f"{_translation_candidate_id('variant-a', 'tr-a', job.job_id)}.json",
-        ),
-        job_path(
-            job,
-            "staging",
-            "translations",
-            f"{_translation_candidate_id('variant-a', 'tr-b', job.job_id)}.json",
+            f"{_translation_candidate_id('variant-b', final_transcript_ref, job.job_id)}.json",
         ),
     )
+    routing_facts = cast(tuple[RoutingFact, ...], output["routing_facts"])
+    failed_facts = [
+        fact for fact in routing_facts if fact.fact_type == "translation_variant_failed"
+    ]
+    assert [(fact.value, fact.source_ref) for fact in failed_facts] == [
+        (f"variant-a:{final_transcript_ref}", "boom-tr-b-variant-a"),
+    ]
 
 
-def test_generate_translation_candidates_dual_experiment_runs_both_variants_for_selected_winner(
+def test_generate_translation_candidates_dual_experiment_runs_both_variants_for_synthesized_input(
     tmp_path: Path,
 ) -> None:
     run_store = InMemoryRunStore()
@@ -721,14 +731,25 @@ def test_generate_translation_candidates_dual_experiment_runs_both_variants_for_
     job = _job_context(job_id="job-translation-experiment").model_copy(
         update={"translation_variant_policy": "dual_experiment"}
     )
-    storage_job_id = operational_job_key(job)
-    transcript_a = TranscriptCandidate(
-        candidate_id="tr-a",
+    synthesized = SynthesizedTranscriptArtifact(
+        artifact_id="synth-job-translation-experiment",
         job_id=job.job_id,
-        provider_id="assemblyai",
-        provider_request_id="req-a",
+        run_id="run-translation-experiment",
         language=job.source_language,
-        segments=(
+        transcript_metadata={"blocker_tags": []},
+        canonical_spans=(
+            CanonicalTranscriptSpan(
+                canonical_span_id="canonical-span-0001",
+                start_ms=0,
+                end_ms=1_000,
+                speaker="speaker-1",
+                supporting_candidate_ids=("tr-a",),
+                supporting_provider_ids=("assemblyai",),
+                metadata={},
+            ),
+        ),
+        span_candidates=(),
+        final_segments=(
             Segment(
                 segment_id="seg-a",
                 start_ms=0,
@@ -737,33 +758,27 @@ def test_generate_translation_candidates_dual_experiment_runs_both_variants_for_
                 source_text="Alpha",
             ),
         ),
+        provenance=(),
+        unresolved_spans=(),
+        quality_metrics=TranscriptQualityMetrics(
+            canonical_span_count=1,
+            supported_span_count=1,
+            emitted_span_count=1,
+            unresolved_span_count=0,
+            overlap_count=0,
+            non_monotonic_count=0,
+            zero_length_count=0,
+            dropped_supported_span_count=0,
+            provider_support_summary={"assemblyai": 1},
+        ),
         full_text="Alpha",
-        speaker_map={"speaker-1": "Host"},
-        timing_resolution="segment",
-        raw_payload_ref="raw/tr-a.json",
-        normalization_version="test",
-        metadata={"provider_rank": 0},
+        status="ready",
     )
-    transcript_b = transcript_a.model_copy(
-        update={
-            "candidate_id": "tr-b",
-            "provider_request_id": "req-b",
-            "full_text": "Beta",
-            "segments": (
-                Segment(
-                    segment_id="seg-b",
-                    start_ms=0,
-                    end_ms=1_000,
-                    speaker="speaker-1",
-                    source_text="Beta",
-                ),
-            ),
-            "raw_payload_ref": "raw/tr-b.json",
-            "metadata": {"provider_rank": 1},
-        }
+    final_transcript_ref = job_path(job, "artifacts", "final-transcript.json")
+    blob_store.put_bytes(
+        final_transcript_ref,
+        (synthesized.model_dump_json(indent=2) + "\n").encode(),
     )
-    runtime.decision_store.save_transcript_candidate(transcript_a, storage_job_id=storage_job_id)
-    runtime.decision_store.save_transcript_candidate(transcript_b, storage_job_id=storage_job_id)
 
     class RawAdapter:
         model_id = "gpt-5.4-mini"
@@ -791,13 +806,13 @@ def test_generate_translation_candidates_dual_experiment_runs_both_variants_for_
             prompt_variant_id: str,
             request_context: RequestContext,
         ) -> tuple[TranslationCandidate, dict[str, object]]:
-            del request_context
+            assert request_context.metadata["transcript_synthesis"]["transcript_blockers"] == []
             self.calls.append((transcript.candidate_id, prompt_variant_id))
             target_text = f"{transcript.full_text}-{prompt_variant_id}"
             candidate = TranslationCandidate(
                 candidate_id=f"raw-{transcript.candidate_id}-{prompt_variant_id}",
                 job_id=job.job_id,
-                source_transcript_candidate_id=transcript.candidate_id,
+                source_transcript_ref=final_transcript_ref,
                 model_id=self.model_id,
                 prompt_variant_id=prompt_variant_id,
                 prompt_version="raw-prompt",
@@ -818,17 +833,20 @@ def test_generate_translation_candidates_dual_experiment_runs_both_variants_for_
         current_stage="generate_translation_candidates",
         source_video_ref="input.mp4",
         source_artifact_ref=source_ref,
-        transcript_candidate_ids=("tr-a", "tr-b"),
-        final_transcript_candidate_id="tr-a",
+        final_transcript_ref=final_transcript_ref,
     )
 
     output = generate_translation_candidates(state, runtime)
+    source_token = sha256(final_transcript_ref.encode()).hexdigest()[:12]
 
     assert output["translation_failed"] is False
-    assert adapter.calls == [("tr-a", "variant-a"), ("tr-a", "variant-b")]
+    assert adapter.calls == [
+        ("synth-job-translation-experiment", "variant-a"),
+        ("synth-job-translation-experiment", "variant-b"),
+    ]
     assert output["raw_translation_payload_refs"] == (
-        job_path(job, "raw", "translation-candidates", "variant-a-tr-a.json"),
-        job_path(job, "raw", "translation-candidates", "variant-b-tr-a.json"),
+        job_path(job, "raw", "translation-candidates", f"variant-a-{source_token}.json"),
+        job_path(job, "raw", "translation-candidates", f"variant-b-{source_token}.json"),
     )
 
 

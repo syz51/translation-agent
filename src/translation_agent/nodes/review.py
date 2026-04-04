@@ -8,8 +8,10 @@ from hashlib import sha256
 from translation_agent.graph.runtime import WorkflowRuntime
 from translation_agent.graph.state import GraphState, RoutingFact
 from translation_agent.models import (
+    FinalTranscriptDecision,
     MemoryBundle,
     ReviewBundle,
+    SynthesizedTranscriptArtifact,
     TranscriptCandidate,
     TranslationCandidate,
 )
@@ -18,10 +20,14 @@ from translation_agent.nodes.common import (
     TRANSCRIPT_REVIEW_STAGE,
     TRANSLATION_REVIEW_STAGE,
     build_memory_query,
+    read_model_artifact,
     review_memory_bundle_key,
     select_transcript_candidates,
     select_translation_candidates,
+    synthesized_transcript_as_candidate,
     transcript_candidate_key,
+    transcript_decision_key,
+    transcript_investigation_key,
     transcript_review_key,
     translation_candidate_key,
     translation_review_key,
@@ -118,16 +124,7 @@ def review_translations(state: GraphState, runtime: WorkflowRuntime) -> dict[str
         job=state.job,
         candidate_ids=state.translation_candidate_ids,
     )
-    transcript_provider_ids = tuple(
-        transcript.provider_id
-        for transcript in select_transcript_candidates(
-            runtime,
-            job=state.job,
-            candidate_ids=tuple(
-                candidate.source_transcript_candidate_id or "" for candidate in candidates
-            ),
-        )
-    )
+    transcript_provider_ids = _translation_source_provider_ids(state, runtime, candidates)
     memory_bundle = runtime.memory_recall_backend.recall_memory(
         build_memory_query(
             state,
@@ -275,6 +272,9 @@ def _build_review_bundle(
                 if final_transcript is not None
                 else None
             ),
+            transcript_context=_translation_transcript_context(state, runtime)
+            if stage == TRANSLATION_REVIEW_STAGE
+            else None,
         )
         raw_review_text = render_reviewer_output(
             review_context,
@@ -330,8 +330,15 @@ def _load_final_transcript_candidate(
     state: GraphState,
     runtime: WorkflowRuntime,
 ) -> TranscriptCandidate:
+    if state.final_transcript_ref is not None:
+        artifact = read_model_artifact(
+            runtime,
+            state.final_transcript_ref,
+            SynthesizedTranscriptArtifact,
+        )
+        return synthesized_transcript_as_candidate(artifact)
     if state.final_transcript_candidate_id is None:
-        raise RuntimeError("translation review requires a final transcript candidate")
+        raise RuntimeError("translation review requires a synthesized transcript artifact")
     candidates = select_transcript_candidates(
         runtime,
         job=state.job,
@@ -340,6 +347,34 @@ def _load_final_transcript_candidate(
     if not candidates:
         raise RuntimeError("final transcript candidate not found for translation review")
     return candidates[0]
+
+
+def _translation_transcript_context(
+    state: GraphState,
+    runtime: WorkflowRuntime,
+) -> dict[str, object]:
+    if state.final_transcript_ref is None:
+        return {}
+    artifact = read_model_artifact(
+        runtime,
+        state.final_transcript_ref,
+        SynthesizedTranscriptArtifact,
+    )
+    decision_ref = state.final_transcript_decision_ref or transcript_decision_key(state.job)
+    decision: FinalTranscriptDecision | None = None
+    if runtime.blob_store.exists(decision_ref):
+        decision = read_model_artifact(runtime, decision_ref, FinalTranscriptDecision)
+    investigation_ref = transcript_investigation_key(state.job)
+    return {
+        "transcript_synthesis_status": artifact.status,
+        "transcript_blockers": list(artifact.transcript_metadata.get("blocker_tags", [])),
+        "transcript_decision_ref": decision_ref if decision is not None else None,
+        "transcript_investigation_ref": (
+            investigation_ref if runtime.blob_store.exists(investigation_ref) else None
+        ),
+        "transcript_unresolved_span_count": artifact.quality_metrics.unresolved_span_count,
+        "transcript_decision_mode": decision.decision_mode if decision is not None else None,
+    }
 
 
 def _review_id(
@@ -403,3 +438,38 @@ def _validate_rendered_review_against_draft(*, parsed, draft) -> None:  # noqa: 
         raise ValueError("rendered reviewer confidence does not match structured draft")
     if parsed.escalation_signal != draft.escalation_signal:
         raise ValueError("rendered reviewer escalation flag does not match structured draft")
+
+
+def _translation_source_provider_ids(
+    state: GraphState,
+    runtime: WorkflowRuntime,
+    candidates: list[TranslationCandidate],
+) -> tuple[str, ...]:
+    provider_ids: list[str] = []
+    seen: set[str] = set()
+    if state.final_transcript_ref is not None:
+        artifact = read_model_artifact(
+            runtime,
+            state.final_transcript_ref,
+            SynthesizedTranscriptArtifact,
+        )
+        for provider_id in artifact.quality_metrics.provider_support_summary:
+            if provider_id in seen:
+                continue
+            provider_ids.append(provider_id)
+            seen.add(provider_id)
+        if provider_ids:
+            return tuple(provider_ids)
+    transcript_candidates = select_transcript_candidates(
+        runtime,
+        job=state.job,
+        candidate_ids=tuple(
+            candidate.source_transcript_candidate_id or "" for candidate in candidates
+        ),
+    )
+    for transcript in transcript_candidates:
+        if transcript.provider_id in seen:
+            continue
+        provider_ids.append(transcript.provider_id)
+        seen.add(transcript.provider_id)
+    return tuple(provider_ids)

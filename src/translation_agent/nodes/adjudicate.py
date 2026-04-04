@@ -362,7 +362,7 @@ def adjudicate_translation(state: GraphState, runtime: WorkflowRuntime) -> dict[
         "current_stage": "adjudicate_translation",
         "final_translation_candidate_id": winner_candidate_id,
         "final_transcript_candidate_id": (
-            winner.source_transcript_candidate_id
+            winner.source_transcript_candidate_id or state.final_transcript_candidate_id
             if winner is not None
             else state.final_transcript_candidate_id
         ),

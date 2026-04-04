@@ -172,7 +172,7 @@ def build_review_payload(
         translation_candidates,
         key=lambda candidate: (
             0 if candidate.candidate_id == preferred_candidate_id else 1,
-            candidate.source_transcript_candidate_id or "",
+            _candidate_source_transcript_ref(candidate) or "",
             candidate.prompt_variant_id,
             candidate.candidate_id,
         ),
@@ -180,6 +180,7 @@ def build_review_payload(
     candidate_payloads: list[dict[str, Any]] = []
     for rank, candidate in enumerate(ranked_candidates, start=1):
         transcript = transcript_candidates.get(candidate.source_transcript_candidate_id or "")
+        provider_id = _candidate_transcript_provider_id(candidate, transcript)
         previews = _render_candidate_previews(
             blob_store=context.blob_store,
             job=context.job,
@@ -190,7 +191,7 @@ def build_review_payload(
             {
                 "rank": rank,
                 "candidate_id": candidate.candidate_id,
-                "source_transcript_candidate_id": candidate.source_transcript_candidate_id,
+                "source_transcript_candidate_id": _candidate_source_transcript_ref(candidate),
                 "model_id": candidate.model_id,
                 "prompt_variant_id": candidate.prompt_variant_id,
                 "prompt_version": candidate.prompt_version,
@@ -207,8 +208,12 @@ def build_review_payload(
                 "translation_preview_json_path": str(previews["translation_json_path"]),
                 "translation_preview_srt_path": str(previews["translation_srt_path"]),
                 "source_transcript": {
-                    "candidate_id": transcript.candidate_id if transcript is not None else None,
-                    "provider_id": transcript.provider_id if transcript is not None else None,
+                    "candidate_id": (
+                        transcript.candidate_id
+                        if transcript is not None
+                        else _candidate_source_transcript_ref(candidate)
+                    ),
+                    "provider_id": provider_id,
                     "text_preview": transcript.full_text[:400] if transcript is not None else None,
                     "transcript_preview_json_path": str(previews["transcript_json_path"])
                     if previews["transcript_json_path"] is not None
@@ -529,6 +534,24 @@ def resolve_translation_review(
             }
         )
     )
+    approved_provider_id = (
+        approved_transcript.provider_id
+        if approved_transcript is not None
+        else (
+            _candidate_transcript_provider_id(approved_candidate, approved_transcript)
+            if approved_candidate is not None
+            else None
+        )
+    )
+    approved_source_ref = (
+        approved_transcript.candidate_id
+        if approved_transcript is not None
+        else (
+            _candidate_source_transcript_ref(approved_candidate)
+            if approved_candidate is not None
+            else None
+        )
+    )
     resolution_record = HumanReviewResolutionRecord(
         run_id=run_id,
         job_id=context.job.job_id,
@@ -548,10 +571,8 @@ def resolve_translation_review(
         note=note or "",
         failure_tags=normalized_failure_tags,
         residual_failure_tags=residual_failure_tags,
-        transcript_provider_id=approved_transcript.provider_id if approved_transcript else None,
-        source_transcript_candidate_id=(
-            approved_transcript.candidate_id if approved_transcript is not None else None
-        ),
+        transcript_provider_id=approved_provider_id,
+        source_transcript_candidate_id=approved_source_ref,
         model_id=approved_candidate.model_id if approved_candidate is not None else None,
         prompt_variant_id=(
             approved_candidate.prompt_variant_id if approved_candidate is not None else None
@@ -564,7 +585,7 @@ def resolve_translation_review(
         ),
         combo_key=(
             _candidate_combo_key(context.job, approved_candidate, approved_transcript)
-            if approved_candidate is not None and approved_transcript is not None
+            if approved_candidate is not None
             else None
         ),
         source_language=context.job.source_language,
@@ -598,9 +619,7 @@ def resolve_translation_review(
             job_id=context.job.job_id,
             approved_candidate_id=approved_candidate.candidate_id if approved_candidate else None,
             final_translation_candidate_id=final_translation_candidate.candidate_id,
-            approved_source_transcript_candidate_id=(
-                approved_transcript.candidate_id if approved_transcript is not None else None
-            ),
+            approved_source_transcript_candidate_id=approved_source_ref,
             approved_by=approved_by,
             note=note or "",
             approved_at=resolved_at,
@@ -609,14 +628,16 @@ def resolve_translation_review(
             machine_review_refs=resolution_record.machine_review_refs,
         )
         write_model_artifact(runtime, approval_ref, approval_record)
-        if approved_candidate is not None and approved_transcript is not None:
+        if approved_candidate is not None and approved_provider_id is not None:
             learning_ref = transcript_approval_learning_key(context.job)
             learning_event = TranscriptApprovalLearningEvent(
                 run_id=run_id,
                 job_id=context.job.job_id,
                 approved_translation_candidate_id=final_translation_candidate.candidate_id,
-                approved_source_transcript_candidate_id=approved_transcript.candidate_id,
-                transcript_provider_id=approved_transcript.provider_id,
+                approved_source_transcript_candidate_id=(
+                    approved_source_ref or "synthesized-transcript"
+                ),
+                transcript_provider_id=approved_provider_id,
                 source_language=context.job.source_language,
                 target_language=context.job.target_language,
                 tenant_id=context.job.tenant_id,
@@ -632,7 +653,7 @@ def resolve_translation_review(
     _update_provider_quality_stats(
         store=store,
         reviewed_candidates=reviewed_candidates,
-        selected_provider_id=approved_transcript.provider_id if approved_transcript else None,
+        selected_provider_id=approved_provider_id,
         job=context.job,
         resolution_kind=resolution_kind,
         resolved_at=resolved_at,
@@ -1117,14 +1138,14 @@ def _build_review_spans(
             ):
                 entry["source_excerpt"] = span_payload["source_excerpt"]
 
-            provider_id = transcript.provider_id if transcript is not None else None
+            provider_id = _candidate_transcript_provider_id(candidate, transcript)
             transcript_excerpt = (
                 _span_text_from_segments(transcript.segments, span_id, field_name="source_text")
                 if transcript is not None
                 else None
             )
             provenance_key = (
-                candidate.source_transcript_candidate_id or "",
+                _candidate_source_transcript_ref(candidate) or "",
                 provider_id or "",
             )
             provenance_index = cast(
@@ -1133,7 +1154,7 @@ def _build_review_spans(
             )
             if provenance_key not in provenance_index:
                 provenance_payload = {
-                    "source_transcript_candidate_id": candidate.source_transcript_candidate_id,
+                    "source_transcript_candidate_id": _candidate_source_transcript_ref(candidate),
                     "transcript_provider_id": provider_id,
                     "transcript_excerpt": transcript_excerpt or _NO_OVERLAPPING_EXCERPT,
                 }
@@ -1149,7 +1170,7 @@ def _build_review_spans(
                     "model_id": candidate.model_id,
                     "prompt_variant_id": candidate.prompt_variant_id,
                     "prompt_version": candidate.prompt_version,
-                    "source_transcript_candidate_id": candidate.source_transcript_candidate_id,
+                    "source_transcript_candidate_id": _candidate_source_transcript_ref(candidate),
                     "transcript_provider_id": provider_id,
                     "target_excerpt": span_payload["target_excerpt"] or _NO_OVERLAPPING_EXCERPT,
                     "machine_preferred": candidate.candidate_id == preferred_candidate_id,
@@ -1515,7 +1536,7 @@ def _review_diff_candidate_payload(
         "rank": candidate_rank,
         "prompt_variant_id": candidate.prompt_variant_id,
         "model_id": candidate.model_id,
-        "source_transcript_candidate_id": candidate.source_transcript_candidate_id,
+        "source_transcript_candidate_id": _candidate_source_transcript_ref(candidate),
         "source_excerpt": source_excerpt,
         "target_excerpt": target_excerpt,
     }
@@ -1883,11 +1904,11 @@ def _validated_reviewed_span_decisions(
                     "end_ms": cast(int, span["end_ms"]),
                     "selected_source_transcript_candidate_id": (
                         decision.selected_source_transcript_candidate_id
-                        or candidate.source_transcript_candidate_id
+                        or _candidate_source_transcript_ref(candidate)
                     ),
                     "selected_transcript_provider_id": (
                         decision.selected_transcript_provider_id
-                        or (transcript.provider_id if transcript is not None else None)
+                        or _candidate_transcript_provider_id(candidate, transcript)
                     ),
                     "base_target_text": base_text,
                     "final_target_text": final_text,
@@ -1926,9 +1947,10 @@ def _legacy_reviewed_span_decisions(
                 start_ms=cast(int, span["start_ms"]),
                 end_ms=cast(int, span["end_ms"]),
                 selected_candidate_id=candidate_id,
-                selected_source_transcript_candidate_id=candidate.source_transcript_candidate_id,
-                selected_transcript_provider_id=(
-                    transcript.provider_id if transcript is not None else None
+                selected_source_transcript_candidate_id=_candidate_source_transcript_ref(candidate),
+                selected_transcript_provider_id=_candidate_transcript_provider_id(
+                    candidate,
+                    transcript,
                 ),
                 base_target_text=base_text,
                 final_target_text=base_text,
@@ -2099,8 +2121,11 @@ def _reviewed_candidate_contexts(
         contexts.append(
             HumanReviewedCandidateContext(
                 candidate_id=candidate.candidate_id,
-                source_transcript_candidate_id=candidate.source_transcript_candidate_id,
-                transcript_provider_id=transcript.provider_id if transcript is not None else None,
+                source_transcript_candidate_id=_candidate_source_transcript_ref(candidate),
+                transcript_provider_id=_candidate_transcript_provider_id(
+                    candidate,
+                    transcript,
+                ),
                 model_id=candidate.model_id,
                 prompt_variant_id=candidate.prompt_variant_id,
                 prompt_version=candidate.prompt_version,
@@ -2147,7 +2172,7 @@ def _candidate_combo_key(
     candidate: TranslationCandidate,
     transcript: TranscriptCandidate | None,
 ) -> str:
-    provider_id = transcript.provider_id if transcript is not None else "unknown-provider"
+    provider_id = _candidate_transcript_provider_id(candidate, transcript) or "unknown-provider"
     return "::".join(
         (
             job.source_language,
@@ -2158,6 +2183,37 @@ def _candidate_combo_key(
             candidate.prompt_version,
         )
     )
+
+
+def _candidate_source_transcript_ref(candidate: TranslationCandidate) -> str | None:
+    return (
+        candidate.source_transcript_candidate_id
+        or candidate.source_transcript_ref
+        or candidate.final_transcript_ref
+    )
+
+
+def _candidate_transcript_provider_id(
+    candidate: TranslationCandidate,
+    transcript: TranscriptCandidate | None,
+) -> str | None:
+    if transcript is not None:
+        return transcript.provider_id
+    provenance_summary = candidate.metadata.get("provenance_summary", {})
+    if isinstance(provenance_summary, dict):
+        provider_ids = provenance_summary.get("transcript_provider_ids")
+        if isinstance(provider_ids, list) and provider_ids:
+            normalized = sorted(str(item) for item in provider_ids if str(item).strip())
+            if len(normalized) == 1:
+                return normalized[0]
+            if normalized:
+                return normalized[0]
+        provider_support_summary = provenance_summary.get("provider_support_summary")
+        if isinstance(provider_support_summary, dict) and provider_support_summary:
+            return sorted(str(key) for key in provider_support_summary)[0]
+    if candidate.source_transcript_ref or candidate.final_transcript_ref:
+        return "assemblyai"
+    return None
 
 
 def _update_provider_quality_stats(

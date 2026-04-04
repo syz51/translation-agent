@@ -731,7 +731,7 @@ def test_phase_four_workflow_defers_transcript_escalation_to_translation_review(
 
     assert final_state.human_review_required is False
     assert final_state.final_translation_decision_ref is not None
-    assert decision.decision_mode == "human_review"
+    assert decision.decision_mode == "automatic_finalize"
     assert decision.human_review_required is False
     assert decision.investigation_ref == _artifact_path("investigations", "transcript.json")
     assert blob_store.exists(_artifact_path("investigations", "transcript.json"))

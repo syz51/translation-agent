@@ -16,6 +16,7 @@ from translation_agent.models import (
     MemoryQuery,
     RequestContext,
     ReviewBundle,
+    SynthesizedTranscriptArtifact,
     TranscriptCandidate,
     TranslationCandidate,
 )
@@ -153,16 +154,32 @@ def translation_candidate_key(job: JobContext, candidate_id: str) -> str:
     return job_path(job, "candidates", "translations", f"{candidate_id}.json")
 
 
+def canonical_transcript_span_key(job: JobContext) -> str:
+    return job_path(job, "artifacts", "canonical-transcript-spans.json")
+
+
+def transcript_synthesis_key(job: JobContext) -> str:
+    return job_path(job, "artifacts", "transcript-synthesis.json")
+
+
+def transcript_span_review_record_key(job: JobContext) -> str:
+    return job_path(job, "artifacts", "transcript-span-review.json")
+
+
+def final_transcript_artifact_key(job: JobContext) -> str:
+    return job_path(job, "artifacts", "final-transcript.json")
+
+
 def raw_translation_candidate_key(
     job: JobContext,
     prompt_variant_id: str,
-    source_transcript_candidate_id: str,
+    source_transcript_token: str,
 ) -> str:
     return job_path(
         job,
         "raw",
         "translation-candidates",
-        f"{prompt_variant_id}-{source_transcript_candidate_id}.json",
+        f"{prompt_variant_id}-{source_transcript_token}.json",
     )
 
 
@@ -308,9 +325,40 @@ def transcript_sort_key(candidate: TranscriptCandidate) -> tuple[int, str]:
 
 def translation_sort_key(candidate: TranslationCandidate) -> tuple[str, str, str]:
     return (
-        candidate.source_transcript_candidate_id or "",
+        candidate.source_transcript_ref
+        or candidate.source_transcript_candidate_id
+        or candidate.final_transcript_ref
+        or "",
         candidate.prompt_variant_id,
         candidate.candidate_id,
+    )
+
+
+def synthesized_transcript_as_candidate(
+    artifact: SynthesizedTranscriptArtifact,
+) -> TranscriptCandidate:
+    """Project the synthesized transcript artifact into adapter-friendly candidate shape."""
+
+    provider_ids = artifact.quality_metrics.provider_support_summary
+    return TranscriptCandidate(
+        candidate_id=artifact.artifact_id,
+        job_id=artifact.job_id,
+        provider_id="synthesized-transcript",
+        provider_request_id=None,
+        language=artifact.language,
+        segments=artifact.final_segments,
+        full_text=artifact.full_text,
+        speaker_map={},
+        timing_resolution="segment",
+        raw_payload_ref=None,
+        normalization_version=str(
+            artifact.transcript_metadata.get("normalization_version", "transcript-synthesis-v1")
+        ),
+        metadata={
+            "artifact_id": artifact.artifact_id,
+            "provider_support_summary": provider_ids,
+            "synthesis_status": artifact.status,
+        },
     )
 
 

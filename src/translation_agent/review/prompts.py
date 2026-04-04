@@ -178,6 +178,7 @@ def build_review_prompt(
     candidate_refs: tuple[str, ...],
     raw_payload_refs: tuple[str, ...],
     final_transcript_ref: str | None = None,
+    transcript_context: dict[str, object] | None = None,
 ) -> str:
     spec = _role_spec(context.stage, context.reviewer_role)
     memory_notes = [
@@ -199,6 +200,20 @@ def build_review_prompt(
     ]
     if final_transcript_ref is not None:
         lines.append(f"Final Transcript Ref: {final_transcript_ref}")
+    if transcript_context:
+        blockers = transcript_context.get("transcript_blockers")
+        if isinstance(blockers, list) and blockers:
+            blocker_summary = ", ".join(str(item) for item in blockers)
+            lines.append(f"Transcript synthesis blockers: {blocker_summary}")
+        synthesis_status = transcript_context.get("transcript_synthesis_status")
+        if isinstance(synthesis_status, str) and synthesis_status:
+            lines.append(f"Transcript Synthesis Status: {synthesis_status}")
+        decision_ref = transcript_context.get("transcript_decision_ref")
+        if isinstance(decision_ref, str) and decision_ref:
+            lines.append(f"Transcript Decision Ref: {decision_ref}")
+        investigation_ref = transcript_context.get("transcript_investigation_ref")
+        if isinstance(investigation_ref, str) and investigation_ref:
+            lines.append(f"Transcript Investigation Ref: {investigation_ref}")
     anti_patterns = [
         entry.content for entry in context.memory_bundle.procedural_memory if entry.content.strip()
     ]
