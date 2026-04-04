@@ -49,10 +49,9 @@ class DeterministicMemoryStagingBackend:
         now = datetime.now(UTC)
         dedupe_keys: list[str] = []
         semantic_writes: tuple[MemoryWrite, ...] = ()
-        if decision.winner_candidate_id is not None:
-            semantic_key = (
-                f"semantic:{source_stage}:{decision.job_id}:{decision.winner_candidate_id}"
-            )
+        primary_ref = _decision_primary_ref(decision)
+        if primary_ref is not None:
+            semantic_key = f"semantic:{source_stage}:{decision.job_id}:{primary_ref}"
             dedupe_keys.append(semantic_key)
             semantic_writes = (
                 MemoryWrite(
@@ -125,7 +124,7 @@ class DeterministicMemoryStagingBackend:
             job_id=decision.job_id,
             source_stage=source_stage,
             investigation_ref=decision.investigation_ref,
-            winner_candidate_id=decision.winner_candidate_id,
+            winner_candidate_id=primary_ref,
             decision_mode=decision.decision_mode,
             decision_confidence=decision.decision_confidence,
             disagreement_bucket=decision.disagreement_bucket,
@@ -347,8 +346,9 @@ def _semantic_summary(
     source_stage: str,
 ) -> str:
     stage_label = source_stage.replace("_", " ")
+    primary_ref = _decision_primary_ref(decision) or "no-primary-ref"
     return (
-        f"{stage_label} trusted {decision.winner_candidate_id} after "
+        f"{stage_label} trusted {primary_ref} after "
         f"{decision.decision_mode} with {decision.disagreement_bucket} disagreement."
     )
 
@@ -384,6 +384,14 @@ def _decision_episodic_summary(
     if isinstance(decision, FinalTranslationDecision) and decision.escalated:
         return "Translation adjudication escalated after unstable disagreement signals."
     return decision.rationale_summary
+
+
+def _decision_primary_ref(
+    decision: FinalTranscriptDecision | FinalTranslationDecision,
+) -> str | None:
+    if isinstance(decision, FinalTranslationDecision):
+        return decision.winner_candidate_id
+    return decision.transcript_artifact_ref
 
 
 def _report_metadata_string(metadata: dict[str, object], key: str) -> str | None:

@@ -40,7 +40,7 @@ from translation_agent.models import (
     ReviewBundle,
     Segment,
     StructuredEvidence,
-    TranscriptCandidate,
+    SynthesizedTranscriptArtifact,
     TranslationCandidate,
 )
 from translation_agent.observability import TraceEvent
@@ -1243,7 +1243,7 @@ def test_run_job_bootstraps_local_artifacts_and_postgres_record(
     }
     assert record.output_data is not None
     assert record.output_data["final_stage"] == "finalize_outputs"
-    assert len(node_executions) == 13
+    assert len(node_executions) == 16
 
 
 @pytest.mark.unit
@@ -1969,7 +1969,7 @@ def test_cli_run_job_json(migrated_postgres_dsn: str, monkeypatch, tmp_path: Pat
         node_executions = store.list_node_executions(payload["run_id"])
 
     assert record is not None
-    assert len(node_executions) == 13
+    assert len(node_executions) == 16
 
 
 @pytest.mark.unit
@@ -2399,7 +2399,7 @@ def test_approve_review_json_republishes_outputs_and_updates_provider_stats(
     approved_translation = TranslationCandidate.model_validate_json(
         blob_store.read_bytes(str(translation_path))
     )
-    approved_transcript = TranscriptCandidate.model_validate_json(
+    approved_transcript = SynthesizedTranscriptArtifact.model_validate_json(
         blob_store.read_bytes(str(transcript_path))
     )
     assert approved_translation.candidate_id.startswith("human-reviewed-")
@@ -2407,9 +2407,8 @@ def test_approve_review_json_republishes_outputs_and_updates_provider_stats(
     assert approved_translation.metadata["provenance_summary"]["translation_candidate_ids"] == [
         cast(str, first_candidate["candidate_id"])
     ]
-    assert approved_translation.final_transcript_ref is not None or (
-        approved_translation.source_transcript_candidate_id == approved_transcript.candidate_id
-    )
+    assert approved_translation.final_transcript_ref is not None
+    assert approved_transcript.status == "ready"
 
     with SQLiteOperationalStore(tmp_path / "runtime" / "state.sqlite3") as store:
         first_record = store.get_run(first.run_id)

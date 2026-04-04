@@ -134,10 +134,14 @@ class AdjudicationScorecard(ContractModel):
 
 
 class FinalTranscriptDecision(ContractModel):
-    """Deterministic transcript adjudication output."""
+    """Structured transcript-synthesis outcome recorded after adjudication."""
 
     job_id: NonEmptyStr
     winner_candidate_id: str | None = None
+    transcript_artifact_ref: str | None = None
+    canonical_span_ref: str | None = None
+    synthesis_record_ref: str | None = None
+    span_review_ref: str | None = None
     decision_mode: DecisionMode
     decision_confidence: float = Field(ge=0.0, le=1.0)
     rationale_summary: NonEmptyStr
@@ -145,6 +149,12 @@ class FinalTranscriptDecision(ContractModel):
     investigation_ref: str | None = None
     disagreement_bucket: DisagreementBucket
     adjudication_scorecard: AdjudicationScorecard
+    synthesis_status: Literal["complete", "blocked", "review_required"] = "complete"
+    canonical_span_count: int = Field(default=0, ge=0)
+    emitted_span_count: int = Field(default=0, ge=0)
+    unresolved_span_count: int = Field(default=0, ge=0)
+    provider_support_summary: dict[str, int] = Field(default_factory=dict)
+    provenance_refs: tuple[str, ...] = ()
     escalated: bool = False
     human_review_required: bool = False
 

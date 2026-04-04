@@ -33,6 +33,7 @@ from translation_agent.models import (
     RegeneratedTranslationDraft,
     Segment,
     StrongerGraderScore,
+    SynthesizedTranscriptArtifact,
     TranscriptAlignmentReport,
     TranscriptCandidate,
     TranscriptMismatchSpan,
@@ -45,6 +46,7 @@ from translation_agent.nodes.common import (
     memory_consolidation_key,
     read_model_artifact,
     select_translation_candidates,
+    synthesized_transcript_as_candidate,
     write_model_artifact,
 )
 from translation_agent.parallelism import ordered_parallel_map
@@ -494,7 +496,7 @@ def _evaluate_historical_run(
 ) -> EvaluatedRunReport:
     transcript_report = None
     if link.transcript_ref and runtime.blob_store.exists(link.transcript_ref):
-        transcript = read_model_artifact(runtime, link.transcript_ref, TranscriptCandidate)
+        transcript = _read_transcript_for_evaluation(runtime, link.transcript_ref)
         transcript_report = _evaluate_transcript(
             link=link,
             reference=reference,
@@ -515,6 +517,18 @@ def _evaluate_historical_run(
         transcript=transcript_report,
         translation=translation_report,
     )
+
+
+def _read_transcript_for_evaluation(
+    runtime: WorkflowRuntime,
+    transcript_ref: str,
+) -> TranscriptCandidate:
+    payload = runtime.blob_store.read_bytes(transcript_ref)
+    try:
+        return TranscriptCandidate.model_validate_json(payload)
+    except Exception:
+        artifact = SynthesizedTranscriptArtifact.model_validate_json(payload)
+        return synthesized_transcript_as_candidate(artifact)
 
 
 def _evaluate_transcript(
