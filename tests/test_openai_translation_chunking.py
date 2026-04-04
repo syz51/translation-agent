@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -11,6 +12,7 @@ from translation_agent.adapters import OpenAITranslationAdapter, RetryPolicy
 from translation_agent.adapters import openai_translation as openai_translation_module
 from translation_agent.adapters.common import HttpRequest, HttpResponse
 from translation_agent.models import JobContext, RequestContext, Segment, TranscriptCandidate
+from translation_agent.parallelism import GlobalConcurrencyLimiter
 from translation_agent.storage import LocalBlobStore
 
 pytestmark = pytest.mark.unit
@@ -347,7 +349,7 @@ def test_openai_translation_adapter_splits_retryable_failed_chunks(
 
     stored_payload = json.loads(blob_store.read_bytes(candidate.raw_response_ref).decode("utf-8"))
     assert stored_payload["chunking"]["planned_chunk_count"] == 1
-    assert stored_payload["chunking"]["executed_request_count"] == 3
+    assert stored_payload["chunking"]["executed_request_count"] == 2
     assert stored_payload["chunks"][0]["status"] == "split_after_retryable_failure"
     assert stored_payload["chunks"][0]["fallback_children"] == ["chunk-0.a", "chunk-0.b"]
 
@@ -426,7 +428,7 @@ def test_openai_translation_adapter_splits_partial_segment_coverage_chunks(
 
     stored_payload = json.loads(blob_store.read_bytes(candidate.raw_response_ref).decode("utf-8"))
     assert stored_payload["chunking"]["planned_chunk_count"] == 1
-    assert stored_payload["chunking"]["executed_request_count"] == 3
+    assert stored_payload["chunking"]["executed_request_count"] == 2
     assert stored_payload["chunks"][0]["status"] == "split_after_validation_failure"
     assert stored_payload["chunks"][0]["fallback_children"] == ["chunk-0.a", "chunk-0.b"]
     assert stored_payload["chunks"][0]["error"]["message"].startswith(
@@ -857,4 +859,108 @@ def test_openai_translation_adapter_preserves_chunk_order_under_parallel_complet
     assert [chunk["segment_ids"] for chunk in stored_payload["chunks"]] == [
         ["seg-1", "seg-2"],
         ["seg-3", "seg-4"],
+    ]
+
+
+def test_openai_translation_adapter_nested_calls_share_global_chunk_limit(
+    tmp_path: Path,
+) -> None:
+    class CountingTransport:
+        def __init__(self) -> None:
+            self._lock = threading.Lock()
+            self.active = 0
+            self.max_active = 0
+
+        def request(self, request: HttpRequest) -> HttpResponse:
+            with self._lock:
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+            try:
+                assert request.body is not None
+                payload = json.loads(request.body.decode("utf-8"))
+                prompt = json.loads(payload["input"][1]["content"][0]["text"])
+                segments = prompt["segments"]
+                time.sleep(0.05)
+                return _json_response(
+                    {
+                        "id": f"resp-{prompt['chunk_index']}",
+                        "output_text": json.dumps(
+                            {
+                                "full_text": " ".join(
+                                    f"Bonjour {segment['segment_id']}" for segment in segments
+                                ),
+                                "segments": [
+                                    {
+                                        "segment_id": segment["segment_id"],
+                                        "target_text": f"Bonjour {segment['segment_id']}",
+                                    }
+                                    for segment in segments
+                                ],
+                            }
+                        ),
+                    }
+                )
+            finally:
+                with self._lock:
+                    self.active -= 1
+
+    transcript = _transcript_candidate().model_copy(
+        update={
+            "segments": (
+                *_transcript_candidate().segments,
+                Segment(
+                    segment_id="seg-4",
+                    start_ms=3_000,
+                    end_ms=4_000,
+                    speaker="speaker-2",
+                    source_text="Delta source",
+                ),
+            ),
+            "full_text": "Alpha source Beta source Gamma source Delta source",
+        }
+    )
+    blob_store = LocalBlobStore(tmp_path / "blobs")
+    transport = CountingTransport()
+    adapter = OpenAITranslationAdapter(
+        api_key="test-key",  # pragma: allowlist secret
+        blob_store=blob_store,
+        transport=transport,
+        retry_policy=RetryPolicy(max_attempts=1),
+        sleep=lambda _: None,
+        max_chunk_workers=4,
+        global_concurrency_limiter=GlobalConcurrencyLimiter(4),
+        provider_io_token_cost=2,
+        max_chunk_characters=25,
+        max_chunk_segments=2,
+        context_segment_window=1,
+    )
+    results: list[tuple[str, list[str]]] = []
+    errors: list[BaseException] = []
+
+    def run_candidate(prompt_variant_id: str) -> None:
+        try:
+            candidate = adapter.generate_translation(
+                transcript,
+                prompt_variant_id,
+                _request_context(),
+            )
+        except BaseException as exc:  # pragma: no cover - test safety
+            errors.append(exc)
+            return
+        results.append((prompt_variant_id, [segment.segment_id for segment in candidate.segments]))
+
+    first = threading.Thread(target=run_candidate, args=("variant-a",))
+    second = threading.Thread(target=run_candidate, args=("variant-b",))
+    first.start()
+    second.start()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert not errors
+    assert transport.max_active == 2
+    assert sorted(results) == [
+        ("variant-a", ["seg-1", "seg-2", "seg-3", "seg-4"]),
+        ("variant-b", ["seg-1", "seg-2", "seg-3", "seg-4"]),
     ]

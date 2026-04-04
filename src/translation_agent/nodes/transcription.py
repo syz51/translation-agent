@@ -17,7 +17,11 @@ from translation_agent.nodes.common import (
     write_model_artifact,
 )
 from translation_agent.observability import TraceEvent
-from translation_agent.parallelism import ordered_parallel_map
+from translation_agent.parallelism import (
+    ParallelTaskClass,
+    concurrency_trace_attributes,
+    ordered_parallel_map,
+)
 
 
 def fanout_transcription(state: GraphState, runtime: WorkflowRuntime) -> dict[str, object]:
@@ -29,15 +33,18 @@ def fanout_transcription(state: GraphState, runtime: WorkflowRuntime) -> dict[st
     staged_refs: list[str] = []
     provider_errors: dict[str, str] = {}
     routing_facts = list(state.routing_facts)
-    max_workers = runtime.parallelism.transcription_max_workers
+    effective_stage_workers = runtime.parallelism.resolve_stage_workers(
+        runtime.parallelism.transcription_max_workers,
+        task_count=len(runtime.transcription_adapters),
+    )
     if not all(
         _supports_raw_payload_transcription(adapter) for adapter in runtime.transcription_adapters
     ):
-        max_workers = 1
+        effective_stage_workers = 1
 
     gathered = ordered_parallel_map(
         runtime.transcription_adapters,
-        max_workers=max_workers,
+        max_workers=effective_stage_workers,
         worker=lambda adapter: _transcribe_adapter(
             adapter,
             audio_artifact,
@@ -45,6 +52,7 @@ def fanout_transcription(state: GraphState, runtime: WorkflowRuntime) -> dict[st
             runtime=runtime,
             run_id=state.run_id,
             provider_total=len(runtime.transcription_adapters),
+            effective_stage_workers=effective_stage_workers,
         ),
     )
 
@@ -125,47 +133,59 @@ def _transcribe_adapter(
     runtime: WorkflowRuntime,
     run_id: str,
     provider_total: int,
+    effective_stage_workers: int,
 ):
     provider_id = adapter.provider_id
-    runtime.trace_sink.record(
-        TraceEvent(
-            run_id=run_id,
-            name="transcription.provider.started",
-            attributes={
-                "provider_id": provider_id,
-                "provider_total": provider_total,
-            },
-        )
-    )
     raw_payload: dict[str, object] | None = None
+    trace_attributes = {
+        "provider_id": provider_id,
+        "provider_total": provider_total,
+        "effective_stage_workers": effective_stage_workers,
+    }
     try:
-        if _supports_raw_payload_transcription(adapter):
-            candidate, raw_payload = adapter.transcribe_with_payload(
-                audio_artifact,
-                request_context,
+        with runtime.global_concurrency_limiter.acquire(
+            runtime.parallelism.token_cost(ParallelTaskClass.PROVIDER_IO),
+            task_class=ParallelTaskClass.PROVIDER_IO,
+        ) as acquisition:
+            trace_attributes = {
+                **trace_attributes,
+                **concurrency_trace_attributes(
+                    acquisition,
+                    effective_stage_workers=effective_stage_workers,
+                ),
+            }
+            runtime.trace_sink.record(
+                TraceEvent(
+                    run_id=run_id,
+                    name="transcription.provider.started",
+                    attributes=trace_attributes,
+                )
             )
-        else:
-            candidate = adapter.transcribe(audio_artifact, request_context)
-        runtime.trace_sink.record(
-            TraceEvent(
-                run_id=run_id,
-                name="transcription.provider.completed",
-                attributes={
-                    "provider_id": provider_id,
-                    "provider_total": provider_total,
-                    "candidate_id": candidate.candidate_id,
-                },
+            if _supports_raw_payload_transcription(adapter):
+                candidate, raw_payload = adapter.transcribe_with_payload(
+                    audio_artifact,
+                    request_context,
+                )
+            else:
+                candidate = adapter.transcribe(audio_artifact, request_context)
+            runtime.trace_sink.record(
+                TraceEvent(
+                    run_id=run_id,
+                    name="transcription.provider.completed",
+                    attributes={
+                        **trace_attributes,
+                        "candidate_id": candidate.candidate_id,
+                    },
+                )
             )
-        )
-        return candidate, raw_payload
+            return candidate, raw_payload
     except Exception as exc:
         runtime.trace_sink.record(
             TraceEvent(
                 run_id=run_id,
                 name="transcription.provider.failed",
                 attributes={
-                    "provider_id": provider_id,
-                    "provider_total": provider_total,
+                    **trace_attributes,
                     "error": str(exc),
                 },
             )

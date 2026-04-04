@@ -25,7 +25,14 @@ from translation_agent.models import (
     TranscriptCandidate,
     TranslationCandidate,
 )
-from translation_agent.parallelism import ordered_parallel_map
+from translation_agent.observability import TraceEvent, TraceSink
+from translation_agent.parallelism import (
+    GlobalConcurrencyLimiter,
+    ParallelTaskClass,
+    concurrency_trace_attributes,
+    ordered_parallel_map,
+    resolve_stage_workers,
+)
 from translation_agent.storage import BlobStore, job_path, job_scope_token
 
 DEFAULT_GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
@@ -147,7 +154,10 @@ class ChatCompletionTranslationAdapter:
         client: object | None = None,
         transport: HttpTransport | None = None,
         sleep: Callable[[float], None] | None = None,
-        max_chunk_workers: int = 4,
+        max_chunk_workers: int | None = 4,
+        global_concurrency_limiter: GlobalConcurrencyLimiter | None = None,
+        provider_io_token_cost: int = 2,
+        trace_sink: TraceSink | None = None,
         max_chunk_characters: int = DEFAULT_MAX_CHUNK_CHARACTERS,
         max_chunk_segments: int = DEFAULT_MAX_CHUNK_SEGMENTS,
         context_segment_window: int = DEFAULT_CONTEXT_SEGMENT_WINDOW,
@@ -160,7 +170,10 @@ class ChatCompletionTranslationAdapter:
         self._timeout_seconds = timeout_seconds
         self._retry_policy = retry_policy or RetryPolicy()
         self._sleep = sleep or (lambda seconds: __import__("time").sleep(seconds))
-        self._max_chunk_workers = max(1, max_chunk_workers)
+        self._max_chunk_workers = max_chunk_workers
+        self._global_concurrency_limiter = global_concurrency_limiter
+        self._provider_io_token_cost = max(1, provider_io_token_cost)
+        self._trace_sink = trace_sink
         self._max_chunk_characters = max(1, max_chunk_characters)
         self._max_chunk_segments = max(1, max_chunk_segments)
         self._context_segment_window = max(0, context_segment_window)
@@ -255,13 +268,23 @@ class ChatCompletionTranslationAdapter:
         translated_segments: list[Segment] = []
         chunk_full_texts: list[str] = []
         response_ids: list[str] = []
+        effective_stage_workers = resolve_stage_workers(
+            self._max_chunk_workers,
+            task_count=len(chunks),
+            global_max_parallel_tokens=(
+                self._global_concurrency_limiter.total_tokens
+                if self._global_concurrency_limiter is not None
+                else len(chunks)
+            ),
+        )
         chunk_results = ordered_parallel_map(
             chunks,
-            max_workers=self._max_chunk_workers,
+            max_workers=effective_stage_workers,
             worker=lambda chunk: self._translate_chunk_with_fallback(
                 chunk,
                 prompt_variant_id=prompt_variant_id,
                 request_context=request_context,
+                effective_stage_workers=effective_stage_workers,
             ),
             sort_key=lambda _input_index, chunk: (chunk.chunk_index,),
         )
@@ -291,8 +314,14 @@ class ChatCompletionTranslationAdapter:
             "chunking": {
                 "chunk_count": len(chunk_full_texts),
                 "planned_chunk_count": len(chunks),
-                "executed_request_count": len(raw_chunk_payloads),
-                "max_chunk_workers": self._max_chunk_workers,
+                "executed_request_count": len(
+                    [
+                        payload
+                        for payload in raw_chunk_payloads
+                        if payload.get("status") == "translated"
+                    ]
+                ),
+                "max_chunk_workers": effective_stage_workers,
                 "max_chunk_characters": self._max_chunk_characters,
                 "max_chunk_segments": self._max_chunk_segments,
                 "context_segment_window": self._context_segment_window,
@@ -324,6 +353,8 @@ class ChatCompletionTranslationAdapter:
         chunk: _TranslationChunk,
         prompt_variant_id: str,
         request_context: RequestContext,
+        *,
+        effective_stage_workers: int,
     ) -> dict[str, Any]:
         body = _request_body(
             provider_id=self.provider_id,
@@ -333,13 +364,92 @@ class ChatCompletionTranslationAdapter:
             request_context=request_context,
             timeout_seconds=self._timeout_seconds,
         )
+        trace_attributes = {
+            "provider_id": self.provider_id,
+            "prompt_variant_id": prompt_variant_id,
+            "chunk_key": chunk.chunk_key,
+            "chunk_index": chunk.chunk_index,
+            "effective_stage_workers": effective_stage_workers,
+        }
         try:
-            response = self._inference_client.create(**body)
+            if self._global_concurrency_limiter is None:
+                self._record_trace(
+                    request_context=request_context,
+                    name="translation.chunk.started",
+                    attributes=trace_attributes,
+                )
+                response = self._inference_client.create(**body)
+                payload = _response_payload(response, provider_id=self.provider_id)
+                if not isinstance(payload, dict):
+                    raise AdapterError(
+                        provider_id=self.provider_id,
+                        message="provider response must be a JSON object",
+                        category="malformed_response",
+                        retryable=False,
+                    )
+                self._record_trace(
+                    request_context=request_context,
+                    name="translation.chunk.completed",
+                    attributes=trace_attributes,
+                )
+                return payload
+            with self._global_concurrency_limiter.acquire(
+                self._provider_io_token_cost,
+                task_class=ParallelTaskClass.PROVIDER_IO,
+            ) as acquisition:
+                trace_attributes = {
+                    **trace_attributes,
+                    **concurrency_trace_attributes(
+                        acquisition,
+                        effective_stage_workers=effective_stage_workers,
+                    ),
+                }
+                self._record_trace(
+                    request_context=request_context,
+                    name="translation.chunk.started",
+                    attributes=trace_attributes,
+                )
+                response = self._inference_client.create(**body)
+                payload = _response_payload(response, provider_id=self.provider_id)
+                if not isinstance(payload, dict):
+                    raise AdapterError(
+                        provider_id=self.provider_id,
+                        message="provider response must be a JSON object",
+                        category="malformed_response",
+                        retryable=False,
+                    )
+                self._record_trace(
+                    request_context=request_context,
+                    name="translation.chunk.completed",
+                    attributes=trace_attributes,
+                )
+                return payload
         except AdapterError:
+            self._record_trace(
+                request_context=request_context,
+                name="translation.chunk.failed",
+                attributes=trace_attributes,
+            )
             raise
         except APIStatusError as exc:
+            self._record_trace(
+                request_context=request_context,
+                name="translation.chunk.failed",
+                attributes={
+                    **trace_attributes,
+                    "error": str(exc),
+                },
+            )
             raise _classify_provider_status_error(self.provider_id, exc) from exc
         except APITimeoutError as exc:
+            self._record_trace(
+                request_context=request_context,
+                name="translation.chunk.failed",
+                attributes={
+                    **trace_attributes,
+                    "error": str(exc),
+                },
+            )
             raise AdapterError(
                 provider_id=self.provider_id,
                 message="request timed out",
@@ -347,21 +457,20 @@ class ChatCompletionTranslationAdapter:
                 retryable=True,
             ) from exc
         except APIConnectionError as exc:
+            self._record_trace(
+                request_context=request_context,
+                name="translation.chunk.failed",
+                attributes={
+                    **trace_attributes,
+                    "error": str(exc),
+                },
+            )
             raise AdapterError(
                 provider_id=self.provider_id,
                 message=f"network failure: {exc}",
                 category="network_error",
                 retryable=True,
             ) from exc
-        payload = _response_payload(response, provider_id=self.provider_id)
-        if not isinstance(payload, dict):
-            raise AdapterError(
-                provider_id=self.provider_id,
-                message="provider response must be a JSON object",
-                category="malformed_response",
-                retryable=False,
-            )
-        return payload
 
     def _translate_chunk_with_fallback(
         self,
@@ -369,11 +478,17 @@ class ChatCompletionTranslationAdapter:
         *,
         prompt_variant_id: str,
         request_context: RequestContext,
+        effective_stage_workers: int,
     ) -> _ChunkExecutionResult:
         raw_payload: dict[str, Any] | None = None
         try:
             raw_payload = perform_with_retries(
-                lambda: self._generate_once(chunk, prompt_variant_id, request_context),
+                lambda: self._generate_once(
+                    chunk,
+                    prompt_variant_id,
+                    request_context,
+                    effective_stage_workers=effective_stage_workers,
+                ),
                 provider_id=self.provider_id,
                 retry_policy=self._retry_policy,
                 sleep=self._sleep,
@@ -398,11 +513,13 @@ class ChatCompletionTranslationAdapter:
                     left_chunk,
                     prompt_variant_id=prompt_variant_id,
                     request_context=request_context,
+                    effective_stage_workers=effective_stage_workers,
                 )
                 right_result = self._translate_chunk_with_fallback(
                     right_chunk,
                     prompt_variant_id=prompt_variant_id,
                     request_context=request_context,
+                    effective_stage_workers=effective_stage_workers,
                 )
                 fallback_record = _chunk_attempt_record(
                     chunk,
@@ -439,6 +556,23 @@ class ChatCompletionTranslationAdapter:
             segments=chunk_result.segments,
             chunk_texts=(chunk_result.full_text,),
             response_ids=response_ids,
+        )
+
+    def _record_trace(
+        self,
+        *,
+        request_context: RequestContext,
+        name: str,
+        attributes: dict[str, Any],
+    ) -> None:
+        if self._trace_sink is None:
+            return
+        self._trace_sink.record(
+            TraceEvent(
+                run_id=request_context.run_id,
+                name=name,
+                attributes=attributes,
+            )
         )
 
 

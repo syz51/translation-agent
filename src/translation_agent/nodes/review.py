@@ -34,7 +34,11 @@ from translation_agent.nodes.common import (
     write_model_artifact,
 )
 from translation_agent.observability import TraceEvent
-from translation_agent.parallelism import ordered_parallel_map
+from translation_agent.parallelism import (
+    ParallelTaskClass,
+    concurrency_trace_attributes,
+    ordered_parallel_map,
+)
 from translation_agent.review import (
     PARSER_VERSION,
     build_review_context,
@@ -198,14 +202,19 @@ def _generate_and_persist_reviews(
     runtime: WorkflowRuntime,
     tasks: tuple[_ReviewTask, ...],
 ) -> tuple[str, ...]:
+    effective_stage_workers = runtime.parallelism.resolve_stage_workers(
+        runtime.parallelism.review_max_workers,
+        task_count=len(tasks),
+    )
     gathered = ordered_parallel_map(
         tasks,
-        max_workers=runtime.parallelism.review_max_workers,
+        max_workers=effective_stage_workers,
         worker=lambda task: _build_review_bundle(
             state=state,
             runtime=runtime,
             task=task,
             bundle_total=len(tasks),
+            effective_stage_workers=effective_stage_workers,
         ),
         sort_key=lambda input_index, _task: (input_index,),
     )
@@ -225,6 +234,7 @@ def _build_review_bundle(
     runtime: WorkflowRuntime,
     task: _ReviewTask,
     bundle_total: int,
+    effective_stage_workers: int,
 ) -> ReviewBundle:
     stage = task.stage
     reviewer_role = task.reviewer_role
@@ -236,80 +246,87 @@ def _build_review_bundle(
         reviewer_role=reviewer_role,
         candidate_ids=tuple(candidate.candidate_id for candidate in candidates),
     )
-    runtime.trace_sink.record(
-        TraceEvent(
-            run_id=state.run_id,
-            name="review.bundle.started",
-            attributes={
+    try:
+        with runtime.global_concurrency_limiter.acquire(
+            runtime.parallelism.token_cost(ParallelTaskClass.LOCAL_COMPUTE),
+            task_class=ParallelTaskClass.LOCAL_COMPUTE,
+        ) as acquisition:
+            trace_attributes = {
                 "review_stage": stage,
                 "reviewer_role": reviewer_role,
                 "bundle_total": bundle_total,
-            },
-        )
-    )
-    try:
-        review_context = build_review_context(
-            run_id=state.run_id,
-            stage=stage,
-            reviewer_role=reviewer_role,
-            job=state.job,
-            candidate_ids=tuple(candidate.candidate_id for candidate in candidates),
-            memory_bundle=task.memory_bundle,
-        )
-        candidate_refs = tuple(
-            transcript_candidate_key(state.job, candidate.candidate_id)
-            if stage == TRANSCRIPT_REVIEW_STAGE
-            else translation_candidate_key(state.job, candidate.candidate_id)
-            for candidate in candidates
-        )
-        raw_payload_refs = _raw_payload_refs(stage=stage, candidates=candidates)
-        prompt_text = build_review_prompt(
-            review_context,
-            candidate_refs=candidate_refs,
-            raw_payload_refs=raw_payload_refs,
-            final_transcript_ref=(
-                transcript_candidate_key(state.job, final_transcript.candidate_id)
-                if final_transcript is not None
-                else None
-            ),
-            transcript_context=_translation_transcript_context(state, runtime)
-            if stage == TRANSLATION_REVIEW_STAGE
-            else None,
-        )
-        raw_review_text = render_reviewer_output(
-            review_context,
-            candidates=candidates,
-            prompt_text=prompt_text,
-            final_transcript=final_transcript,
-        )
-        draft = build_structured_review(
-            review_context,
-            candidates=candidates,
-            final_transcript=final_transcript,
-        )
-        parsed = parse_reviewer_output(raw_review_text)
-        _validate_rendered_review_against_draft(parsed=parsed, draft=draft)
-        review = review_bundle_from_draft(
-            review_id=review_id,
-            job_id=state.job.job_id,
-            stage=stage,
-            reviewer_role=reviewer_role,
-            raw_review_text=raw_review_text,
-            draft=draft,
-        ).model_copy(update={"parser_version": PARSER_VERSION})
-        runtime.trace_sink.record(
-            TraceEvent(
-                run_id=state.run_id,
-                name="review.bundle.completed",
-                attributes={
-                    "review_stage": stage,
-                    "reviewer_role": reviewer_role,
-                    "bundle_total": bundle_total,
-                    "review_id": review_id,
-                },
+                **concurrency_trace_attributes(
+                    acquisition,
+                    effective_stage_workers=effective_stage_workers,
+                ),
+            }
+            runtime.trace_sink.record(
+                TraceEvent(
+                    run_id=state.run_id,
+                    name="review.bundle.started",
+                    attributes=trace_attributes,
+                )
             )
-        )
-        return review
+            review_context = build_review_context(
+                run_id=state.run_id,
+                stage=stage,
+                reviewer_role=reviewer_role,
+                job=state.job,
+                candidate_ids=tuple(candidate.candidate_id for candidate in candidates),
+                memory_bundle=task.memory_bundle,
+            )
+            candidate_refs = tuple(
+                transcript_candidate_key(state.job, candidate.candidate_id)
+                if stage == TRANSCRIPT_REVIEW_STAGE
+                else translation_candidate_key(state.job, candidate.candidate_id)
+                for candidate in candidates
+            )
+            raw_payload_refs = _raw_payload_refs(stage=stage, candidates=candidates)
+            prompt_text = build_review_prompt(
+                review_context,
+                candidate_refs=candidate_refs,
+                raw_payload_refs=raw_payload_refs,
+                final_transcript_ref=(
+                    transcript_candidate_key(state.job, final_transcript.candidate_id)
+                    if final_transcript is not None
+                    else None
+                ),
+                transcript_context=_translation_transcript_context(state, runtime)
+                if stage == TRANSLATION_REVIEW_STAGE
+                else None,
+            )
+            raw_review_text = render_reviewer_output(
+                review_context,
+                candidates=candidates,
+                prompt_text=prompt_text,
+                final_transcript=final_transcript,
+            )
+            draft = build_structured_review(
+                review_context,
+                candidates=candidates,
+                final_transcript=final_transcript,
+            )
+            parsed = parse_reviewer_output(raw_review_text)
+            _validate_rendered_review_against_draft(parsed=parsed, draft=draft)
+            review = review_bundle_from_draft(
+                review_id=review_id,
+                job_id=state.job.job_id,
+                stage=stage,
+                reviewer_role=reviewer_role,
+                raw_review_text=raw_review_text,
+                draft=draft,
+            ).model_copy(update={"parser_version": PARSER_VERSION})
+            runtime.trace_sink.record(
+                TraceEvent(
+                    run_id=state.run_id,
+                    name="review.bundle.completed",
+                    attributes={
+                        **trace_attributes,
+                        "review_id": review_id,
+                    },
+                )
+            )
+            return review
     except Exception as exc:
         runtime.trace_sink.record(
             TraceEvent(
@@ -319,6 +336,7 @@ def _build_review_bundle(
                     "review_stage": stage,
                     "reviewer_role": reviewer_role,
                     "bundle_total": bundle_total,
+                    "effective_stage_workers": effective_stage_workers,
                     "error": str(exc),
                 },
             )

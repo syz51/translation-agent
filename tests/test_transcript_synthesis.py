@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
@@ -16,12 +17,14 @@ from translation_agent.models import (
     TranscriptSynthesisRecord,
     TranscriptSynthesisReview,
 )
+from translation_agent.parallelism import GlobalConcurrencyLimiter, RuntimeParallelismPolicy
 from translation_agent.transcript_synthesis import (
     blocking_failures_for_artifact,
     build_canonical_transcript_spans,
     build_span_candidates,
     materialize_synthesized_transcript,
     run_global_adjudicator,
+    run_reviewer_agent,
     run_selector_agent,
 )
 
@@ -288,6 +291,181 @@ def test_regression_window_2504_2604_preserves_missing_dialogue() -> None:
     assert "bring the radio" in record.decisions[0].output_text.lower()
 
 
+def test_live_reasoning_requests_acquire_provider_io_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class CollectingTraceSink:
+        def __init__(self) -> None:
+            self.events: list[Any] = []
+
+        def record(self, event: Any) -> None:
+            self.events.append(event)
+
+    class ResponseStub:
+        def __init__(self, payload: dict[str, object]) -> None:
+            self._payload = payload
+
+        def model_dump(self, mode: str = "json") -> dict[str, object]:
+            del mode
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(self._payload),
+                        }
+                    }
+                ]
+            }
+
+    class CompletionsStub:
+        def __init__(self, payloads: list[dict[str, object]]) -> None:
+            self._payloads = payloads
+            self.calls: list[dict[str, object]] = []
+
+        def create(self, **kwargs: Any) -> ResponseStub:
+            self.calls.append(kwargs)
+            if not self._payloads:
+                raise AssertionError("unexpected live reasoning request")
+            return ResponseStub(self._payloads.pop(0))
+
+    completions = CompletionsStub(
+        [
+            {
+                "decisions": [
+                    {
+                        "canonical_span_id": "canonical-span-0001",
+                        "decision_type": "select_provider_span",
+                        "selected_candidate_ids": ["candidate-a"],
+                        "selected_span_candidate_ids": ["canonical-span-0001--candidate-a"],
+                        "source_fragment_refs": ["candidate-a:seg-a1"],
+                        "output_text": "Take the map.",
+                        "speaker_label": "speaker-1",
+                        "start_ms": 0,
+                        "end_ms": 1_000,
+                        "rationale": "Grounded provider evidence.",
+                    }
+                ]
+            },
+            {
+                "accepted_span_ids": ["canonical-span-0001"],
+                "corrected_decisions": [],
+                "unresolved_span_ids": [],
+                "dropped_supported_span_ids": [],
+                "issues": [],
+            },
+            {
+                "decisions": [
+                    {
+                        "canonical_span_id": "canonical-span-0001",
+                        "decision_type": "select_provider_span",
+                        "selected_candidate_ids": ["candidate-a"],
+                        "selected_span_candidate_ids": ["canonical-span-0001--candidate-a"],
+                        "source_fragment_refs": ["candidate-a:seg-a1"],
+                        "output_text": "Take the map.",
+                        "speaker_label": "speaker-1",
+                        "start_ms": 0,
+                        "end_ms": 1_000,
+                        "rationale": "Grounded provider evidence.",
+                    }
+                ]
+            },
+        ]
+    )
+
+    class ReasoningClientStub:
+        def __init__(self, completions_stub: CompletionsStub) -> None:
+            self.chat = type(
+                "ChatStub",
+                (),
+                {"completions": completions_stub},
+            )()
+
+    monkeypatch.setattr(
+        "translation_agent.transcript_synthesis._reasoning_client",
+        lambda runtime: ReasoningClientStub(completions),
+    )
+
+    trace_sink = CollectingTraceSink()
+    runtime = cast(
+        WorkflowRuntime,
+        type(
+            "LiveRuntimeStub",
+            (),
+            {
+                "reasoning_profile": ReasoningProfile(
+                    provider_id="openai",
+                    model_id="gpt-5.4",
+                    base_url_source="openai-sdk-default",
+                    api_key="openai-test-key",  # pragma: allowlist secret
+                    live_adapter_enabled=True,
+                ),
+                "parallelism": RuntimeParallelismPolicy(
+                    global_max_parallel_tokens=2,
+                    provider_io_token_cost=2,
+                    local_compute_token_cost=1,
+                    transcription_max_workers=None,
+                    translation_candidate_max_workers=None,
+                    translation_chunk_max_workers=None,
+                    review_max_workers=None,
+                    reference_evaluation_max_workers=None,
+                    memory_drain_max_workers=None,
+                ),
+                "global_concurrency_limiter": GlobalConcurrencyLimiter(2),
+                "trace_sink": trace_sink,
+            },
+        )(),
+    )
+
+    spans, span_candidates = _fixture_inputs()
+    selector = run_selector_agent(
+        job=_job(),
+        run_id="run-live-reasoning",
+        runtime=runtime,
+        spans=spans,
+        span_candidates=span_candidates,
+    )
+    review = run_reviewer_agent(
+        job=_job(),
+        run_id="run-live-reasoning",
+        runtime=runtime,
+        spans=spans,
+        span_candidates=span_candidates,
+        selector_record=selector,
+    )
+    adjudicated = run_global_adjudicator(
+        job=_job(),
+        run_id="run-live-reasoning",
+        runtime=runtime,
+        spans=spans,
+        span_candidates=span_candidates,
+        selector_record=selector,
+        review=review,
+    )
+
+    assert selector.decisions[0].decision_type == "select_provider_span"
+    assert review.accepted_span_ids == ("canonical-span-0001",)
+    assert adjudicated.decisions[0].decision_type == "select_provider_span"
+    assert len(completions.calls) == 3
+
+    started_events = [event for event in trace_sink.events if event.name.endswith(".started")]
+    completed_events = [event for event in trace_sink.events if event.name.endswith(".completed")]
+    assert [event.name for event in started_events] == [
+        "transcript_synthesis.selector.started",
+        "transcript_synthesis.reviewer.started",
+        "transcript_synthesis.global_adjudicator.started",
+    ]
+    assert [event.name for event in completed_events] == [
+        "transcript_synthesis.selector.completed",
+        "transcript_synthesis.reviewer.completed",
+        "transcript_synthesis.global_adjudicator.completed",
+    ]
+    assert all(event.attributes["parallel_task_class"] == "provider_io" for event in started_events)
+    assert all(event.attributes["global_parallel_tokens_total"] == 2 for event in started_events)
+    assert all(event.attributes["global_parallel_tokens_acquired"] == 2 for event in started_events)
+    assert all(event.attributes["effective_stage_workers"] == 1 for event in started_events)
+    assert all(event.run_id == "run-live-reasoning" for event in trace_sink.events)
+
+
 def _candidate(
     candidate_id: str,
     provider_id: str,
@@ -316,6 +494,23 @@ def _candidate(
         normalization_version="test",
         metadata={"provider_rank": 0 if provider_id == "assemblyai" else 1},
     )
+
+
+def _fixture_inputs() -> tuple[tuple[CanonicalTranscriptSpan, ...], tuple[Any, ...]]:
+    candidates = (
+        _candidate(
+            "candidate-a",
+            "assemblyai",
+            (("seg-a1", 0, 1_000, "Take the map."),),
+        ),
+        _candidate(
+            "candidate-b",
+            "speechmatics",
+            (("seg-b1", 0, 1_000, "Take the map. Bring the radio."),),
+        ),
+    )
+    spans = build_canonical_transcript_spans(candidates)
+    return spans, build_span_candidates(spans, candidates)
 
 
 def _job() -> JobContext:

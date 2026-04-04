@@ -132,14 +132,19 @@ def generate_translation_candidates(
             )
         )
 
+    effective_stage_workers = runtime.parallelism.resolve_stage_workers(
+        runtime.parallelism.translation_candidate_max_workers,
+        task_count=len(task_specs),
+    )
     gathered = ordered_parallel_map(
         task_specs,
-        max_workers=runtime.parallelism.translation_candidate_max_workers,
+        max_workers=effective_stage_workers,
         worker=lambda task: _generate_translation_task(
             task,
             runtime,
             run_id=state.run_id,
             variant_total=len(task_specs),
+            effective_stage_workers=effective_stage_workers,
         ),
         sort_key=lambda input_index, _task: (input_index,),
     )
@@ -282,6 +287,7 @@ def _generate_translation_task(
     *,
     run_id: str,
     variant_total: int,
+    effective_stage_workers: int,
 ) -> tuple[TranslationCandidate, dict[str, object] | None]:
     runtime.trace_sink.record(
         TraceEvent(
@@ -291,6 +297,7 @@ def _generate_translation_task(
                 "prompt_variant_id": task.prompt_variant_id,
                 "source_transcript_ref": task.transcript_ref,
                 "variant_total": variant_total,
+                "effective_stage_workers": effective_stage_workers,
             },
         )
     )
@@ -326,6 +333,7 @@ def _generate_translation_task(
                     "prompt_variant_id": task.prompt_variant_id,
                     "source_transcript_ref": task.transcript_ref,
                     "variant_total": variant_total,
+                    "effective_stage_workers": effective_stage_workers,
                     "candidate_id": candidate.candidate_id,
                 },
             )
@@ -340,6 +348,7 @@ def _generate_translation_task(
                     "prompt_variant_id": task.prompt_variant_id,
                     "source_transcript_ref": task.transcript_ref,
                     "variant_total": variant_total,
+                    "effective_stage_workers": effective_stage_workers,
                     "error": str(exc),
                 },
             )

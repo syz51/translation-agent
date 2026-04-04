@@ -55,7 +55,7 @@ from translation_agent.models import (
     TranslationCandidate,
 )
 from translation_agent.observability import TraceSink
-from translation_agent.parallelism import RuntimeParallelismPolicy
+from translation_agent.parallelism import GlobalConcurrencyLimiter, RuntimeParallelismPolicy
 from translation_agent.storage import (
     BlobStore,
     DecisionStore,
@@ -108,6 +108,7 @@ class WorkflowRuntime:
     prompt_evolution_backend: PromptEvolutionBackend
     prompt_resolver: PromptResolver
     parallelism: RuntimeParallelismPolicy
+    global_concurrency_limiter: GlobalConcurrencyLimiter
     reasoning_profile: ReasoningProfile
     source_artifact_ref: str
     scenario: str = DEFAULT_SCENARIO
@@ -474,6 +475,7 @@ def build_phase_two_runtime(
     memory_store = _memory_store_for_runtime(run_store=run_store, blob_store=blob_store)
     resolved_decision_store = decision_store or _decision_store_for_run_store(run_store)
     resolved_memory_batch_store = memory_batch_store or _memory_batch_store_for_run_store(run_store)
+    parallelism = _default_parallelism_policy(provider_count=3)
     return WorkflowRuntime(
         blob_store=blob_store,
         run_store=run_store,
@@ -492,7 +494,8 @@ def build_phase_two_runtime(
         memory_consolidation_backend=DeterministicMemoryConsolidationBackend(memory_store),
         prompt_evolution_backend=DeterministicPromptEvolutionBackend(),
         prompt_resolver=ProposalBackedPromptResolver(run_store, blob_store),
-        parallelism=_default_parallelism_policy(provider_count=3),
+        parallelism=parallelism,
+        global_concurrency_limiter=GlobalConcurrencyLimiter(parallelism.global_max_parallel_tokens),
         reasoning_profile=_default_reasoning_profile(),
         source_artifact_ref=source_artifact_ref,
         scenario=scenario,
@@ -583,10 +586,18 @@ def build_phase_three_runtime(
         blob_store=blob_store,
         retry_policy=retry_policy,
     )
+    parallelism = _settings_parallelism_policy(
+        settings,
+        provider_count=len(transcription_adapters),
+    )
+    global_concurrency_limiter = GlobalConcurrencyLimiter(parallelism.global_max_parallel_tokens)
     translation_adapter = overrides.translation_adapter or _build_real_translation_adapter(
         settings=settings,
         blob_store=blob_store,
         retry_policy=retry_policy,
+        parallelism=parallelism,
+        global_concurrency_limiter=global_concurrency_limiter,
+        trace_sink=trace_sink,
     )
 
     memory_store = _memory_store_for_runtime(run_store=run_store, blob_store=blob_store)
@@ -606,10 +617,8 @@ def build_phase_three_runtime(
         memory_consolidation_backend=DeterministicMemoryConsolidationBackend(memory_store),
         prompt_evolution_backend=DeterministicPromptEvolutionBackend(),
         prompt_resolver=ProposalBackedPromptResolver(run_store, blob_store),
-        parallelism=_settings_parallelism_policy(
-            settings,
-            provider_count=len(transcription_adapters),
-        ),
+        parallelism=parallelism,
+        global_concurrency_limiter=global_concurrency_limiter,
         reasoning_profile=_reasoning_profile_from_settings(settings),
         source_artifact_ref=source_artifact_ref,
         scenario=scenario,
@@ -690,6 +699,9 @@ def _build_real_translation_adapter(
     settings: Settings,
     blob_store: BlobStore,
     retry_policy: RetryPolicy,
+    parallelism: RuntimeParallelismPolicy,
+    global_concurrency_limiter: GlobalConcurrencyLimiter,
+    trace_sink: TraceSink,
 ) -> TranslationAdapter:
     provider_id = settings.translation_provider
     return ChatCompletionTranslationAdapter(
@@ -702,6 +714,9 @@ def _build_real_translation_adapter(
         timeout_seconds=settings.translation_timeout_seconds,
         retry_policy=retry_policy,
         max_chunk_workers=settings.translation_chunk_max_workers,
+        global_concurrency_limiter=global_concurrency_limiter,
+        provider_io_token_cost=parallelism.provider_io_token_cost,
+        trace_sink=trace_sink,
         max_chunk_characters=settings.translation_max_chunk_characters,
         max_chunk_segments=settings.translation_max_chunk_segments,
         context_segment_window=settings.translation_context_segment_window,
@@ -740,13 +755,17 @@ def _default_reasoning_profile() -> ReasoningProfile:
 
 
 def _default_parallelism_policy(*, provider_count: int) -> RuntimeParallelismPolicy:
+    del provider_count
     return RuntimeParallelismPolicy(
-        transcription_max_workers=min(max(provider_count, 1), 4),
-        translation_candidate_max_workers=2,
-        translation_chunk_max_workers=4,
-        review_max_workers=2,
-        reference_evaluation_max_workers=4,
-        memory_drain_max_workers=2,
+        global_max_parallel_tokens=8,
+        provider_io_token_cost=2,
+        local_compute_token_cost=1,
+        transcription_max_workers=None,
+        translation_candidate_max_workers=None,
+        translation_chunk_max_workers=None,
+        review_max_workers=None,
+        reference_evaluation_max_workers=None,
+        memory_drain_max_workers=None,
     )
 
 
@@ -757,8 +776,10 @@ def _settings_parallelism_policy(
 ) -> RuntimeParallelismPolicy:
     defaults = _default_parallelism_policy(provider_count=provider_count)
     return RuntimeParallelismPolicy(
-        transcription_max_workers=settings.transcription_max_workers
-        or defaults.transcription_max_workers,
+        global_max_parallel_tokens=settings.global_parallel_tokens,
+        provider_io_token_cost=defaults.provider_io_token_cost,
+        local_compute_token_cost=defaults.local_compute_token_cost,
+        transcription_max_workers=settings.transcription_max_workers,
         translation_candidate_max_workers=settings.translation_candidate_max_workers,
         translation_chunk_max_workers=settings.translation_chunk_max_workers,
         review_max_workers=settings.review_max_workers,

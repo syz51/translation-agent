@@ -49,7 +49,12 @@ from translation_agent.nodes.common import (
     synthesized_transcript_as_candidate,
     write_model_artifact,
 )
-from translation_agent.parallelism import ordered_parallel_map
+from translation_agent.observability import TraceEvent
+from translation_agent.parallelism import (
+    ParallelTaskClass,
+    concurrency_trace_attributes,
+    ordered_parallel_map,
+)
 from translation_agent.storage import asset_path, operational_job_key
 
 _WORD_RE = re.compile(r"[A-Za-z0-9']+")
@@ -466,14 +471,20 @@ def _load_historical_runs(
             exclude_run_id=state.run_id,
         )
     )
+    effective_stage_workers = runtime.parallelism.resolve_stage_workers(
+        runtime.parallelism.reference_evaluation_max_workers,
+        task_count=len(links),
+    )
     gathered = ordered_parallel_map(
         links,
-        max_workers=runtime.parallelism.reference_evaluation_max_workers,
+        max_workers=effective_stage_workers,
         worker=lambda link: _evaluate_historical_run(
             runtime,
             link=link,
             reference=reference,
             trusted_transcript_ref=trusted_transcript_ref,
+            run_id=state.run_id,
+            effective_stage_workers=effective_stage_workers,
         ),
         sort_key=lambda input_index, _link: (input_index,),
     )
@@ -493,30 +504,79 @@ def _evaluate_historical_run(
     link: HistoricalRunLink,
     reference: ReferenceTranscript,
     trusted_transcript_ref: str,
+    run_id: str,
+    effective_stage_workers: int,
 ) -> EvaluatedRunReport:
-    transcript_report = None
-    if link.transcript_ref and runtime.blob_store.exists(link.transcript_ref):
-        transcript = _read_transcript_for_evaluation(runtime, link.transcript_ref)
-        transcript_report = _evaluate_transcript(
-            link=link,
-            reference=reference,
-            transcript=transcript,
-            trusted_transcript_ref=trusted_transcript_ref,
+    trace_attributes = {
+        "historical_run_id": link.run_id,
+        "effective_stage_workers": effective_stage_workers,
+    }
+    try:
+        with runtime.global_concurrency_limiter.acquire(
+            runtime.parallelism.token_cost(ParallelTaskClass.LOCAL_COMPUTE),
+            task_class=ParallelTaskClass.LOCAL_COMPUTE,
+        ) as acquisition:
+            trace_attributes = {
+                **trace_attributes,
+                **concurrency_trace_attributes(
+                    acquisition,
+                    effective_stage_workers=effective_stage_workers,
+                ),
+            }
+            runtime.trace_sink.record(
+                TraceEvent(
+                    run_id=run_id,
+                    name="reference_evaluation.item.started",
+                    attributes=trace_attributes,
+                )
+            )
+            transcript_report = None
+            if link.transcript_ref and runtime.blob_store.exists(link.transcript_ref):
+                transcript = _read_transcript_for_evaluation(runtime, link.transcript_ref)
+                transcript_report = _evaluate_transcript(
+                    link=link,
+                    reference=reference,
+                    transcript=transcript,
+                    trusted_transcript_ref=trusted_transcript_ref,
+                )
+            translation_report = None
+            if link.translation_ref and runtime.blob_store.exists(link.translation_ref):
+                translation = read_model_artifact(
+                    runtime,
+                    link.translation_ref,
+                    TranslationCandidate,
+                )
+                translation_report = _evaluate_translation(
+                    link=link,
+                    reference=reference,
+                    translation=translation,
+                    trusted_transcript_ref=trusted_transcript_ref,
+                )
+            report = EvaluatedRunReport(
+                run=link,
+                transcript=transcript_report,
+                translation=translation_report,
+            )
+            runtime.trace_sink.record(
+                TraceEvent(
+                    run_id=run_id,
+                    name="reference_evaluation.item.completed",
+                    attributes=trace_attributes,
+                )
+            )
+            return report
+    except Exception as exc:
+        runtime.trace_sink.record(
+            TraceEvent(
+                run_id=run_id,
+                name="reference_evaluation.item.failed",
+                attributes={
+                    **trace_attributes,
+                    "error": str(exc),
+                },
+            )
         )
-    translation_report = None
-    if link.translation_ref and runtime.blob_store.exists(link.translation_ref):
-        translation = read_model_artifact(runtime, link.translation_ref, TranslationCandidate)
-        translation_report = _evaluate_translation(
-            link=link,
-            reference=reference,
-            translation=translation,
-            trusted_transcript_ref=trusted_transcript_ref,
-        )
-    return EvaluatedRunReport(
-        run=link,
-        transcript=transcript_report,
-        translation=translation_report,
-    )
+        raise
 
 
 def _read_transcript_for_evaluation(

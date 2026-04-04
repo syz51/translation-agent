@@ -21,6 +21,7 @@ from translation_agent.models import (
 )
 from translation_agent.nodes.reference_evaluation import _load_historical_runs, _parse_srt
 from translation_agent.observability import NoOpTraceSink
+from translation_agent.parallelism import GlobalConcurrencyLimiter, RuntimeParallelismPolicy
 from translation_agent.storage import LocalBlobStore, SQLiteOperationalStore, asset_path, job_path
 
 pytestmark = pytest.mark.unit
@@ -321,6 +322,7 @@ def test_reference_evaluation_preserves_historical_link_order_under_parallel_loa
                 project_id="project-local",
                 source_language="en",
                 target_language="fr",
+                transcript_ref="runs/run-b/transcript.json",
                 created_at=datetime(2026, 4, 1, 0, 0, tzinfo=UTC),
             ),
             HistoricalRunLink(
@@ -331,6 +333,7 @@ def test_reference_evaluation_preserves_historical_link_order_under_parallel_loa
                 project_id="project-local",
                 source_language="en",
                 target_language="fr",
+                transcript_ref="runs/run-a/transcript.json",
                 created_at=datetime(2026, 4, 1, 1, 0, tzinfo=UTC),
             ),
         ]
@@ -342,8 +345,16 @@ def test_reference_evaluation_preserves_historical_link_order_under_parallel_loa
             del media_key, exclude_run_id
             return list(links)
 
-        def fake_evaluate(runtime, *, link, reference, trusted_transcript_ref):  # noqa: ANN001
-            del runtime, reference, trusted_transcript_ref
+        def fake_evaluate(
+            runtime,
+            *,
+            link,
+            reference,
+            trusted_transcript_ref,
+            run_id,
+            effective_stage_workers,
+        ):  # noqa: ANN001
+            del runtime, reference, trusted_transcript_ref, run_id, effective_stage_workers
             if link.run_id == "run-b":
                 first_started.set()
                 assert second_finished.wait(timeout=1)
@@ -392,3 +403,160 @@ def test_reference_evaluation_preserves_historical_link_order_under_parallel_loa
         run_store.close()
 
     assert [report.run.run_id for report in reports] == ["run-b", "run-a"]
+
+
+def test_reference_evaluation_blocks_then_resumes_when_global_tokens_are_exhausted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class CollectingTraceSink(NoOpTraceSink):
+        def __init__(self) -> None:
+            self.events = []
+
+        def record(self, event) -> None:  # noqa: ANN001
+            self.events.append(event)
+
+    run_store = SQLiteOperationalStore(tmp_path / "state.sqlite3")
+    try:
+        blob_store = LocalBlobStore(tmp_path / "blobs")
+        source_ref = "jobs/run-reference-budget-request.json"
+        blob_store.put_bytes(source_ref, b"{}\n")
+        trace_sink = CollectingTraceSink()
+        runtime = build_phase_two_runtime(
+            blob_store=blob_store,
+            run_store=run_store,
+            trace_sink=trace_sink,
+            source_artifact_ref=source_ref,
+            scenario="happy",
+        )
+        runtime.parallelism = RuntimeParallelismPolicy(
+            global_max_parallel_tokens=1,
+            provider_io_token_cost=2,
+            local_compute_token_cost=1,
+            transcription_max_workers=None,
+            translation_candidate_max_workers=None,
+            translation_chunk_max_workers=None,
+            review_max_workers=None,
+            reference_evaluation_max_workers=4,
+            memory_drain_max_workers=None,
+        )
+        runtime.global_concurrency_limiter = GlobalConcurrencyLimiter(1)
+        links = [
+            HistoricalRunLink(
+                run_id="run-b",
+                media_key="asset-id:asset-1",
+                job_id="job-b",
+                tenant_id="tenant-local",
+                project_id="project-local",
+                source_language="en",
+                target_language="fr",
+                transcript_ref="runs/run-b/transcript.json",
+                created_at=datetime(2026, 4, 1, 0, 0, tzinfo=UTC),
+            ),
+            HistoricalRunLink(
+                run_id="run-a",
+                media_key="asset-id:asset-1",
+                job_id="job-a",
+                tenant_id="tenant-local",
+                project_id="project-local",
+                source_language="en",
+                target_language="fr",
+                transcript_ref="runs/run-a/transcript.json",
+                created_at=datetime(2026, 4, 1, 1, 0, tzinfo=UTC),
+            ),
+        ]
+
+        first_entered = threading.Event()
+        release_first = threading.Event()
+        second_entered = threading.Event()
+        errors: list[BaseException] = []
+
+        def fake_list_historical_run_links(media_key: str, *, exclude_run_id: str | None = None):  # noqa: ANN001
+            del media_key, exclude_run_id
+            return list(links)
+
+        def fake_evaluate_transcript(*, link, reference, transcript, trusted_transcript_ref):  # noqa: ANN001
+            del reference, transcript, trusted_transcript_ref
+            if not first_entered.is_set():
+                first_entered.set()
+                assert release_first.wait(timeout=1)
+            else:
+                second_entered.set()
+            return None
+
+        monkeypatch.setattr(
+            run_store,
+            "list_historical_run_links",
+            fake_list_historical_run_links,
+        )
+        monkeypatch.setattr(runtime.blob_store, "exists", lambda ref: True)
+        monkeypatch.setattr(
+            "translation_agent.nodes.reference_evaluation._read_transcript_for_evaluation",
+            lambda runtime, transcript_ref: object(),
+        )
+        monkeypatch.setattr(
+            "translation_agent.nodes.reference_evaluation._evaluate_transcript",
+            fake_evaluate_transcript,
+        )
+
+        def run_loader() -> None:
+            try:
+                _load_historical_runs(
+                    GraphState(
+                        run_id="run-current",
+                        job=_job("job-current"),
+                        current_stage="reference_evaluation",
+                        source_video_ref="input.mp4",
+                        source_artifact_ref=source_ref,
+                    ),
+                    runtime,
+                    reference=ReferenceTranscript(
+                        reference_id="reference-current",
+                        media_key="asset-id:asset-1",
+                        asset_id="asset-1",
+                        source="reference.srt",
+                        format="srt",
+                        segments=_parse_srt(
+                            "\n".join(
+                                [
+                                    "1",
+                                    "00:00:00,000 --> 00:00:01,000",
+                                    "Hello",
+                                    "",
+                                ]
+                            )
+                        ),
+                        full_text="Hello",
+                        created_at=datetime(2026, 4, 1, 0, 0, tzinfo=UTC),
+                    ),
+                    trusted_transcript_ref=(
+                        "assets/asset-id-asset-1/references/transcript/latest.json"
+                    ),
+                )
+            except BaseException as exc:  # pragma: no cover - test safety
+                errors.append(exc)
+
+        worker = threading.Thread(target=run_loader)
+        worker.start()
+        assert first_entered.wait(timeout=1)
+        assert not second_entered.wait(timeout=0.05)
+        release_first.set()
+        worker.join(timeout=2)
+
+        assert not worker.is_alive()
+        assert not errors
+        assert second_entered.is_set()
+        started_events = [
+            event
+            for event in trace_sink.events
+            if event.name == "reference_evaluation.item.started"
+        ]
+        assert started_events
+        assert all(
+            event.attributes["parallel_task_class"] == "local_compute" for event in started_events
+        )
+        assert all(
+            event.attributes["global_parallel_tokens_total"] == 1 for event in started_events
+        )
+    finally:
+        run_store.close()
