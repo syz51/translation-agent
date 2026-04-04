@@ -1131,8 +1131,8 @@ def _live_global_decisions(
 
 def _invoke_reasoning_json(
     *,
-    runtime: WorkflowRuntime,
     run_id: str,
+    runtime: WorkflowRuntime,
     schema_name: str,
     schema: dict[str, object],
     system_prompt: str,
@@ -1146,6 +1146,14 @@ def _invoke_reasoning_json(
         "reasoning_model_id": runtime.reasoning_profile.model_id,
         **trace_attributes,
     }
+    _record_reasoning_trace_event(
+        runtime,
+        run_id=run_id,
+        event_name="transcript.reasoning.started",
+        schema_name=schema_name,
+        system_prompt_chars=len(system_prompt),
+        user_prompt_chars=len(user_prompt),
+    )
     try:
         with runtime.global_concurrency_limiter.acquire(
             runtime.parallelism.token_cost(ParallelTaskClass.PROVIDER_IO),
@@ -1186,8 +1194,17 @@ def _invoke_reasoning_json(
                 attributes={
                     **request_trace_attributes,
                     "error": str(exc),
+                    "error_type": type(exc).__name__,
                 },
             )
+        )
+        _record_reasoning_trace_event(
+            runtime,
+            run_id=run_id,
+            event_name="transcript.reasoning.failed",
+            schema_name=schema_name,
+            error_type=type(exc).__name__,
+            error=str(exc),
         )
         return {}
 
@@ -1203,6 +1220,13 @@ def _invoke_reasoning_json(
                 },
             )
         )
+        _record_reasoning_trace_event(
+            runtime,
+            run_id=run_id,
+            event_name="transcript.reasoning.parse_failed",
+            schema_name=schema_name,
+            failure_stage="payload_not_dict",
+        )
         return {}
     try:
         content = payload["choices"][0]["message"]["content"]
@@ -1217,9 +1241,16 @@ def _invoke_reasoning_json(
                     },
                 )
             )
+            _record_reasoning_trace_event(
+                runtime,
+                run_id=run_id,
+                event_name="transcript.reasoning.parse_failed",
+                schema_name=schema_name,
+                failure_stage="content_not_string",
+            )
             return {}
         parsed = json.loads(content)
-    except Exception:
+    except Exception as exc:
         runtime.trace_sink.record(
             TraceEvent(
                 run_id=run_id,
@@ -1227,8 +1258,18 @@ def _invoke_reasoning_json(
                 attributes={
                     **request_trace_attributes,
                     "error": "response content was not valid JSON",
+                    "error_type": type(exc).__name__,
                 },
             )
+        )
+        _record_reasoning_trace_event(
+            runtime,
+            run_id=run_id,
+            event_name="transcript.reasoning.parse_failed",
+            schema_name=schema_name,
+            failure_stage="content_parse_error",
+            error_type=type(exc).__name__,
+            error=str(exc),
         )
         return {}
     if not isinstance(parsed, dict):
@@ -1242,15 +1283,59 @@ def _invoke_reasoning_json(
                 },
             )
         )
+        _record_reasoning_trace_event(
+            runtime,
+            run_id=run_id,
+            event_name="transcript.reasoning.parse_failed",
+            schema_name=schema_name,
+            failure_stage="parsed_not_dict",
+        )
         return {}
+
+    choice_count = payload.get("choices")
+    response_choice_count = len(choice_count) if isinstance(choice_count, list) else 0
     runtime.trace_sink.record(
         TraceEvent(
             run_id=run_id,
             name=f"{trace_name_prefix}.completed",
-            attributes=request_trace_attributes,
+            attributes={
+                **request_trace_attributes,
+                "content_chars": len(content),
+                "response_choice_count": response_choice_count,
+            },
         )
     )
+    _record_reasoning_trace_event(
+        runtime,
+        run_id=run_id,
+        event_name="transcript.reasoning.completed",
+        schema_name=schema_name,
+        content_chars=len(content),
+        response_choice_count=response_choice_count,
+    )
     return parsed
+
+
+def _record_reasoning_trace_event(
+    runtime: WorkflowRuntime,
+    *,
+    run_id: str,
+    event_name: str,
+    schema_name: str,
+    **attributes: object,
+) -> None:
+    runtime.trace_sink.record(
+        TraceEvent(
+            run_id=run_id,
+            name=event_name,
+            attributes={
+                "schema_name": schema_name,
+                "provider_id": runtime.reasoning_profile.provider_id,
+                "model_id": runtime.reasoning_profile.model_id,
+                **attributes,
+            },
+        )
+    )
 
 
 def _normalized_decisions(

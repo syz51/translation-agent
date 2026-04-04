@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, cast
 
@@ -17,8 +17,10 @@ from translation_agent.models import (
     TranscriptSynthesisRecord,
     TranscriptSynthesisReview,
 )
+from translation_agent.observability import TraceEvent
 from translation_agent.parallelism import GlobalConcurrencyLimiter, RuntimeParallelismPolicy
 from translation_agent.transcript_synthesis import (
+    _invoke_reasoning_json,
     blocking_failures_for_artifact,
     build_canonical_transcript_spans,
     build_span_candidates,
@@ -31,17 +33,63 @@ from translation_agent.transcript_synthesis import (
 pytestmark = pytest.mark.unit
 
 
+@dataclass
+class _RecordingTraceSink:
+    events: list[TraceEvent] = field(default_factory=list)
+
+    @property
+    def path(self) -> None:
+        return None
+
+    def record(self, event: TraceEvent) -> None:
+        self.events.append(event)
+
+    def close(self) -> None:
+        return None
+
+
 @dataclass(frozen=True)
 class _RuntimeStub:
-    reasoning_profile: ReasoningProfile = ReasoningProfile(
-        provider_id="openai",
-        model_id="gpt-5.4",
-        base_url_source="openai-sdk-default",
+    reasoning_profile: ReasoningProfile
+    parallelism: RuntimeParallelismPolicy
+    global_concurrency_limiter: GlobalConcurrencyLimiter
+    trace_sink: _RecordingTraceSink
+
+
+def _runtime(
+    *,
+    trace_sink: _RecordingTraceSink | None = None,
+    live_adapter_enabled: bool = False,
+    global_max_parallel_tokens: int = 4,
+    provider_io_token_cost: int = 1,
+) -> WorkflowRuntime:
+    return cast(
+        WorkflowRuntime,
+        _RuntimeStub(
+            reasoning_profile=ReasoningProfile(
+                provider_id="openai",
+                model_id="gpt-5.4",
+                base_url_source="openai-sdk-default",
+                api_key=(
+                    "openai-test-key" if live_adapter_enabled else None
+                ),  # pragma: allowlist secret
+                live_adapter_enabled=live_adapter_enabled,
+            ),
+            parallelism=RuntimeParallelismPolicy(
+                global_max_parallel_tokens=global_max_parallel_tokens,
+                provider_io_token_cost=provider_io_token_cost,
+                local_compute_token_cost=1,
+                transcription_max_workers=None,
+                translation_candidate_max_workers=None,
+                translation_chunk_max_workers=None,
+                review_max_workers=None,
+                reference_evaluation_max_workers=None,
+                memory_drain_max_workers=None,
+            ),
+            global_concurrency_limiter=GlobalConcurrencyLimiter(global_max_parallel_tokens),
+            trace_sink=trace_sink or _RecordingTraceSink(),
+        ),
     )
-
-
-def _runtime() -> WorkflowRuntime:
-    return cast(WorkflowRuntime, _RuntimeStub())
 
 
 def test_build_canonical_transcript_spans_groups_overlapping_provider_segments() -> None:
@@ -294,14 +342,7 @@ def test_regression_window_2504_2604_preserves_missing_dialogue() -> None:
 def test_live_reasoning_requests_acquire_provider_io_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class CollectingTraceSink:
-        def __init__(self) -> None:
-            self.events: list[Any] = []
-
-        def record(self, event: Any) -> None:
-            self.events.append(event)
-
-    class ResponseStub:
+    class _Response:
         def __init__(self, payload: dict[str, object]) -> None:
             self._payload = payload
 
@@ -317,18 +358,18 @@ def test_live_reasoning_requests_acquire_provider_io_budget(
                 ]
             }
 
-    class CompletionsStub:
+    class _Completions:
         def __init__(self, payloads: list[dict[str, object]]) -> None:
             self._payloads = payloads
             self.calls: list[dict[str, object]] = []
 
-        def create(self, **kwargs: Any) -> ResponseStub:
+        def create(self, **kwargs: Any) -> _Response:
             self.calls.append(kwargs)
             if not self._payloads:
                 raise AssertionError("unexpected live reasoning request")
-            return ResponseStub(self._payloads.pop(0))
+            return _Response(self._payloads.pop(0))
 
-    completions = CompletionsStub(
+    completions = _Completions(
         [
             {
                 "decisions": [
@@ -372,48 +413,21 @@ def test_live_reasoning_requests_acquire_provider_io_budget(
         ]
     )
 
-    class ReasoningClientStub:
-        def __init__(self, completions_stub: CompletionsStub) -> None:
-            self.chat = type(
-                "ChatStub",
-                (),
-                {"completions": completions_stub},
-            )()
+    class _Client:
+        def __init__(self, completions_stub: _Completions) -> None:
+            self.chat = type("_Chat", (), {"completions": completions_stub})()
 
     monkeypatch.setattr(
         "translation_agent.transcript_synthesis._reasoning_client",
-        lambda runtime: ReasoningClientStub(completions),
+        lambda _runtime: _Client(completions),
     )
 
-    trace_sink = CollectingTraceSink()
-    runtime = cast(
-        WorkflowRuntime,
-        type(
-            "LiveRuntimeStub",
-            (),
-            {
-                "reasoning_profile": ReasoningProfile(
-                    provider_id="openai",
-                    model_id="gpt-5.4",
-                    base_url_source="openai-sdk-default",
-                    api_key="openai-test-key",  # pragma: allowlist secret
-                    live_adapter_enabled=True,
-                ),
-                "parallelism": RuntimeParallelismPolicy(
-                    global_max_parallel_tokens=2,
-                    provider_io_token_cost=2,
-                    local_compute_token_cost=1,
-                    transcription_max_workers=None,
-                    translation_candidate_max_workers=None,
-                    translation_chunk_max_workers=None,
-                    review_max_workers=None,
-                    reference_evaluation_max_workers=None,
-                    memory_drain_max_workers=None,
-                ),
-                "global_concurrency_limiter": GlobalConcurrencyLimiter(2),
-                "trace_sink": trace_sink,
-            },
-        )(),
+    trace_sink = _RecordingTraceSink()
+    runtime = _runtime(
+        trace_sink=trace_sink,
+        live_adapter_enabled=True,
+        global_max_parallel_tokens=2,
+        provider_io_token_cost=2,
     )
 
     spans, span_candidates = _fixture_inputs()
@@ -447,23 +461,195 @@ def test_live_reasoning_requests_acquire_provider_io_budget(
     assert adjudicated.decisions[0].decision_type == "select_provider_span"
     assert len(completions.calls) == 3
 
-    started_events = [event for event in trace_sink.events if event.name.endswith(".started")]
-    completed_events = [event for event in trace_sink.events if event.name.endswith(".completed")]
-    assert [event.name for event in started_events] == [
+    stage_started_events = [
+        event for event in trace_sink.events if event.name.startswith("transcript_synthesis.")
+    ]
+    assert [event.name for event in stage_started_events if event.name.endswith(".started")] == [
         "transcript_synthesis.selector.started",
         "transcript_synthesis.reviewer.started",
         "transcript_synthesis.global_adjudicator.started",
     ]
-    assert [event.name for event in completed_events] == [
+    assert [event.name for event in stage_started_events if event.name.endswith(".completed")] == [
         "transcript_synthesis.selector.completed",
         "transcript_synthesis.reviewer.completed",
         "transcript_synthesis.global_adjudicator.completed",
     ]
-    assert all(event.attributes["parallel_task_class"] == "provider_io" for event in started_events)
-    assert all(event.attributes["global_parallel_tokens_total"] == 2 for event in started_events)
-    assert all(event.attributes["global_parallel_tokens_acquired"] == 2 for event in started_events)
-    assert all(event.attributes["effective_stage_workers"] == 1 for event in started_events)
+    assert all(
+        event.attributes["parallel_task_class"] == "provider_io"
+        for event in stage_started_events
+        if event.name.endswith(".started")
+    )
+    assert all(
+        event.attributes["global_parallel_tokens_total"] == 2
+        for event in stage_started_events
+        if event.name.endswith(".started")
+    )
+    assert all(
+        event.attributes["global_parallel_tokens_acquired"] == 2
+        for event in stage_started_events
+        if event.name.endswith(".started")
+    )
+    assert all(
+        event.attributes["effective_stage_workers"] == 1
+        for event in stage_started_events
+        if event.name.endswith(".started")
+    )
     assert all(event.run_id == "run-live-reasoning" for event in trace_sink.events)
+
+    reasoning_events = [
+        event.name for event in trace_sink.events if event.name.startswith("transcript.reasoning.")
+    ]
+    assert reasoning_events == [
+        "transcript.reasoning.started",
+        "transcript.reasoning.completed",
+        "transcript.reasoning.started",
+        "transcript.reasoning.completed",
+        "transcript.reasoning.started",
+        "transcript.reasoning.completed",
+    ]
+
+
+def test_invoke_reasoning_json_records_started_and_completed_events(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+
+    class _Response:
+        def model_dump(self, mode: str = "json") -> dict[str, object]:
+            assert mode == "json"
+            content = '{"decisions": [{"canonical_span_id": "canonical-span-0001"}]}'
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": content,
+                        }
+                    }
+                ]
+            }
+
+    class _Completions:
+        def create(self, **_kwargs: object) -> _Response:
+            return _Response()
+
+    class _Client:
+        chat = type("_Chat", (), {"completions": _Completions()})()
+
+    monkeypatch.setattr(
+        "translation_agent.transcript_synthesis._reasoning_client",
+        lambda _runtime: _Client(),
+    )
+
+    result = _invoke_reasoning_json(
+        run_id="run-trace-success",
+        runtime=runtime,
+        schema_name="transcript_selector",
+        schema={"type": "object"},
+        system_prompt="system",
+        user_prompt="user",
+        trace_name_prefix="transcript_synthesis.selector",
+        trace_attributes={"canonical_span_count": 1},
+    )
+
+    assert result == {"decisions": [{"canonical_span_id": "canonical-span-0001"}]}
+    events = cast(_RecordingTraceSink, runtime.trace_sink).events
+    assert [event.name for event in events if event.name.startswith("transcript.reasoning.")] == [
+        "transcript.reasoning.started",
+        "transcript.reasoning.completed",
+    ]
+    assert [event.name for event in events if event.name.startswith("transcript_synthesis.")] == [
+        "transcript_synthesis.selector.started",
+        "transcript_synthesis.selector.completed",
+    ]
+    assert events[0].attributes["schema_name"] == "transcript_selector"
+    assert events[-1].attributes["response_choice_count"] == 1
+
+
+def test_invoke_reasoning_json_records_failed_event_on_client_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+
+    class _Completions:
+        def create(self, **_kwargs: object) -> object:
+            raise ValueError("boom")
+
+    class _Client:
+        chat = type("_Chat", (), {"completions": _Completions()})()
+
+    monkeypatch.setattr(
+        "translation_agent.transcript_synthesis._reasoning_client",
+        lambda _runtime: _Client(),
+    )
+
+    result = _invoke_reasoning_json(
+        run_id="run-trace-failed",
+        runtime=runtime,
+        schema_name="transcript_selector",
+        schema={"type": "object"},
+        system_prompt="system",
+        user_prompt="user",
+        trace_name_prefix="transcript_synthesis.selector",
+        trace_attributes={"canonical_span_count": 1},
+    )
+
+    assert result == {}
+    events = cast(_RecordingTraceSink, runtime.trace_sink).events
+    assert [event.name for event in events if event.name.startswith("transcript.reasoning.")] == [
+        "transcript.reasoning.started",
+        "transcript.reasoning.failed",
+    ]
+    assert [event.name for event in events if event.name.startswith("transcript_synthesis.")] == [
+        "transcript_synthesis.selector.started",
+        "transcript_synthesis.selector.failed",
+    ]
+    assert events[-1].attributes["error_type"] == "ValueError"
+
+
+def test_invoke_reasoning_json_records_parse_failed_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+
+    class _Response:
+        def model_dump(self, mode: str = "json") -> dict[str, object]:
+            assert mode == "json"
+            return {"choices": [{"message": {"content": "not-json"}}]}
+
+    class _Completions:
+        def create(self, **_kwargs: object) -> _Response:
+            return _Response()
+
+    class _Client:
+        chat = type("_Chat", (), {"completions": _Completions()})()
+
+    monkeypatch.setattr(
+        "translation_agent.transcript_synthesis._reasoning_client",
+        lambda _runtime: _Client(),
+    )
+
+    result = _invoke_reasoning_json(
+        run_id="run-trace-parse-failed",
+        runtime=runtime,
+        schema_name="transcript_selector",
+        schema={"type": "object"},
+        system_prompt="system",
+        user_prompt="user",
+        trace_name_prefix="transcript_synthesis.selector",
+        trace_attributes={"canonical_span_count": 1},
+    )
+
+    assert result == {}
+    events = cast(_RecordingTraceSink, runtime.trace_sink).events
+    assert [event.name for event in events if event.name.startswith("transcript.reasoning.")] == [
+        "transcript.reasoning.started",
+        "transcript.reasoning.parse_failed",
+    ]
+    assert [event.name for event in events if event.name.startswith("transcript_synthesis.")] == [
+        "transcript_synthesis.selector.started",
+        "transcript_synthesis.selector.failed",
+    ]
+    assert events[-1].attributes["failure_stage"] == "content_parse_error"
 
 
 def _candidate(
