@@ -101,6 +101,7 @@ class RunJobRequest:
     reference_transcript_source: str | None = None
     reference_transcript_format: Literal["srt"] | None = None
     reference_mode: Literal["none", "evaluate_and_regenerate"] = "none"
+    translation_variant_policy: Literal["single", "dual_experiment"] = "single"
     review_mode: Literal["auto", "always", "never"] = "auto"
 
 
@@ -257,6 +258,7 @@ def run_job(
             reference_transcript_source=normalized_reference_source,
             reference_transcript_format=reference_transcript_format,
             reference_mode=request.reference_mode,
+            translation_variant_policy=request.translation_variant_policy,
         )
         manifest_entry = blob_store.put_bytes(
             f"jobs/{run_id}-request.json",
@@ -1308,6 +1310,7 @@ def _job_context_from_run(
         ),
         reference_transcript_format=request_payload.get("reference_transcript_format"),
         reference_mode=request_payload.get("reference_mode") or "none",
+        translation_variant_policy=request_payload.get("translation_variant_policy") or "single",
     )
 
 
@@ -1782,6 +1785,7 @@ def _serialize_request(
         "reference_transcript_source": request.reference_transcript_source,
         "reference_transcript_format": _resolved_reference_transcript_format(request),
         "reference_mode": request.reference_mode,
+        "translation_variant_policy": request.translation_variant_policy,
     }
     return json.dumps(payload, indent=2, sort_keys=True) + "\n"
 

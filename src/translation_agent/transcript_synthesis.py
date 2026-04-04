@@ -1,11 +1,15 @@
-"""Deterministic span-level transcript synthesis pipeline."""
+"""Span-level transcript synthesis pipeline with optional live reasoning."""
 
 from __future__ import annotations
 
+import json
 import re
 from collections import defaultdict
 from hashlib import sha256
 from typing import TYPE_CHECKING
+
+from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAI
+from pydantic import ValidationError
 
 from translation_agent.models import (
     CanonicalTranscriptSpan,
@@ -178,13 +182,20 @@ def run_selector_agent(
 ) -> TranscriptSynthesisRecord:
     """Emit structured per-span synthesis decisions."""
 
-    decisions = tuple(
-        _selector_decision_for_span(
-            span,
-            _span_candidates_for(span.canonical_span_id, span_candidates),
+    if _should_use_live_reasoning(runtime):
+        decisions = _live_selector_decisions(
+            runtime=runtime,
+            spans=spans,
+            span_candidates=span_candidates,
         )
-        for span in spans
-    )
+    else:
+        decisions = tuple(
+            _selector_decision_for_span(
+                span,
+                _span_candidates_for(span.canonical_span_id, span_candidates),
+            )
+            for span in spans
+        )
     unresolved_span_ids = tuple(
         decision.canonical_span_id
         for decision in decisions
@@ -217,6 +228,16 @@ def run_reviewer_agent(
 ) -> TranscriptSynthesisReview:
     """Audit synthesized span decisions for grounding, coverage, timing, and provenance."""
 
+    if _should_use_live_reasoning(runtime):
+        return _live_reviewer_review(
+            job=job,
+            run_id=run_id,
+            runtime=runtime,
+            spans=spans,
+            span_candidates=span_candidates,
+            selector_record=selector_record,
+        )
+
     decision_by_span = {
         decision.canonical_span_id: decision for decision in selector_record.decisions
     }
@@ -225,7 +246,6 @@ def run_reviewer_agent(
     unresolved_span_ids: list[str] = []
     dropped_supported_span_ids: list[str] = []
     issues: list[TranscriptReviewIssue] = []
-
     for span in spans:
         supported = _span_candidates_for(span.canonical_span_id, span_candidates)
         decision = decision_by_span.get(span.canonical_span_id)
@@ -351,6 +371,33 @@ def run_global_adjudicator(
     review: TranscriptSynthesisReview,
 ) -> TranscriptSynthesisRecord:
     """Resolve remaining unresolved transcript spans or leave them blocked."""
+
+    if _should_use_live_reasoning(runtime):
+        decisions = _live_global_decisions(
+            runtime=runtime,
+            spans=spans,
+            span_candidates=span_candidates,
+            selector_record=selector_record,
+            review=review,
+        )
+        payload = {
+            "record_id": _record_id(job.job_id, "global_adjudicator", run_id),
+            "job_id": job.job_id,
+            "run_id": run_id,
+            "agent_role": "global_adjudicator",
+            "reasoning_provider": runtime.reasoning_profile.provider_id,
+            "reasoning_model_id": runtime.reasoning_profile.model_id,
+            "canonical_span_count": len(spans),
+            "decisions": decisions,
+            "unresolved_span_ids": tuple(
+                decision.canonical_span_id
+                for decision in decisions
+                if decision.decision_type == "mark_unresolved"
+            ),
+            "provider_support_summary": _provider_support_summary(span_candidates),
+            "metadata": {"base_url_source": runtime.reasoning_profile.base_url_source},
+        }
+        return TranscriptSynthesisRecord.model_validate(payload)
 
     candidate_decisions = {
         decision.canonical_span_id: decision for decision in selector_record.decisions
@@ -485,6 +532,7 @@ def materialize_synthesized_transcript(
         )
 
     quality_metrics = _quality_metrics(spans, span_candidates, final_segments, unresolved_spans)
+    blocker_tags = blocking_failures_for_artifact(quality_metrics)
     artifact = SynthesizedTranscriptArtifact(
         artifact_id=f"synth-{job.job_id}",
         job_id=job.job_id,
@@ -497,6 +545,7 @@ def materialize_synthesized_transcript(
             "reasoning_provider": selector_record.reasoning_provider,
             "reasoning_model_id": selector_record.reasoning_model_id,
             "normalization_version": "transcript-synthesis-v1",
+            "blocker_tags": list(blocker_tags),
         },
         canonical_spans=spans,
         span_candidates=span_candidates,
@@ -509,9 +558,7 @@ def materialize_synthesized_transcript(
             for segment in final_segments
             if (segment.source_text or "").strip()
         ),
-        status=(
-            "ready" if not blocking_failures_for_artifact(quality_metrics) else "review_required"
-        ),
+        status=("ready" if not blocker_tags else "blocked"),
     )
     return SynthesizedTranscriptArtifact.model_validate(artifact.model_dump(mode="json"))
 
@@ -615,7 +662,7 @@ def _global_decision_for_span(
         canonical_span_id=span.canonical_span_id,
         decision_type="mark_unresolved",
         rationale=reason,
-        conflict_reasons=("manual_transcript_review_required",),
+        conflict_reasons=("transcript_blocked",),
     )
 
 
@@ -872,3 +919,310 @@ def _segment_id_for_decision(canonical_span_id: str, decision: TranscriptSpanDec
         if ":" in first:
             return first.split(":", 1)[1]
     return canonical_span_id
+
+
+def _should_use_live_reasoning(runtime: WorkflowRuntime) -> bool:
+    profile = runtime.reasoning_profile
+    return bool(profile.live_adapter_enabled and profile.api_key and profile.model_id)
+
+
+def _reasoning_client(runtime: WorkflowRuntime) -> OpenAI:
+    profile = runtime.reasoning_profile
+    return OpenAI(
+        api_key=profile.api_key,
+        base_url=profile.base_url,
+        timeout=60.0,
+        max_retries=0,
+    )
+
+
+def _live_selector_decisions(
+    *,
+    runtime: WorkflowRuntime,
+    spans: tuple[CanonicalTranscriptSpan, ...],
+    span_candidates: tuple[TranscriptSpanCandidate, ...],
+) -> tuple[TranscriptSpanDecision, ...]:
+    response = _invoke_reasoning_json(
+        runtime=runtime,
+        schema_name="transcript_selector",
+        schema=_selector_output_schema(),
+        system_prompt=(
+            "You are the transcript selector. For each canonical transcript span, choose the best "
+            "grounded provider span, merge grounded fragments, or mark the span unresolved. "
+            "Never invent words not present in the evidence. You may reconcile slight timing drift "
+            "only within the canonical span and the supported evidence timing."
+        ),
+        user_prompt=json.dumps(
+            {
+                "spans": [_span_payload(span) for span in spans],
+                "span_candidates": [_candidate_payload(item) for item in span_candidates],
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+        ),
+    )
+    fallback_map = {
+        span.canonical_span_id: _selector_decision_for_span(
+            span,
+            _span_candidates_for(span.canonical_span_id, span_candidates),
+        )
+        for span in spans
+    }
+    return _normalized_decisions(
+        spans=spans,
+        raw_decisions=response.get("decisions"),
+        fallback_map=fallback_map,
+    )
+
+
+def _live_reviewer_review(
+    *,
+    job: JobContext,
+    run_id: str,
+    runtime: WorkflowRuntime,
+    spans: tuple[CanonicalTranscriptSpan, ...],
+    span_candidates: tuple[TranscriptSpanCandidate, ...],
+    selector_record: TranscriptSynthesisRecord,
+) -> TranscriptSynthesisReview:
+    response = _invoke_reasoning_json(
+        runtime=runtime,
+        schema_name="transcript_reviewer",
+        schema=_reviewer_output_schema(),
+        system_prompt=(
+            "You are the transcript reviewer. Audit selector decisions for grounding, timing, "
+            "coverage, and provenance. Correct only when fully grounded in the provided evidence. "
+            "Otherwise leave the span unresolved."
+        ),
+        user_prompt=json.dumps(
+            {
+                "spans": [_span_payload(span) for span in spans],
+                "span_candidates": [_candidate_payload(item) for item in span_candidates],
+                "selector_decisions": [
+                    decision.model_dump(mode="json") for decision in selector_record.decisions
+                ],
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+        ),
+    )
+    corrected_decisions = _normalized_decisions(
+        spans=spans,
+        raw_decisions=response.get("corrected_decisions"),
+        fallback_map={},
+        allow_missing=True,
+    )
+    raw_issues = response.get("issues")
+    issue_items = raw_issues if isinstance(raw_issues, list) else []
+    issues = tuple(
+        TranscriptReviewIssue.model_validate(item) for item in issue_items if isinstance(item, dict)
+    )
+    return TranscriptSynthesisReview.model_validate(
+        {
+            "review_id": _record_id(job.job_id, "reviewer", run_id),
+            "job_id": job.job_id,
+            "run_id": run_id,
+            "reasoning_provider": runtime.reasoning_profile.provider_id,
+            "reasoning_model_id": runtime.reasoning_profile.model_id,
+            "accepted_span_ids": tuple(_string_items(response.get("accepted_span_ids"))),
+            "corrected_decisions": corrected_decisions,
+            "unresolved_span_ids": tuple(_string_items(response.get("unresolved_span_ids"))),
+            "dropped_supported_span_ids": tuple(
+                _string_items(response.get("dropped_supported_span_ids"))
+            ),
+            "issues": issues,
+            "metadata": {"base_url_source": runtime.reasoning_profile.base_url_source},
+        }
+    )
+
+
+def _live_global_decisions(
+    *,
+    runtime: WorkflowRuntime,
+    spans: tuple[CanonicalTranscriptSpan, ...],
+    span_candidates: tuple[TranscriptSpanCandidate, ...],
+    selector_record: TranscriptSynthesisRecord,
+    review: TranscriptSynthesisReview,
+) -> tuple[TranscriptSpanDecision, ...]:
+    response = _invoke_reasoning_json(
+        runtime=runtime,
+        schema_name="transcript_global_adjudicator",
+        schema=_selector_output_schema(),
+        system_prompt=(
+            "You are the transcript global adjudicator. Resolve only the remaining risky or "
+            "unresolved transcript spans. Prefer grounded resolutions, slight timing "
+            "reconciliation, or bounded grounded merges. If evidence is still insufficient, "
+            "mark the span unresolved."
+        ),
+        user_prompt=json.dumps(
+            {
+                "spans": [_span_payload(span) for span in spans],
+                "span_candidates": [_candidate_payload(item) for item in span_candidates],
+                "selector_decisions": [
+                    decision.model_dump(mode="json") for decision in selector_record.decisions
+                ],
+                "review": {
+                    "accepted_span_ids": list(review.accepted_span_ids),
+                    "corrected_decisions": [
+                        decision.model_dump(mode="json") for decision in review.corrected_decisions
+                    ],
+                    "unresolved_span_ids": list(review.unresolved_span_ids),
+                    "issues": [issue.model_dump(mode="json") for issue in review.issues],
+                },
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+        ),
+    )
+    fallback_map = {}
+    for span in spans:
+        supported = _span_candidates_for(span.canonical_span_id, span_candidates)
+        existing = next(
+            (
+                decision
+                for decision in selector_record.decisions
+                if decision.canonical_span_id == span.canonical_span_id
+            ),
+            None,
+        )
+        fallback_map[span.canonical_span_id] = _global_decision_for_span(
+            span,
+            supported,
+            existing=existing,
+        )
+    return _normalized_decisions(
+        spans=spans,
+        raw_decisions=response.get("decisions"),
+        fallback_map=fallback_map,
+    )
+
+
+def _invoke_reasoning_json(
+    *,
+    runtime: WorkflowRuntime,
+    schema_name: str,
+    schema: dict[str, object],
+    system_prompt: str,
+    user_prompt: str,
+) -> dict[str, object]:
+    try:
+        response = _reasoning_client(runtime).chat.completions.create(
+            model=runtime.reasoning_profile.model_id,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": schema_name,
+                    "strict": True,
+                    "schema": schema,
+                },
+            },
+            timeout=60.0,
+        )
+    except APIConnectionError, APITimeoutError, APIStatusError, ValueError:
+        return {}
+
+    payload = response.model_dump(mode="json")
+    if not isinstance(payload, dict):
+        return {}
+    try:
+        content = payload["choices"][0]["message"]["content"]
+        if not isinstance(content, str):
+            return {}
+        parsed = json.loads(content)
+    except Exception:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _normalized_decisions(
+    *,
+    spans: tuple[CanonicalTranscriptSpan, ...],
+    raw_decisions: object,
+    fallback_map: dict[str, TranscriptSpanDecision],
+    allow_missing: bool = False,
+) -> tuple[TranscriptSpanDecision, ...]:
+    decision_map: dict[str, TranscriptSpanDecision] = {}
+    if isinstance(raw_decisions, list):
+        for item in raw_decisions:
+            if not isinstance(item, dict):
+                continue
+            try:
+                decision = TranscriptSpanDecision.model_validate(item)
+            except ValidationError:
+                continue
+            decision_map[decision.canonical_span_id] = decision
+
+    normalized: list[TranscriptSpanDecision] = []
+    for span in spans:
+        decision = decision_map.get(span.canonical_span_id)
+        if decision is not None:
+            normalized.append(decision)
+            continue
+        fallback = fallback_map.get(span.canonical_span_id)
+        if fallback is not None:
+            normalized.append(fallback)
+            continue
+        if not allow_missing:
+            normalized.append(
+                TranscriptSpanDecision(
+                    canonical_span_id=span.canonical_span_id,
+                    decision_type="mark_unresolved",
+                    rationale="Model output omitted a required span decision.",
+                )
+            )
+    return tuple(normalized)
+
+
+def _selector_output_schema() -> dict[str, object]:
+    decision_schema = TranscriptSpanDecision.model_json_schema()
+    return {
+        "type": "object",
+        "properties": {
+            "decisions": {
+                "type": "array",
+                "items": decision_schema,
+            }
+        },
+        "required": ["decisions"],
+        "additionalProperties": False,
+    }
+
+
+def _reviewer_output_schema() -> dict[str, object]:
+    decision_schema = TranscriptSpanDecision.model_json_schema()
+    issue_schema = TranscriptReviewIssue.model_json_schema()
+    return {
+        "type": "object",
+        "properties": {
+            "accepted_span_ids": {"type": "array", "items": {"type": "string"}},
+            "corrected_decisions": {"type": "array", "items": decision_schema},
+            "unresolved_span_ids": {"type": "array", "items": {"type": "string"}},
+            "dropped_supported_span_ids": {"type": "array", "items": {"type": "string"}},
+            "issues": {"type": "array", "items": issue_schema},
+        },
+        "required": [
+            "accepted_span_ids",
+            "corrected_decisions",
+            "unresolved_span_ids",
+            "dropped_supported_span_ids",
+            "issues",
+        ],
+        "additionalProperties": False,
+    }
+
+
+def _span_payload(span: CanonicalTranscriptSpan) -> dict[str, object]:
+    return span.model_dump(mode="json")
+
+
+def _candidate_payload(candidate: TranscriptSpanCandidate) -> dict[str, object]:
+    return candidate.model_dump(mode="json")
+
+
+def _string_items(value: object) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        return ()
+    return tuple(str(item) for item in value if str(item).strip())

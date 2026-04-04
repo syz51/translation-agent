@@ -253,7 +253,7 @@ def test_materialized_transcript_blocks_when_supported_span_stays_unresolved() -
         global_record=unresolved_record,
     )
 
-    assert artifact.status == "review_required"
+    assert artifact.status == "blocked"
     assert artifact.quality_metrics.unresolved_span_count == 1
     assert blocking_failures_for_artifact(artifact.quality_metrics) == (
         "unresolved_supported_spans",

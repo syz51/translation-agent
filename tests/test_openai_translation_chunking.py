@@ -101,10 +101,18 @@ def _transcript_candidate() -> TranscriptCandidate:
 
 def test_chunk_transcript_respects_limits_and_context() -> None:
     transcript = _transcript_candidate()
+    exact_two_segment_budget = openai_translation_module._estimated_user_prompt_size(
+        chunk_index=0,
+        segments=transcript.segments[:2],
+        transcript_segments=transcript.segments,
+        start_index=0,
+        end_index=2,
+        context_segment_window=1,
+    )
 
     chunks = openai_translation_module._chunk_transcript(
         transcript,
-        max_chunk_characters=25,
+        max_chunk_characters=exact_two_segment_budget,
         max_chunk_segments=2,
         context_segment_window=1,
     )
@@ -123,6 +131,14 @@ def test_openai_translation_adapter_chunks_requests_and_aggregates_results(
 ) -> None:
     blob_store = LocalBlobStore(tmp_path / "blobs")
     transcript = _transcript_candidate()
+    exact_two_segment_budget = openai_translation_module._estimated_user_prompt_size(
+        chunk_index=0,
+        segments=transcript.segments[:2],
+        transcript_segments=transcript.segments,
+        start_index=0,
+        end_index=2,
+        context_segment_window=1,
+    )
     transport = SequencedTransport(
         [
             _json_response(
@@ -160,7 +176,7 @@ def test_openai_translation_adapter_chunks_requests_and_aggregates_results(
         transport=transport,
         retry_policy=RetryPolicy(max_attempts=1),
         sleep=lambda _: None,
-        max_chunk_characters=25,
+        max_chunk_characters=exact_two_segment_budget,
         max_chunk_segments=2,
         context_segment_window=1,
     )
@@ -183,11 +199,8 @@ def test_openai_translation_adapter_chunks_requests_and_aggregates_results(
     first_request = json.loads(transport.requests[0].body.decode("utf-8"))
     first_prompt = json.loads(first_request["input"][1]["content"][0]["text"])
     assert first_request["text"]["format"]["type"] == "json_schema"
-    assert [segment["segment_id"] for segment in first_prompt["chunk"]["segments"]] == [
-        "seg-1",
-        "seg-2",
-    ]
-    assert "Gamma source" not in first_prompt["chunk"]["full_text"]
+    assert [segment["segment_id"] for segment in first_prompt["segments"]] == ["seg-1", "seg-2"]
+    assert "full_text" not in first_prompt
     assert first_prompt["context_after"] == ["Gamma source"]
 
     stored_payload = json.loads(blob_store.read_bytes(candidate.raw_response_ref).decode("utf-8"))
@@ -235,7 +248,7 @@ def test_gemini_translation_adapter_uses_chat_completions_endpoint(
         transport=transport,
         retry_policy=RetryPolicy(max_attempts=1),
         sleep=lambda _: None,
-        max_chunk_characters=200,
+        max_chunk_characters=10_000,
         max_chunk_segments=10,
     )
 
@@ -315,7 +328,7 @@ def test_openai_translation_adapter_splits_retryable_failed_chunks(
         transport=transport,
         retry_policy=RetryPolicy(max_attempts=1),
         sleep=lambda _: None,
-        max_chunk_characters=200,
+        max_chunk_characters=10_000,
         max_chunk_segments=10,
         context_segment_window=1,
     )
@@ -334,7 +347,7 @@ def test_openai_translation_adapter_splits_retryable_failed_chunks(
 
     stored_payload = json.loads(blob_store.read_bytes(candidate.raw_response_ref).decode("utf-8"))
     assert stored_payload["chunking"]["planned_chunk_count"] == 1
-    assert stored_payload["chunking"]["executed_request_count"] == 2
+    assert stored_payload["chunking"]["executed_request_count"] == 3
     assert stored_payload["chunks"][0]["status"] == "split_after_retryable_failure"
     assert stored_payload["chunks"][0]["fallback_children"] == ["chunk-0.a", "chunk-0.b"]
 
@@ -394,7 +407,7 @@ def test_openai_translation_adapter_splits_partial_segment_coverage_chunks(
         transport=transport,
         retry_policy=RetryPolicy(max_attempts=1),
         sleep=lambda _: None,
-        max_chunk_characters=200,
+        max_chunk_characters=10_000,
         max_chunk_segments=10,
         context_segment_window=1,
     )
@@ -413,7 +426,7 @@ def test_openai_translation_adapter_splits_partial_segment_coverage_chunks(
 
     stored_payload = json.loads(blob_store.read_bytes(candidate.raw_response_ref).decode("utf-8"))
     assert stored_payload["chunking"]["planned_chunk_count"] == 1
-    assert stored_payload["chunking"]["executed_request_count"] == 2
+    assert stored_payload["chunking"]["executed_request_count"] == 3
     assert stored_payload["chunks"][0]["status"] == "split_after_validation_failure"
     assert stored_payload["chunks"][0]["fallback_children"] == ["chunk-0.a", "chunk-0.b"]
     assert stored_payload["chunks"][0]["error"]["message"].startswith(
@@ -480,7 +493,7 @@ def test_openai_translation_adapter_splits_implausibly_long_segment_translations
         transport=transport,
         retry_policy=RetryPolicy(max_attempts=1),
         sleep=lambda _: None,
-        max_chunk_characters=200,
+        max_chunk_characters=10_000,
         max_chunk_segments=10,
         context_segment_window=1,
     )
@@ -600,7 +613,7 @@ def test_openai_translation_adapter_splits_segments_that_duplicate_later_text(
         transport=transport,
         retry_policy=RetryPolicy(max_attempts=1),
         sleep=lambda _: None,
-        max_chunk_characters=200,
+        max_chunk_characters=10_000,
         max_chunk_segments=10,
         context_segment_window=1,
     )
@@ -624,6 +637,114 @@ def test_openai_translation_adapter_splits_segments_that_duplicate_later_text(
     )
 
 
+def test_chunk_transcript_uses_serialized_prompt_size_estimator() -> None:
+    transcript = _transcript_candidate()
+    exact_two_segment_budget = openai_translation_module._estimated_user_prompt_size(
+        chunk_index=0,
+        segments=transcript.segments[:2],
+        transcript_segments=transcript.segments,
+        start_index=0,
+        end_index=2,
+        context_segment_window=1,
+    )
+
+    chunks_at_budget = openai_translation_module._chunk_transcript(
+        transcript,
+        max_chunk_characters=exact_two_segment_budget,
+        max_chunk_segments=10,
+        context_segment_window=1,
+    )
+    chunks_below_budget = openai_translation_module._chunk_transcript(
+        transcript,
+        max_chunk_characters=exact_two_segment_budget - 1,
+        max_chunk_segments=10,
+        context_segment_window=1,
+    )
+
+    assert [segment.segment_id for segment in chunks_at_budget[0].segments] == ["seg-1", "seg-2"]
+    assert [segment.segment_id for segment in chunks_below_budget[0].segments] == ["seg-1"]
+
+
+def test_openai_translation_adapter_does_not_split_children_twice(
+    tmp_path: Path,
+) -> None:
+    blob_store = LocalBlobStore(tmp_path / "blobs")
+    transcript = _transcript_candidate().model_copy(
+        update={
+            "segments": (
+                *_transcript_candidate().segments,
+                Segment(
+                    segment_id="seg-4",
+                    start_ms=3_000,
+                    end_ms=4_000,
+                    speaker="speaker-2",
+                    source_text="Delta source",
+                ),
+            ),
+            "full_text": "Alpha source Beta source Gamma source Delta source",
+        }
+    )
+    transport = SequencedTransport(
+        [
+            _json_response(
+                {
+                    "id": "resp-parent",
+                    "output_text": json.dumps(
+                        {
+                            "full_text": "Bonjour alpha",
+                            "segments": [
+                                {"segment_id": "seg-1", "target_text": "Bonjour alpha"},
+                            ],
+                        }
+                    ),
+                }
+            ),
+            _json_response(
+                {
+                    "id": "resp-left",
+                    "output_text": json.dumps(
+                        {
+                            "full_text": "Bonjour alpha Bonjour beta",
+                            "segments": [
+                                {"segment_id": "seg-1", "target_text": "Bonjour alpha"},
+                                {"segment_id": "seg-2", "target_text": "Bonjour beta"},
+                            ],
+                        }
+                    ),
+                }
+            ),
+            _json_response(
+                {
+                    "id": "resp-right",
+                    "output_text": json.dumps(
+                        {
+                            "full_text": "Bonjour gamma",
+                            "segments": [
+                                {"segment_id": "seg-3", "target_text": "Bonjour gamma"},
+                            ],
+                        }
+                    ),
+                }
+            ),
+        ]
+    )
+    adapter = OpenAITranslationAdapter(
+        api_key="test-key",  # pragma: allowlist secret
+        blob_store=blob_store,
+        transport=transport,
+        retry_policy=RetryPolicy(max_attempts=1),
+        sleep=lambda _: None,
+        max_chunk_characters=10_000,
+        max_chunk_segments=10,
+        context_segment_window=1,
+    )
+
+    with pytest.raises(Exception, match="missing segment translations"):
+        adapter.generate_translation(transcript, "variant-a", _request_context())
+
+    assert len(transport.requests) == 3
+
+
 def test_openai_translation_adapter_preserves_chunk_order_under_parallel_completion(
     tmp_path: Path,
 ) -> None:
@@ -638,7 +759,7 @@ def test_openai_translation_adapter_preserves_chunk_order_under_parallel_complet
             assert request.body is not None
             payload = json.loads(request.body.decode("utf-8"))
             prompt = json.loads(payload["input"][1]["content"][0]["text"])
-            chunk_index = int(prompt["chunk"]["chunk_index"])
+            chunk_index = int(prompt["chunk_index"])
             if chunk_index == 0:
                 self._chunk_zero_started.set()
                 assert self._chunk_one_finished.wait(timeout=1)
@@ -690,6 +811,24 @@ def test_openai_translation_adapter_preserves_chunk_order_under_parallel_complet
         }
     )
     transport = CoordinatedTransport()
+    exact_two_segment_budget = max(
+        openai_translation_module._estimated_user_prompt_size(
+            chunk_index=0,
+            segments=transcript.segments[:2],
+            transcript_segments=transcript.segments,
+            start_index=0,
+            end_index=2,
+            context_segment_window=1,
+        ),
+        openai_translation_module._estimated_user_prompt_size(
+            chunk_index=1,
+            segments=transcript.segments[2:],
+            transcript_segments=transcript.segments,
+            start_index=2,
+            end_index=4,
+            context_segment_window=1,
+        ),
+    )
     adapter = OpenAITranslationAdapter(
         api_key="test-key",  # pragma: allowlist secret
         blob_store=blob_store,
@@ -697,7 +836,7 @@ def test_openai_translation_adapter_preserves_chunk_order_under_parallel_complet
         retry_policy=RetryPolicy(max_attempts=1),
         sleep=lambda _: None,
         max_chunk_workers=2,
-        max_chunk_characters=25,
+        max_chunk_characters=exact_two_segment_budget,
         max_chunk_segments=2,
         context_segment_window=1,
     )

@@ -77,6 +77,8 @@ class ReasoningProfile:
     provider_id: str
     model_id: str
     base_url_source: str
+    api_key: str | None = None
+    base_url: str | None = None
     live_adapter_enabled: bool = False
 
     def as_metadata(self) -> dict[str, object]:
@@ -715,10 +717,17 @@ def _required_llm_provider_setting(settings: Settings, provider_id: LlmProviderI
 
 
 def _reasoning_profile_from_settings(settings: Settings) -> ReasoningProfile:
+    provider_id = settings.reasoning_provider
     return ReasoningProfile(
-        provider_id=settings.reasoning_provider,
+        provider_id=provider_id,
         model_id=settings.reasoning_model_id,
-        base_url_source=llm_provider_base_url_source(settings, settings.reasoning_provider),
+        base_url_source=llm_provider_base_url_source(settings, provider_id),
+        api_key=llm_provider_api_key(settings, provider_id),
+        base_url=llm_provider_base_url(settings, provider_id),
+        live_adapter_enabled=(
+            settings.adapter_mode == "real"
+            and llm_provider_api_key(settings, provider_id) is not None
+        ),
     )
 
 

@@ -153,6 +153,7 @@ class FinalTranscriptDecision(ContractModel):
     canonical_span_count: int = Field(default=0, ge=0)
     emitted_span_count: int = Field(default=0, ge=0)
     unresolved_span_count: int = Field(default=0, ge=0)
+    blocker_tags: tuple[str, ...] = ()
     provider_support_summary: dict[str, int] = Field(default_factory=dict)
     provenance_refs: tuple[str, ...] = ()
     escalated: bool = False

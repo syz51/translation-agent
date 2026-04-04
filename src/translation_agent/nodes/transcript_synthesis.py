@@ -187,7 +187,7 @@ def materialize_synthesized_transcript_node(
     )
     artifact_ref = write_model_artifact(runtime, final_transcript_artifact_key(state.job), artifact)
     blocking_failures = blocking_failures_for_artifact(artifact.quality_metrics)
-    review_required = bool(blocking_failures)
+    blocked = bool(blocking_failures)
     primary_candidate_id = _primary_transcript_candidate_id(artifact)
     investigation_ref = write_model_artifact(
         runtime,
@@ -200,7 +200,7 @@ def materialize_synthesized_transcript_node(
             "synthesis_record_ref": state.final_transcript_synthesis_ref,
             "span_review_ref": state.transcript_span_review_ref,
             "transcript_artifact_ref": artifact_ref,
-            "synthesis_status": "review_required" if review_required else "complete",
+            "synthesis_status": "blocked" if blocked else "complete",
             "unresolved_span_count": artifact.quality_metrics.unresolved_span_count,
             "unresolved_span_ids": list(global_record.unresolved_span_ids),
             "blocking_failures": blocking_failures,
@@ -214,11 +214,12 @@ def materialize_synthesized_transcript_node(
         canonical_span_ref=state.canonical_transcript_span_ref,
         synthesis_record_ref=state.final_transcript_synthesis_ref,
         span_review_ref=state.transcript_span_review_ref,
-        decision_mode="human_review" if review_required else "automatic_finalize",
-        decision_confidence=0.0 if review_required else 0.88,
+        decision_mode="conflict_investigation" if blocked else "automatic_finalize",
+        decision_confidence=0.42 if blocked else 0.88,
         rationale_summary=(
-            "Synthesized transcript blocked pending transcript-span review."
-            if review_required
+            "Synthesized transcript completed with transcript blockers that downstream translation "
+            "must inspect."
+            if blocked
             else "Synthesized transcript passed span selection, review, and adjudication."
         ),
         review_refs=(
@@ -227,16 +228,17 @@ def materialize_synthesized_transcript_node(
             else ()
         ),
         investigation_ref=investigation_ref,
-        disagreement_bucket="unresolved" if review_required else "low",
+        disagreement_bucket="unresolved" if blocked else "low",
         adjudication_scorecard=_transcript_scorecard(artifact),
-        synthesis_status="review_required" if review_required else "complete",
+        synthesis_status="blocked" if blocked else "complete",
         canonical_span_count=artifact.quality_metrics.canonical_span_count,
         emitted_span_count=artifact.quality_metrics.emitted_span_count,
         unresolved_span_count=artifact.quality_metrics.unresolved_span_count,
+        blocker_tags=blocking_failures,
         provider_support_summary=artifact.quality_metrics.provider_support_summary,
         provenance_refs=(artifact_ref,),
-        escalated=review_required,
-        human_review_required=review_required,
+        escalated=blocked,
+        human_review_required=False,
     )
     runtime.decision_store.save_transcript_decision(
         decision,
@@ -250,8 +252,8 @@ def materialize_synthesized_transcript_node(
         "final_transcript_decision_ref": decision_ref,
         "transcript_unresolved_span_count": artifact.quality_metrics.unresolved_span_count,
         "pending_memory_source_stage": "transcript_adjudication",
-        "human_review_required": review_required,
-        "review_required_stage": "transcript" if review_required else None,
+        "human_review_required": False,
+        "review_required_stage": None,
         "routing_facts": state.routing_facts
         + tuple(
             RoutingFact(

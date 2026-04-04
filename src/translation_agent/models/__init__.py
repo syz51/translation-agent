@@ -34,6 +34,7 @@ from .jobs import (
     ReferenceTranscriptFormat,
     RequestContext,
     RoutingContext,
+    TranslationVariantPolicy,
 )
 from .memory import (
     MemoryBundle,
@@ -158,4 +159,5 @@ __all__ = [
     "TranslationFeedbackStats",
     "TranslationScore",
     "TranslationCandidate",
+    "TranslationVariantPolicy",
 ]

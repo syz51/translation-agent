@@ -644,8 +644,10 @@ def test_real_mode_assemblyai_only_workflow_stays_on_single_candidate_path_regre
 
     assert len(final_state.transcript_candidate_ids) == 1
     assert decision.decision_mode == "automatic_finalize"
-    assert decision.escalated is True
+    assert decision.escalated is False
     assert decision.human_review_required is False
+    assert decision.synthesis_status == "complete"
+    assert decision.blocker_tags == ()
     assert decision.investigation_ref == job_path(job, "investigations", "transcript.json")
     assert blob_store.exists(job_path(job, "published", "transcript.json"))
     assert blob_store.exists(job_path(job, "published", "translation.json"))
@@ -852,7 +854,9 @@ def test_replay_translation_failure_manifest_is_stable_regression(tmp_path: Path
 def test_replay_adjudication_uses_persisted_candidates_reviews_and_memory_refs(
     tmp_path: Path,
 ) -> None:
-    job = _job_context(job_id="job-replay-adjudication")
+    job = _job_context(job_id="job-replay-adjudication").model_copy(
+        update={"translation_variant_policy": "dual_experiment"}
+    )
     final_state, blob_store = _run_workflow(
         tmp_path,
         run_id="run-replay-adjudication",
@@ -900,7 +904,9 @@ def test_replay_adjudication_uses_persisted_candidates_reviews_and_memory_refs(
     assert replayed_decision["adjudication_scorecard"] == stored_decision["adjudication_scorecard"]
 
 
-def test_replay_adjudication_supports_transcript_stage_regression(tmp_path: Path) -> None:
+def test_transcript_synthesis_persists_inspectable_decision_refs_regression(
+    tmp_path: Path,
+) -> None:
     job = _job_context(job_id="job-replay-transcript")
     final_state, blob_store = _run_workflow(
         tmp_path,
@@ -908,45 +914,27 @@ def test_replay_adjudication_supports_transcript_stage_regression(tmp_path: Path
         scenario="happy",
         job=job,
     )
-    runtime = build_phase_two_runtime(
-        blob_store=blob_store,
-        run_store=InMemoryRunStore(),
-        trace_sink=NoOpTraceSink(),
-        source_artifact_ref=f"jobs/{final_state.run_id}-request.json",
-        scenario="happy",
+    decision = FinalTranscriptDecision.model_validate_json(
+        blob_store.read_bytes(job_path(job, "decisions", "transcript.json"))
     )
+    investigation = _load_json(blob_store, job_path(job, "investigations", "transcript.json"))
+    artifact = _load_json(blob_store, job_path(job, "artifacts", "final-transcript.json"))
 
-    replayed = replay_adjudication(
-        runtime,
-        ReplayAdjudicationRequest(
-            run_id=final_state.run_id,
-            job=job,
-            stage="transcript",
-            candidate_refs=tuple(
-                job_path(job, "candidates", "transcripts", f"{candidate_id}.json")
-                for candidate_id in final_state.transcript_candidate_ids
-            ),
-            review_refs=tuple(
-                job_path(job, "reviews", "transcript", f"{review_id}.json")
-                for review_id in final_state.transcript_review_ids
-            ),
-            memory_ref=next(
-                fact.source_ref
-                for fact in final_state.routing_facts
-                if fact.fact_type == "adjudication_memory_bundle"
-                and fact.stage == "adjudicate_transcript"
-                and fact.source_ref is not None
-            ),
-            content_risk_class=content_risk_class_for_scenario("happy"),
-        ),
+    assert final_state.final_transcript_decision_ref == job_path(
+        job, "decisions", "transcript.json"
     )
-
-    assert replayed.decision.decision_mode == "automatic_finalize"
-    assert replayed.decision.winner_candidate_id == final_state.final_transcript_candidate_id
+    assert final_state.final_transcript_ref == job_path(job, "artifacts", "final-transcript.json")
+    assert decision.decision_mode == "automatic_finalize"
+    assert decision.winner_candidate_id == final_state.final_transcript_candidate_id
+    assert decision.transcript_artifact_ref == final_state.final_transcript_ref
+    assert investigation["synthesis_status"] == "complete"
+    assert artifact["status"] == "ready"
 
 
 def test_replay_adjudication_preserves_timeout_escalation_regression(tmp_path: Path) -> None:
-    job = _job_context(job_id="job-replay-timeout")
+    job = _job_context(job_id="job-replay-timeout").model_copy(
+        update={"translation_variant_policy": "dual_experiment"}
+    )
     final_state, blob_store = _run_workflow(
         tmp_path,
         run_id="run-replay-timeout",
@@ -992,7 +980,9 @@ def test_replay_adjudication_preserves_timeout_escalation_regression(tmp_path: P
 
 
 def test_replay_adjudication_ignores_missing_timeout_artifact_regression(tmp_path: Path) -> None:
-    job = _job_context(job_id="job-replay-missing-timeout")
+    job = _job_context(job_id="job-replay-missing-timeout").model_copy(
+        update={"translation_variant_policy": "dual_experiment"}
+    )
     final_state, blob_store = _run_workflow(
         tmp_path,
         run_id="run-replay-missing-timeout",

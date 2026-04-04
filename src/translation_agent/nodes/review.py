@@ -8,6 +8,7 @@ from hashlib import sha256
 from translation_agent.graph.runtime import WorkflowRuntime
 from translation_agent.graph.state import GraphState, RoutingFact
 from translation_agent.models import (
+    FinalTranscriptDecision,
     MemoryBundle,
     ReviewBundle,
     SynthesizedTranscriptArtifact,
@@ -25,6 +26,8 @@ from translation_agent.nodes.common import (
     select_translation_candidates,
     synthesized_transcript_as_candidate,
     transcript_candidate_key,
+    transcript_decision_key,
+    transcript_investigation_key,
     transcript_review_key,
     translation_candidate_key,
     translation_review_key,
@@ -269,6 +272,9 @@ def _build_review_bundle(
                 if final_transcript is not None
                 else None
             ),
+            transcript_context=_translation_transcript_context(state, runtime)
+            if stage == TRANSLATION_REVIEW_STAGE
+            else None,
         )
         raw_review_text = render_reviewer_output(
             review_context,
@@ -341,6 +347,34 @@ def _load_final_transcript_candidate(
     if not candidates:
         raise RuntimeError("final transcript candidate not found for translation review")
     return candidates[0]
+
+
+def _translation_transcript_context(
+    state: GraphState,
+    runtime: WorkflowRuntime,
+) -> dict[str, object]:
+    if state.final_transcript_ref is None:
+        return {}
+    artifact = read_model_artifact(
+        runtime,
+        state.final_transcript_ref,
+        SynthesizedTranscriptArtifact,
+    )
+    decision_ref = state.final_transcript_decision_ref or transcript_decision_key(state.job)
+    decision: FinalTranscriptDecision | None = None
+    if runtime.blob_store.exists(decision_ref):
+        decision = read_model_artifact(runtime, decision_ref, FinalTranscriptDecision)
+    investigation_ref = transcript_investigation_key(state.job)
+    return {
+        "transcript_synthesis_status": artifact.status,
+        "transcript_blockers": list(artifact.transcript_metadata.get("blocker_tags", [])),
+        "transcript_decision_ref": decision_ref if decision is not None else None,
+        "transcript_investigation_ref": (
+            investigation_ref if runtime.blob_store.exists(investigation_ref) else None
+        ),
+        "transcript_unresolved_span_count": artifact.quality_metrics.unresolved_span_count,
+        "transcript_decision_mode": decision.decision_mode if decision is not None else None,
+    }
 
 
 def _review_id(

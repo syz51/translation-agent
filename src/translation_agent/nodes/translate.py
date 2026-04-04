@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from hashlib import sha256
 from typing import cast
@@ -9,6 +10,7 @@ from typing import cast
 from translation_agent.graph.runtime import WorkflowRuntime
 from translation_agent.graph.state import GraphState, RoutingFact
 from translation_agent.models import (
+    FinalTranscriptDecision,
     RequestContext,
     SynthesizedTranscriptArtifact,
     TranscriptCandidate,
@@ -22,12 +24,14 @@ from translation_agent.nodes.common import (
     staged_translation_candidate_key,
     strip_private_metadata,
     synthesized_transcript_as_candidate,
+    transcript_investigation_key,
     write_model_artifact,
 )
 from translation_agent.observability import TraceEvent
 from translation_agent.parallelism import ordered_parallel_map
 
-PROMPT_VARIANTS = ("variant-a", "variant-b")
+DEFAULT_PROMPT_VARIANTS = ("variant-a",)
+EXPERIMENT_PROMPT_VARIANTS = ("variant-a", "variant-b")
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,17 +57,30 @@ def generate_translation_candidates(
         SynthesizedTranscriptArtifact,
     )
     transcript = synthesized_transcript_as_candidate(transcript_artifact)
-
-    request_context = build_request_context(state, runtime)
+    transcript_metadata = _transcript_synthesis_metadata(
+        state=state,
+        runtime=runtime,
+        artifact=transcript_artifact,
+    )
+    base_request_context = build_request_context(state, runtime)
+    request_context = base_request_context.model_copy(
+        update={
+            "metadata": {
+                **base_request_context.metadata,
+                "transcript_synthesis": transcript_metadata,
+            }
+        }
+    )
     payload_refs: list[str] = []
     staged_refs: list[str] = []
     routing_facts = list(state.routing_facts)
     task_specs: list[_TranslationCandidateTask] = []
 
+    transcript_blockers = _string_tuple(transcript_metadata.get("transcript_blockers"))
     provider_ids = tuple(transcript_artifact.quality_metrics.provider_support_summary.keys()) or (
         transcript.provider_id,
     )
-    for prompt_variant_id in PROMPT_VARIANTS:
+    for prompt_variant_id in _selected_prompt_variants(state):
         guidance_bundle = runtime.memory_recall_backend.recall_memory(
             build_memory_query(
                 state,
@@ -72,6 +89,7 @@ def generate_translation_candidates(
                 provider_ids=provider_ids,
                 prompt_variant_ids=(prompt_variant_id,),
                 model_ids=(runtime.translation_adapter.model_id,),
+                failure_tags=transcript_blockers,
             )
         )
         historical_instructions = tuple(
@@ -167,6 +185,10 @@ def generate_translation_candidates(
         elif runtime.blob_store.exists(raw_payload_ref):
             payload_refs.append(raw_payload_ref)
 
+        transcript_synthesis = cast(
+            "dict[str, object]",
+            task.request_context.metadata.get("transcript_synthesis", {}),
+        )
         staged_candidate = candidate.model_copy(
             update={
                 "candidate_id": _translation_candidate_id(
@@ -196,7 +218,20 @@ def generate_translation_candidates(
                             "provider_support_summary": (
                                 task.transcript_artifact.quality_metrics.provider_support_summary
                             ),
+                            "transcript_blockers": transcript_synthesis.get(
+                                "transcript_blockers", []
+                            ),
+                            "transcript_synthesis_status": transcript_synthesis.get(
+                                "transcript_synthesis_status"
+                            ),
+                            "transcript_decision_ref": transcript_synthesis.get(
+                                "transcript_decision_ref"
+                            ),
+                            "transcript_investigation_ref": transcript_synthesis.get(
+                                "transcript_investigation_ref"
+                            ),
                         },
+                        "transcript_synthesis": transcript_synthesis,
                     }
                 ),
             }
@@ -224,6 +259,12 @@ def generate_translation_candidates(
         "translation_failed": not staged_refs,
         "routing_facts": tuple(routing_facts),
     }
+
+
+def _selected_prompt_variants(state: GraphState) -> tuple[str, ...]:
+    if state.job.translation_variant_policy == "dual_experiment":
+        return EXPERIMENT_PROMPT_VARIANTS
+    return DEFAULT_PROMPT_VARIANTS
 
 
 def _translation_candidate_id(
@@ -306,9 +347,64 @@ def _generate_translation_task(
         raise
 
 
-def _supports_raw_payload_translation(adapter: object) -> bool:
-    return callable(getattr(adapter, "generate_translation_with_payload", None))
-
-
 def _translation_source_token(source_transcript_ref: str) -> str:
     return sha256(source_transcript_ref.encode("utf-8")).hexdigest()[:12]
+
+
+def _transcript_synthesis_metadata(
+    *,
+    state: GraphState,
+    runtime: WorkflowRuntime,
+    artifact: SynthesizedTranscriptArtifact,
+) -> dict[str, object]:
+    transcript_decision_ref = state.final_transcript_decision_ref
+    transcript_investigation_ref = transcript_investigation_key(state.job)
+    blocker_tags = tuple(
+        str(item)
+        for item in artifact.transcript_metadata.get("blocker_tags", [])
+        if str(item).strip()
+    )
+    if not blocker_tags:
+        blocker_tags = blocking_failures = tuple(
+            fact.value
+            for fact in state.routing_facts
+            if fact.fact_type == "transcript_synthesis_blocker" and fact.value.strip()
+        )
+        if not blocking_failures and artifact.status == "blocked":
+            blocker_tags = ("unresolved_supported_spans",)
+
+    decision_payload: dict[str, object] = {}
+    if transcript_decision_ref and runtime.blob_store.exists(transcript_decision_ref):
+        decision_payload = read_model_artifact(
+            runtime,
+            transcript_decision_ref,
+            FinalTranscriptDecision,
+        ).model_dump(mode="json")
+    investigation_payload: dict[str, object] = {}
+    if runtime.blob_store.exists(transcript_investigation_ref):
+        investigation_payload = json.loads(
+            runtime.blob_store.read_bytes(transcript_investigation_ref).decode("utf-8")
+        )
+
+    return {
+        "final_transcript_ref": state.final_transcript_ref,
+        "transcript_decision_ref": transcript_decision_ref,
+        "transcript_investigation_ref": (
+            transcript_investigation_ref
+            if runtime.blob_store.exists(transcript_investigation_ref)
+            else None
+        ),
+        "transcript_synthesis_status": artifact.status,
+        "transcript_unresolved_span_count": artifact.quality_metrics.unresolved_span_count,
+        "transcript_blockers": list(blocker_tags),
+        "provider_support_summary": artifact.quality_metrics.provider_support_summary,
+        "source_span_ids": [span.canonical_span_id for span in artifact.canonical_spans],
+        "transcript_decision": decision_payload,
+        "transcript_investigation": investigation_payload,
+    }
+
+
+def _string_tuple(value: object) -> tuple[str, ...]:
+    if isinstance(value, (list, tuple)):
+        return tuple(item for item in value if isinstance(item, str))
+    return ()
