@@ -19,6 +19,10 @@ from translation_agent.adapters.common import (
     poll_until_complete,
     require_usable_timed_segments,
 )
+from translation_agent.language_codes import (
+    canonicalize_language_code,
+    resolve_transcription_provider_language,
+)
 from translation_agent.models import AudioArtifact, RequestContext, Segment, TranscriptCandidate
 from translation_agent.storage import BlobStore, asset_path, job_path, job_scope_token
 
@@ -63,6 +67,7 @@ class AssemblyAITranscriptionAdapter:
         audio_artifact: AudioArtifact,
         request_context: RequestContext,
     ) -> tuple[TranscriptCandidate, dict[str, Any]]:
+        canonical_language, _ = self._resolved_language_codes(request_context)
         audio_bytes = self._blob_store.read_bytes(audio_artifact.blob_ref)
         upload_url = self._upload_url(audio_bytes, request_context)
         transcript_job = perform_with_retries(
@@ -96,7 +101,7 @@ class AssemblyAITranscriptionAdapter:
             _candidate_from_payload(
                 final_payload,
                 request_context=request_context,
-                language=request_context.job.source_language,
+                language=canonical_language,
                 raw_payload_ref=raw_payload_ref,
             ),
             final_payload,
@@ -131,6 +136,7 @@ class AssemblyAITranscriptionAdapter:
     def _create_transcript(
         self, upload_url: str, request_context: RequestContext
     ) -> dict[str, Any]:
+        _, provider_language = self._resolved_language_codes(request_context)
         response = json_request(
             self._transport,
             method="POST",
@@ -141,7 +147,7 @@ class AssemblyAITranscriptionAdapter:
                 "audio_url": upload_url,
                 "speech_models": ["universal-3-pro", "universal-2"],
                 "speaker_labels": True,
-                "language_code": request_context.job.source_language,
+                "language_code": provider_language,
             },
         )
         return _validated_json_response(self.provider_id, response)
@@ -161,6 +167,19 @@ class AssemblyAITranscriptionAdapter:
         if content_type is not None:
             headers["content-type"] = content_type
         return headers
+
+    def _resolved_language_codes(self, request_context: RequestContext) -> tuple[str, str]:
+        try:
+            canonical = canonicalize_language_code(request_context.job.source_language)
+            provider = resolve_transcription_provider_language(self.provider_id, canonical)
+        except ValueError as exc:
+            raise AdapterError(
+                provider_id=self.provider_id,
+                message=str(exc),
+                category="invalid_request",
+                retryable=False,
+            ) from exc
+        return canonical, provider
 
     def _cached_upload_url(
         self,

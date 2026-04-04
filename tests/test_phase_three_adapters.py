@@ -210,14 +210,14 @@ def _json_response(payload: object, *, status_code: int = 200) -> HttpResponse:
     )
 
 
-def _job_context(job_id: str = "job-phase-three") -> JobContext:
+def _job_context(job_id: str = "job-phase-three", *, source_language: str = "en") -> JobContext:
     return JobContext(
         job_id=job_id,
         tenant_id="tenant-1",
         project_id="project-1",
         source_video_ref="input.mp4",
         target_language="fr",
-        source_language="en",
+        source_language=source_language,
         requested_by="tester@example.com",
         created_at=datetime(2026, 3, 30, 12, 0, tzinfo=UTC),
         profile_ref="profiles/default",
@@ -225,10 +225,14 @@ def _job_context(job_id: str = "job-phase-three") -> JobContext:
     )
 
 
-def _request_context(job_id: str = "job-phase-three") -> RequestContext:
+def _request_context(
+    job_id: str = "job-phase-three",
+    *,
+    source_language: str = "en",
+) -> RequestContext:
     return RequestContext(
         run_id="run-phase-three",
-        job=_job_context(job_id),
+        job=_job_context(job_id, source_language=source_language),
         source_artifact_ref=f"jobs/{job_id}.json",
         metadata={},
     )
@@ -570,6 +574,47 @@ def test_assemblyai_adapter_reuses_cached_upload_for_same_media(tmp_path: Path) 
         "https://api.assemblyai.com/v2/transcript",
         "https://api.assemblyai.com/v2/transcript/tr-job-2",
     ]
+
+
+def test_assemblyai_adapter_bridges_canonical_language_to_provider_code(tmp_path: Path) -> None:
+    blob_store = LocalBlobStore(tmp_path / "blobs")
+    audio_artifact = _audio_artifact()
+    blob_store.put_bytes(audio_artifact.blob_ref, b"audio-bytes")
+    transport = SequencedTransport(
+        [
+            _json_response({"upload_url": "https://upload.example/audio.wav"}),
+            _json_response({"id": "tr-job"}),
+            _json_response(
+                {
+                    "id": "tr-job",
+                    "status": "completed",
+                    "text": "Hello world",
+                    "utterances": [
+                        {
+                            "start": 0,
+                            "end": 1000,
+                            "speaker": "A",
+                            "text": "Hello world",
+                            "confidence": 0.98,
+                        }
+                    ],
+                }
+            ),
+        ]
+    )
+    adapter = AssemblyAITranscriptionAdapter(
+        api_key="test-key",
+        blob_store=blob_store,
+        transport=transport,
+        retry_policy=_retry_policy(),
+        sleep=lambda _: None,
+    )
+
+    candidate = adapter.transcribe(audio_artifact, _request_context(source_language="en_us"))
+
+    request_body = json.loads((transport.requests[1].body or b"{}").decode("utf-8"))
+    assert request_body["language_code"] == "en"
+    assert candidate.language == "en-US"
 
 
 def test_assemblyai_adapter_rejects_malformed_payload(tmp_path: Path) -> None:
@@ -956,6 +1001,45 @@ def test_deepgram_adapter_respects_configured_utterance_split(tmp_path: Path) ->
     adapter.transcribe(audio_artifact, _request_context())
 
     assert "utt_split=0.6" in transport.requests[0].url
+
+
+def test_deepgram_adapter_bridges_assemblyai_style_language_codes(tmp_path: Path) -> None:
+    blob_store = LocalBlobStore(tmp_path / "blobs")
+    audio_artifact = _audio_artifact()
+    blob_store.put_bytes(audio_artifact.blob_ref, b"audio-bytes")
+    transport = SequencedTransport(
+        [
+            _json_response(
+                {
+                    "metadata": {"request_id": "dg-job"},
+                    "results": {
+                        "channels": [{"alternatives": [{"transcript": "Hello world"}]}],
+                        "utterances": [
+                            {
+                                "start": 0.0,
+                                "end": 1.0,
+                                "speaker": 0,
+                                "transcript": "Hello world",
+                                "confidence": 0.96,
+                            }
+                        ],
+                    },
+                }
+            ),
+        ]
+    )
+    adapter = DeepgramTranscriptionAdapter(
+        api_key="test-key",
+        blob_store=blob_store,
+        transport=transport,
+        retry_policy=_retry_policy(),
+        sleep=lambda _: None,
+    )
+
+    candidate = adapter.transcribe(audio_artifact, _request_context(source_language="en_us"))
+
+    assert "language=en-US" in transport.requests[0].url
+    assert candidate.language == "en-US"
 
 
 def test_deepgram_adapter_rejects_missing_timed_segments(tmp_path: Path) -> None:

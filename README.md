@@ -272,7 +272,7 @@ result = run_job(
         tenant_id="tenant-local",
         project_id="project-local",
         source_language="en",
-        target_language="zh",
+        target_language="zh-CN",
     )
 )
 

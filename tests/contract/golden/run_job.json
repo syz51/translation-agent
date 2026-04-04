@@ -20,6 +20,6 @@
   "state_backend": "postgres",
   "state_db_target": "<state_db_target>",
   "status": "completed",
-  "target_language": "zh",
+  "target_language": "zh-CN",
   "trace_path": "<trace_path>"
 }

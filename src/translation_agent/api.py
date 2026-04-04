@@ -25,6 +25,7 @@ from translation_agent.graph import (
     run_workflow,
     sync_trace_artifact,
 )
+from translation_agent.language_codes import canonicalize_language_code
 from translation_agent.media_identity import compute_media_fingerprint
 from translation_agent.models import (
     AssetContext,
@@ -1724,8 +1725,8 @@ def _resolved_reference_transcript_format(request: RunJobRequest) -> Literal["sr
 
 def _resolved_job_languages(request: RunJobRequest, settings: Settings) -> tuple[str, str]:
     return (
-        request.source_language or settings.default_source_language,
-        request.target_language or settings.default_target_language,
+        canonicalize_language_code(request.source_language or settings.default_source_language),
+        canonicalize_language_code(request.target_language or settings.default_target_language),
     )
 
 

@@ -19,6 +19,10 @@ from translation_agent.adapters.common import (
     perform_with_retries,
     require_usable_timed_segments,
 )
+from translation_agent.language_codes import (
+    canonicalize_language_code,
+    resolve_transcription_provider_language,
+)
 from translation_agent.models import AudioArtifact, RequestContext, Segment, TranscriptCandidate
 from translation_agent.storage import BlobStore, job_path, job_scope_token
 
@@ -68,6 +72,7 @@ class DeepgramTranscriptionAdapter:
         audio_artifact: AudioArtifact,
         request_context: RequestContext,
     ) -> tuple[TranscriptCandidate, dict[str, Any]]:
+        canonical_language, _ = self._resolved_language_codes(request_context)
         audio_bytes = self._blob_store.read_bytes(audio_artifact.blob_ref)
         payload = perform_with_retries(
             lambda: self._transcribe_once(audio_artifact, audio_bytes, request_context),
@@ -85,7 +90,7 @@ class DeepgramTranscriptionAdapter:
             _candidate_from_payload(
                 payload,
                 request_context=request_context,
-                language=request_context.job.source_language,
+                language=canonical_language,
                 raw_payload_ref=raw_payload_ref,
             ),
             payload,
@@ -97,6 +102,7 @@ class DeepgramTranscriptionAdapter:
         audio_bytes: bytes,
         request_context: RequestContext,
     ) -> dict[str, Any]:
+        _, provider_language = self._resolved_language_codes(request_context)
         query = urllib.parse.urlencode(
             {
                 "model": self._model,
@@ -104,7 +110,7 @@ class DeepgramTranscriptionAdapter:
                 "utterances": "true",
                 "utt_split": f"{self._utterance_split_seconds:g}",
                 "smart_format": "true",
-                "language": request_context.job.source_language,
+                "language": provider_language,
             }
         )
         response = self._transport.request(
@@ -131,6 +137,19 @@ class DeepgramTranscriptionAdapter:
                 retryable=False,
             )
         return payload
+
+    def _resolved_language_codes(self, request_context: RequestContext) -> tuple[str, str]:
+        try:
+            canonical = canonicalize_language_code(request_context.job.source_language)
+            provider = resolve_transcription_provider_language(self.provider_id, canonical)
+        except ValueError as exc:
+            raise AdapterError(
+                provider_id=self.provider_id,
+                message=str(exc),
+                category="invalid_request",
+                retryable=False,
+            ) from exc
+        return canonical, provider
 
 
 def _candidate_from_payload(

@@ -62,7 +62,7 @@ def _job_context(job_id: str = "job-123") -> JobContext:
         tenant_id="tenant-local",
         project_id="project-local",
         source_video_ref="input.mp4",
-        target_language="zh",
+        target_language="zh-CN",
         source_language="en",
         requested_by="system@local",
         created_at=datetime(2026, 3, 31, 0, 0, tzinfo=UTC),
@@ -611,7 +611,7 @@ def test_cli_run_job_plain_output_reports_run_status_and_trace(
     assert len(lines) == 7
     assert lines[1] == "completed"
     assert lines[2] == "source_language: en"
-    assert lines[3] == "target_language: zh"
+    assert lines[3] == "target_language: zh-CN"
     assert lines[4] == f"sqlite: {(tmp_path / 'runtime' / 'state.sqlite3').resolve()}"
     assert Path(lines[5]).exists()
     assert lines[6] == f"default_output_path: {default_output_path}"
@@ -631,7 +631,7 @@ def test_cli_run_job_json_includes_default_output_path(
     payload = json.loads(capsys.readouterr().out)
     assert exit_code == 0
     assert payload["source_language"] == "en"
-    assert payload["target_language"] == "zh"
+    assert payload["target_language"] == "zh-CN"
     assert payload["default_output_path"] == str(
         (
             tmp_path
@@ -708,7 +708,7 @@ def test_cli_run_job_tty_live_panel_renders_recent_events_and_counters(
             status="completed",
             source=request.source,
             source_language="en",
-            target_language="zh",
+            target_language="zh-CN",
             blob_root=Path("/tmp/blob-root"),
             trace_path=trace_path,
             state_backend="sqlite",
@@ -967,7 +967,7 @@ def test_cli_run_job_plain_output_reports_failure_details(
             status="translation_failed",
             source=request.source,
             source_language=request.source_language or "en",
-            target_language=request.target_language or "zh",
+            target_language=request.target_language or "zh-CN",
             blob_root=tmp_path / "runtime" / "blobs",
             trace_path=trace_path,
             state_backend="sqlite",
@@ -989,7 +989,7 @@ def test_cli_run_job_plain_output_reports_failure_details(
         "run-failed",
         "translation_failed",
         "source_language: en",
-        "target_language: zh",
+        "target_language: zh-CN",
         f"sqlite: {(tmp_path / 'runtime' / 'state.sqlite3').resolve()}",
         str(trace_path),
         "All translation variants failed; transcript preserved for recovery.",
@@ -1035,7 +1035,7 @@ def test_run_job_bootstraps_local_artifacts_and_postgres_record(
 
     assert result.status == "completed"
     assert result.source_language == "en"
-    assert result.target_language == "zh"
+    assert result.target_language == "zh-CN"
     assert result.blob_root.exists()
     assert result.trace_path.exists()
     assert (
@@ -1088,9 +1088,9 @@ def test_run_job_uses_configured_default_target_language(
     )
 
     assert request_payload["source_language"] == "en"
-    assert request_payload["target_language"] == "zh"
+    assert request_payload["target_language"] == "zh-CN"
     assert result.source_language == "en"
-    assert result.target_language == "zh"
+    assert result.target_language == "zh-CN"
     assert (
         result.default_output_path
         == (
@@ -1197,7 +1197,7 @@ def test_run_job_defaults_to_local_sqlite_runtime(
 
     assert result.status == "completed"
     assert result.source_language == "en"
-    assert result.target_language == "zh"
+    assert result.target_language == "zh-CN"
     assert result.state_backend == "sqlite"
     assert result.state_db_target == str((tmp_path / "runtime" / "state.sqlite3").resolve())
     assert result.failure_ref is None
@@ -1323,7 +1323,7 @@ def test_run_job_returns_translation_failure_details(
 
     assert result.status == "translation_failed"
     assert result.source_language == "en"
-    assert result.target_language == "zh"
+    assert result.target_language == "zh-CN"
     assert result.default_output_path is None
     assert result.failure_ref == str(
         job_path(_job_context("job-translation-failed"), "published", "translation-failed.json")
@@ -1436,7 +1436,7 @@ def test_run_job_human_review_required_leaves_default_output_path_unset(
     assert result.status == "human_review_required"
     assert result.review_required_stage == "translation"
     assert result.source_language == "en"
-    assert result.target_language == "zh"
+    assert result.target_language == "zh-CN"
     assert result.default_output_path is None
 
 
@@ -1785,7 +1785,7 @@ def test_cli_run_job_json(migrated_postgres_dsn: str, monkeypatch, tmp_path: Pat
     assert payload["source_language"] == "en"
     assert payload["state_backend"] == "postgres"
     assert payload["state_db_target"] == sanitize_db_target(migrated_postgres_dsn)
-    assert payload["target_language"] == "zh"
+    assert payload["target_language"] == "zh-CN"
     assert payload["failure_ref"] is None
     assert payload["failure_summary"] is None
     assert payload["failure_reasons"] == []
@@ -1812,7 +1812,7 @@ def test_cli_run_job_review_auto_non_tty_prints_resume_instructions(
             status="human_review_required",
             source=request.source,
             source_language="en",
-            target_language="zh",
+            target_language="zh-CN",
             blob_root=Path("/tmp/blob-root"),
             trace_path=Path("/tmp/trace.jsonl"),
             state_backend="sqlite",
@@ -1848,7 +1848,7 @@ def test_cli_resume_translation_review_auto_non_tty_prints_resume_instructions(
             status="human_review_required",
             source="input.wav",
             source_language="en",
-            target_language="zh",
+            target_language="zh-CN",
             blob_root=Path("/tmp/blob-root"),
             trace_path=Path("/tmp/trace.jsonl"),
             state_backend="sqlite",
@@ -2247,7 +2247,7 @@ def test_approve_review_json_republishes_outputs_and_updates_provider_stats(
                 cast(dict[str, object], first_candidate["source_transcript"])["provider_id"],
             ),
             source_language="en",
-            target_language="zh",
+            target_language="zh-CN",
         )
 
     assert first_record is not None
@@ -2434,7 +2434,7 @@ def test_resolve_review_approved_best_available_persists_soft_feedback(
                 cast(dict[str, object], selected["source_transcript"])["provider_id"],
             ),
             source_language="en",
-            target_language="zh",
+            target_language="zh-CN",
         )
         combo_stats = store.get_translation_feedback_stats(cast(str, selected["combo_key"]))
 
