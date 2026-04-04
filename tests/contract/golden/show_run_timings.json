@@ -1,0 +1,66 @@
+{
+  "run_id": "run-show",
+  "job_id": "job-show",
+  "status": "completed",
+  "current_stage": "finalize_outputs",
+  "active_node": null,
+  "elapsed_seconds": 5.0,
+  "trace_path": "<trace_path>",
+  "recent_events": [
+    {
+      "timestamp": "2026-04-03T00:00:00+00:00",
+      "name": "run.started",
+      "message": "Run started",
+      "attributes": {
+        "job_id": "job-show"
+      }
+    },
+    {
+      "timestamp": "2026-04-03T00:00:01+00:00",
+      "name": "node.started",
+      "message": "Started node fanout_transcription",
+      "attributes": {
+        "node_name": "fanout_transcription",
+        "execution_id": "exec-1"
+      }
+    },
+    {
+      "timestamp": "2026-04-03T00:00:03+00:00",
+      "name": "node.completed",
+      "message": "Completed node fanout_transcription",
+      "attributes": {
+        "node_name": "fanout_transcription",
+        "execution_id": "exec-1"
+      }
+    },
+    {
+      "timestamp": "2026-04-03T00:00:05+00:00",
+      "name": "run.completed",
+      "message": "Run completed with status completed",
+      "attributes": {
+        "status": "completed"
+      }
+    }
+  ],
+  "transcription_providers": null,
+  "translation_variants": null,
+  "review_bundles": null,
+  "timings": {
+    "run_status": "completed",
+    "run_started_at": "2026-04-03T00:00:00+00:00",
+    "run_completed_at": "2026-04-03T00:00:05+00:00",
+    "run_elapsed_seconds": 5.0,
+    "nodes": [
+      {
+        "name": "fanout_transcription",
+        "status": "completed",
+        "started_at": "2026-04-03T00:00:01+00:00",
+        "completed_at": "2026-04-03T00:00:03+00:00",
+        "elapsed_seconds": 2.0
+      }
+    ],
+    "transcription_providers": [],
+    "translation_variants": [],
+    "review_bundles": []
+  }
+}

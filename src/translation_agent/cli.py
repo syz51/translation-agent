@@ -33,7 +33,10 @@ from translation_agent.run_status import (
     PhaseCounters,
     RunStatusAccumulator,
     RunStatusSnapshot,
+    RunTimingSummary,
+    derive_run_timing_summary,
     is_terminal_run_status,
+    read_trace_events,
 )
 from translation_agent.storage.migrations import upgrade_database
 from translation_agent.tui import ReviewTerminalApp
@@ -54,6 +57,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     show_run_parser = subparsers.add_parser("show-run", help="Show one persisted run snapshot")
     show_run_parser.add_argument("run_id")
+    show_run_parser.add_argument("--timings", action="store_true")
     show_run_parser.add_argument("--json", action="store_true", dest="as_json")
 
     watch_run_parser = subparsers.add_parser(
@@ -241,10 +245,20 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "show-run":
         settings = load_settings()
         snapshot = get_run_status(args.run_id, settings=settings)
+        timings = (
+            derive_run_timing_summary(read_trace_events(snapshot.trace_path))
+            if args.timings
+            else None
+        )
         if args.as_json:
-            print(json.dumps(_json_ready(asdict(snapshot))))
+            payload = _json_ready(asdict(snapshot))
+            if timings is not None:
+                payload["timings"] = _json_ready(asdict(timings))
+            print(json.dumps(payload))
         else:
             _print_run_status_snapshot(snapshot)
+            if timings is not None:
+                _print_run_timing_summary(timings)
         return 0
 
     if args.command == "watch-run":
@@ -610,6 +624,30 @@ def _print_run_status_snapshot(snapshot: RunStatusSnapshot) -> None:
         print("recent_events:")
         for event in snapshot.recent_events:
             print(f"- {_event_time_label(event.timestamp)} {event.message}")
+
+
+def _print_run_timing_summary(summary: RunTimingSummary) -> None:
+    print("timings:")
+    run_elapsed = (
+        "-" if summary.run_elapsed_seconds is None else f"{summary.run_elapsed_seconds:.1f}s"
+    )
+    print(f"run: status={summary.run_status} elapsed={run_elapsed}")
+    _print_timing_entries("nodes", summary.nodes)
+    _print_timing_entries("transcription_providers", summary.transcription_providers)
+    _print_timing_entries("translation_variants", summary.translation_variants)
+    _print_timing_entries("review_bundles", summary.review_bundles)
+
+
+def _print_timing_entries(label: str, entries) -> None:
+    if not entries:
+        return
+    print(f"{label}:")
+    for entry in entries:
+        completed = entry.completed_at or "-"
+        print(
+            f"- {entry.name} | status={entry.status} | "
+            f"elapsed={entry.elapsed_seconds:.1f}s | start={entry.started_at} | end={completed}"
+        )
 
 
 def _format_run_status_panel(snapshot: RunStatusSnapshot) -> str:

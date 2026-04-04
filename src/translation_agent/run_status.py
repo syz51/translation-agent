@@ -47,6 +47,27 @@ class RunStatusSnapshot:
 
 
 @dataclass(slots=True)
+class RunTimingEntry:
+    name: str
+    status: str
+    started_at: str
+    completed_at: str | None
+    elapsed_seconds: float
+
+
+@dataclass(slots=True)
+class RunTimingSummary:
+    run_status: str
+    run_started_at: str | None
+    run_completed_at: str | None
+    run_elapsed_seconds: float | None
+    nodes: tuple[RunTimingEntry, ...] = ()
+    transcription_providers: tuple[RunTimingEntry, ...] = ()
+    translation_variants: tuple[RunTimingEntry, ...] = ()
+    review_bundles: tuple[RunTimingEntry, ...] = ()
+
+
+@dataclass(slots=True)
 class _NormalizedTraceEvent:
     timestamp: str
     name: str
@@ -270,6 +291,111 @@ def derive_run_status_snapshot(
     return accumulator.snapshot(now=now)
 
 
+def derive_run_timing_summary(
+    trace_events: Sequence[Mapping[str, Any]],
+    *,
+    now: datetime | None = None,
+) -> RunTimingSummary:
+    effective_now = now or datetime.now(UTC)
+    run_started_at: str | None = None
+    run_completed_at: str | None = None
+    run_status = "not_started"
+    node_entries: list[RunTimingEntry] = []
+    provider_entries: list[RunTimingEntry] = []
+    variant_entries: list[RunTimingEntry] = []
+    review_entries: list[RunTimingEntry] = []
+    active_nodes: dict[str, deque[str]] = {}
+    active_providers: dict[str, deque[str]] = {}
+    active_variants: dict[str, deque[str]] = {}
+    active_reviews: dict[str, deque[str]] = {}
+
+    for event in trace_events:
+        name = _string_or_none(event.get("name"))
+        timestamp = _string_or_none(event.get("timestamp"))
+        if name is None or timestamp is None:
+            continue
+        attributes = _dict_payload(event.get("attributes"))
+        if name == "run.started":
+            run_started_at = timestamp
+            run_status = "active"
+            continue
+        if name == "run.completed":
+            run_completed_at = timestamp
+            run_status = "completed"
+            continue
+        if name == "run.failed":
+            run_completed_at = timestamp
+            run_status = "failed"
+            continue
+        if name == "node.started":
+            _push_active(active_nodes, _string_or_none(attributes.get("node_name")), timestamp)
+            continue
+        if name in {"node.completed", "node.failed"}:
+            _close_timing_entry(
+                active_nodes,
+                _string_or_none(attributes.get("node_name")),
+                ended_at=timestamp,
+                terminal_event_name=name,
+                target=node_entries,
+            )
+            continue
+        if name == "transcription.provider.started":
+            _push_active(
+                active_providers,
+                _string_or_none(attributes.get("provider_id")),
+                timestamp,
+            )
+            continue
+        if name in {"transcription.provider.completed", "transcription.provider.failed"}:
+            _close_timing_entry(
+                active_providers,
+                _string_or_none(attributes.get("provider_id")),
+                ended_at=timestamp,
+                terminal_event_name=name,
+                target=provider_entries,
+            )
+            continue
+        if name == "translation.variant.started":
+            _push_active(active_variants, _translation_item_key(attributes), timestamp)
+            continue
+        if name in {"translation.variant.completed", "translation.variant.failed"}:
+            _close_timing_entry(
+                active_variants,
+                _translation_item_key(attributes),
+                ended_at=timestamp,
+                terminal_event_name=name,
+                target=variant_entries,
+            )
+            continue
+        if name == "review.bundle.started":
+            _push_active(active_reviews, _review_item_key(attributes), timestamp)
+            continue
+        if name in {"review.bundle.completed", "review.bundle.failed"}:
+            _close_timing_entry(
+                active_reviews,
+                _review_item_key(attributes),
+                ended_at=timestamp,
+                terminal_event_name=name,
+                target=review_entries,
+            )
+
+    _flush_active_entries(active_nodes, target=node_entries, now=effective_now)
+    _flush_active_entries(active_providers, target=provider_entries, now=effective_now)
+    _flush_active_entries(active_variants, target=variant_entries, now=effective_now)
+    _flush_active_entries(active_reviews, target=review_entries, now=effective_now)
+
+    return RunTimingSummary(
+        run_status=run_status,
+        run_started_at=run_started_at,
+        run_completed_at=run_completed_at,
+        run_elapsed_seconds=_elapsed_seconds(run_started_at, run_completed_at, effective_now),
+        nodes=tuple(sorted(node_entries, key=_timing_sort_key)),
+        transcription_providers=tuple(sorted(provider_entries, key=_timing_sort_key)),
+        translation_variants=tuple(sorted(variant_entries, key=_timing_sort_key)),
+        review_bundles=tuple(sorted(review_entries, key=_timing_sort_key)),
+    )
+
+
 def normalize_trace_event(event: Mapping[str, Any]) -> _NormalizedTraceEvent | None:
     name = _string_or_none(event.get("name"))
     timestamp = _string_or_none(event.get("timestamp"))
@@ -407,22 +533,28 @@ def tail_trace_events(
     *,
     limit: int = _TRACE_TAIL_LIMIT,
 ) -> tuple[dict[str, Any], ...]:
+    events = read_trace_events(path)
+    if limit <= 0:
+        return ()
+    if len(events) <= limit:
+        return events
+    return events[-limit:]
+
+
+def read_trace_events(path: str | Path) -> tuple[dict[str, Any], ...]:
     trace_path = Path(path)
     if not trace_path.exists():
         return ()
-    tail: deque[str] = deque(maxlen=limit)
+    events: list[dict[str, Any]] = []
     with trace_path.open(encoding="utf-8") as handle:
         for line in handle:
             if line.strip():
-                tail.append(line)
-    events: list[dict[str, Any]] = []
-    for line in tail:
-        try:
-            payload = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(payload, dict):
-            events.append(payload)
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(payload, dict):
+                    events.append(payload)
     return tuple(events)
 
 
@@ -476,6 +608,76 @@ def _node_execution_sort_key(execution: NodeExecutionRecord) -> tuple[datetime, 
 
 def _dict_payload(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
+
+
+def _push_active(active: dict[str, deque[str]], key: str | None, started_at: str) -> None:
+    if key is None:
+        return
+    active.setdefault(key, deque()).append(started_at)
+
+
+def _close_timing_entry(
+    active: dict[str, deque[str]],
+    key: str | None,
+    *,
+    ended_at: str,
+    terminal_event_name: str,
+    target: list[RunTimingEntry],
+) -> None:
+    if key is None:
+        return
+    started = active.get(key)
+    if not started:
+        return
+    started_at = started.popleft()
+    if not started:
+        active.pop(key, None)
+    target.append(
+        RunTimingEntry(
+            name=key,
+            status="failed" if terminal_event_name.endswith(".failed") else "completed",
+            started_at=started_at,
+            completed_at=ended_at,
+            elapsed_seconds=_elapsed_seconds(started_at, ended_at, None) or 0.0,
+        )
+    )
+
+
+def _flush_active_entries(
+    active: dict[str, deque[str]],
+    *,
+    target: list[RunTimingEntry],
+    now: datetime,
+) -> None:
+    for key, started_times in active.items():
+        for started_at in started_times:
+            target.append(
+                RunTimingEntry(
+                    name=key,
+                    status="active",
+                    started_at=started_at,
+                    completed_at=None,
+                    elapsed_seconds=_elapsed_seconds(started_at, None, now) or 0.0,
+                )
+            )
+
+
+def _elapsed_seconds(
+    started_at: str | None,
+    completed_at: str | None,
+    now: datetime | None,
+) -> float | None:
+    start = _parse_timestamp(started_at)
+    if start is None:
+        return None
+    end = _parse_timestamp(completed_at) if completed_at is not None else now
+    if end is None:
+        return None
+    return round(max(0.0, (end - start).total_seconds()), 1)
+
+
+def _timing_sort_key(entry: RunTimingEntry) -> tuple[float, str, str]:
+    return (-entry.elapsed_seconds, entry.started_at, entry.name)
 
 
 def _parse_timestamp(value: Any) -> datetime | None:

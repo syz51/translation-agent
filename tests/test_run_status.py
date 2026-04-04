@@ -5,7 +5,11 @@ from pathlib import Path
 
 import pytest
 
-from translation_agent.run_status import derive_run_status_snapshot, normalize_trace_event
+from translation_agent.run_status import (
+    derive_run_status_snapshot,
+    derive_run_timing_summary,
+    normalize_trace_event,
+)
 from translation_agent.storage import NodeExecutionRecord, RunRecord
 
 pytestmark = pytest.mark.unit
@@ -156,6 +160,65 @@ def test_derive_run_status_snapshot_tracks_active_node_recent_events_and_counter
     assert (
         snapshot.recent_events[-1].message == "Failed transcription provider speechmatics: timeout"
     )
+
+
+def test_derive_run_timing_summary_tracks_completed_and_active_intervals() -> None:
+    summary = derive_run_timing_summary(
+        (
+            {
+                "run_id": "run-123",
+                "name": "run.started",
+                "timestamp": "2026-04-03T00:00:00+00:00",
+                "attributes": {"job_id": "job-123"},
+            },
+            {
+                "run_id": "run-123",
+                "name": "node.started",
+                "timestamp": "2026-04-03T00:00:01+00:00",
+                "attributes": {"node_name": "fanout_transcription", "execution_id": "exec-1"},
+            },
+            {
+                "run_id": "run-123",
+                "name": "transcription.provider.started",
+                "timestamp": "2026-04-03T00:00:02+00:00",
+                "attributes": {"provider_id": "deepgram", "provider_total": 2},
+            },
+            {
+                "run_id": "run-123",
+                "name": "transcription.provider.completed",
+                "timestamp": "2026-04-03T00:00:04+00:00",
+                "attributes": {"provider_id": "deepgram", "provider_total": 2},
+            },
+            {
+                "run_id": "run-123",
+                "name": "translation.variant.started",
+                "timestamp": "2026-04-03T00:00:05+00:00",
+                "attributes": {
+                    "prompt_variant_id": "variant-a",
+                    "source_transcript_candidate_id": "tr-1",
+                    "variant_total": 2,
+                },
+            },
+        ),
+        now=datetime(2026, 4, 3, 0, 0, 8, tzinfo=UTC),
+    )
+
+    assert summary.run_status == "active"
+    assert summary.run_started_at == "2026-04-03T00:00:00+00:00"
+    assert summary.run_completed_at is None
+    assert summary.run_elapsed_seconds == 8.0
+    assert len(summary.nodes) == 1
+    assert summary.nodes[0].name == "fanout_transcription"
+    assert summary.nodes[0].status == "active"
+    assert summary.nodes[0].elapsed_seconds == 7.0
+    assert len(summary.transcription_providers) == 1
+    assert summary.transcription_providers[0].name == "deepgram"
+    assert summary.transcription_providers[0].status == "completed"
+    assert summary.transcription_providers[0].elapsed_seconds == 2.0
+    assert len(summary.translation_variants) == 1
+    assert summary.translation_variants[0].name == "variant-a:tr-1"
+    assert summary.translation_variants[0].status == "active"
+    assert summary.translation_variants[0].elapsed_seconds == 3.0
 
 
 @pytest.mark.parametrize(

@@ -794,6 +794,179 @@ def test_cli_show_run_json_payload_shape(
 
 
 @pytest.mark.unit
+def test_cli_show_run_json_payload_includes_timings_when_requested(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    runtime_dir = tmp_path / "runtime"
+    monkeypatch.setenv("TA_DATA_DIR", str(runtime_dir))
+    monkeypatch.delenv("TA_STATE_DB_DSN", raising=False)
+
+    with SQLiteOperationalStore(runtime_dir / "state.sqlite3") as store:
+        store.create_run(
+            run_id="run-show",
+            status="completed",
+            input_data={"job_id": "job-show", "source": "input.wav"},
+            created_at="2026-04-03T00:00:00+00:00",
+        )
+        store.update_run(
+            "run-show",
+            status="completed",
+            output_data={"final_stage": "finalize_outputs"},
+            updated_at="2026-04-03T00:00:05+00:00",
+        )
+    trace_path = runtime_dir / "traces" / "run-show.jsonl"
+    trace_path.parent.mkdir(parents=True, exist_ok=True)
+    trace_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "run_id": "run-show",
+                        "name": "run.started",
+                        "timestamp": "2026-04-03T00:00:00+00:00",
+                        "attributes": {"job_id": "job-show"},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "run_id": "run-show",
+                        "name": "node.started",
+                        "timestamp": "2026-04-03T00:00:01+00:00",
+                        "attributes": {
+                            "node_name": "fanout_transcription",
+                            "execution_id": "exec-1",
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "run_id": "run-show",
+                        "name": "node.completed",
+                        "timestamp": "2026-04-03T00:00:03+00:00",
+                        "attributes": {
+                            "node_name": "fanout_transcription",
+                            "execution_id": "exec-1",
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "run_id": "run-show",
+                        "name": "run.completed",
+                        "timestamp": "2026-04-03T00:00:05+00:00",
+                        "attributes": {"status": "completed"},
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    exit_code = main(["show-run", "run-show", "--timings", "--json"])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert payload["timings"]["run_status"] == "completed"
+    assert payload["timings"]["run_elapsed_seconds"] == 5.0
+    assert payload["timings"]["nodes"] == [
+        {
+            "name": "fanout_transcription",
+            "status": "completed",
+            "started_at": "2026-04-03T00:00:01+00:00",
+            "completed_at": "2026-04-03T00:00:03+00:00",
+            "elapsed_seconds": 2.0,
+        }
+    ]
+
+
+@pytest.mark.unit
+def test_cli_show_run_plain_output_appends_timing_summary(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    runtime_dir = tmp_path / "runtime"
+    monkeypatch.setenv("TA_DATA_DIR", str(runtime_dir))
+    monkeypatch.delenv("TA_STATE_DB_DSN", raising=False)
+
+    with SQLiteOperationalStore(runtime_dir / "state.sqlite3") as store:
+        store.create_run(
+            run_id="run-show",
+            status="completed",
+            input_data={"job_id": "job-show", "source": "input.wav"},
+            created_at="2026-04-03T00:00:00+00:00",
+        )
+        store.update_run(
+            "run-show",
+            status="completed",
+            output_data={"final_stage": "finalize_outputs"},
+            updated_at="2026-04-03T00:00:05+00:00",
+        )
+    trace_path = runtime_dir / "traces" / "run-show.jsonl"
+    trace_path.parent.mkdir(parents=True, exist_ok=True)
+    trace_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "run_id": "run-show",
+                        "name": "run.started",
+                        "timestamp": "2026-04-03T00:00:00+00:00",
+                        "attributes": {"job_id": "job-show"},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "run_id": "run-show",
+                        "name": "translation.variant.started",
+                        "timestamp": "2026-04-03T00:00:01+00:00",
+                        "attributes": {
+                            "prompt_variant_id": "variant-a",
+                            "source_transcript_candidate_id": "tr-1",
+                            "variant_total": 2,
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "run_id": "run-show",
+                        "name": "translation.variant.completed",
+                        "timestamp": "2026-04-03T00:00:04+00:00",
+                        "attributes": {
+                            "prompt_variant_id": "variant-a",
+                            "source_transcript_candidate_id": "tr-1",
+                            "variant_total": 2,
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "run_id": "run-show",
+                        "name": "run.completed",
+                        "timestamp": "2026-04-03T00:00:05+00:00",
+                        "attributes": {"status": "completed"},
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    exit_code = main(["show-run", "run-show", "--timings"])
+
+    output = capsys.readouterr().out
+    assert exit_code == 0
+    assert "timings:" in output
+    assert "run: status=completed elapsed=5.0s" in output
+    assert "translation_variants:" in output
+    assert "variant-a:tr-1 | status=completed | elapsed=3.0s" in output
+
+
+@pytest.mark.unit
 def test_cli_watch_run_tty_exits_on_terminal_state_and_renders_recent_events(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],

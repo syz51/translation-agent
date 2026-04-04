@@ -164,6 +164,18 @@ def test_cli_show_run_json_contract(
             input_data={"job_id": "job-show", "source": "input.wav"},
             created_at="2026-04-03T00:00:00+00:00",
         )
+        store.create_node_execution(
+            execution_id="exec-1",
+            run_id="run-show",
+            node_name="fanout_transcription",
+            status="started",
+            created_at="2026-04-03T00:00:01+00:00",
+        )
+        store.update_node_execution(
+            "exec-1",
+            status="completed",
+            updated_at="2026-04-03T00:00:03+00:00",
+        )
         store.update_run(
             "run-show",
             status="completed",
@@ -204,6 +216,96 @@ def test_cli_show_run_json_contract(
     assert _normalize_show_run_payload(payload) == _load_golden("show_run.json")
 
 
+def test_cli_show_run_json_timings_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    runtime_dir = tmp_path / "runtime"
+    monkeypatch.setenv("TA_DATA_DIR", str(runtime_dir))
+    monkeypatch.delenv("TA_STATE_DB_DSN", raising=False)
+
+    with SQLiteOperationalStore(runtime_dir / "state.sqlite3") as store:
+        store.create_run(
+            run_id="run-show",
+            status="completed",
+            input_data={"job_id": "job-show", "source": "input.wav"},
+            created_at="2026-04-03T00:00:00+00:00",
+        )
+        store.create_node_execution(
+            execution_id="exec-1",
+            run_id="run-show",
+            node_name="fanout_transcription",
+            status="started",
+            created_at="2026-04-03T00:00:01+00:00",
+        )
+        store.update_node_execution(
+            "exec-1",
+            status="completed",
+            updated_at="2026-04-03T00:00:03+00:00",
+        )
+        store.update_run(
+            "run-show",
+            status="completed",
+            output_data={"final_stage": "finalize_outputs"},
+            updated_at="2026-04-03T00:00:05+00:00",
+        )
+    trace_path = runtime_dir / "traces" / "run-show.jsonl"
+    trace_path.parent.mkdir(parents=True, exist_ok=True)
+    trace_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "run_id": "run-show",
+                        "name": "run.started",
+                        "timestamp": "2026-04-03T00:00:00+00:00",
+                        "attributes": {"job_id": "job-show"},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "run_id": "run-show",
+                        "name": "node.started",
+                        "timestamp": "2026-04-03T00:00:01+00:00",
+                        "attributes": {
+                            "node_name": "fanout_transcription",
+                            "execution_id": "exec-1",
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "run_id": "run-show",
+                        "name": "node.completed",
+                        "timestamp": "2026-04-03T00:00:03+00:00",
+                        "attributes": {
+                            "node_name": "fanout_transcription",
+                            "execution_id": "exec-1",
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "run_id": "run-show",
+                        "name": "run.completed",
+                        "timestamp": "2026-04-03T00:00:05+00:00",
+                        "attributes": {"status": "completed"},
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    exit_code = main(["show-run", "run-show", "--timings", "--json"])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert _normalize_show_run_timings_payload(payload) == _load_golden("show_run_timings.json")
+
+
 def _load_golden(name: str) -> object:
     return json.loads((GOLDEN_DIR / name).read_text(encoding="utf-8"))
 
@@ -236,4 +338,12 @@ def _normalize_convert_json_to_srt_payload(payload: dict[str, object]) -> dict[s
 def _normalize_show_run_payload(payload: dict[str, object]) -> dict[str, object]:
     normalized = dict(payload)
     normalized["trace_path"] = "<trace_path>"
+    return normalized
+
+
+def _normalize_show_run_timings_payload(payload: dict[str, object]) -> dict[str, object]:
+    normalized = _normalize_show_run_payload(payload)
+    timings_payload = payload.get("timings")
+    timings = dict(timings_payload) if isinstance(timings_payload, dict) else {}
+    normalized["timings"] = timings
     return normalized
