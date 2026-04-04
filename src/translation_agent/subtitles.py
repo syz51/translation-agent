@@ -33,6 +33,26 @@ def subtitle_count(translation: TranslationCandidate) -> int:
     return len(_subtitle_events(translation))
 
 
+def subtitle_validation_errors(translation: TranslationCandidate) -> tuple[str, ...]:
+    """Return deterministic subtitle export validation failures."""
+
+    errors: list[str] = []
+    blank_segment_ids = [
+        segment.segment_id
+        for segment in translation.segments
+        if not (segment.target_text or "").strip()
+    ]
+    if blank_segment_ids:
+        errors.append("blank_target_cues")
+
+    events = _subtitle_events(translation)
+    for left, right in zip(events, events[1:], strict=False):
+        if right.start < left.end:
+            errors.append("subtitle_overlaps")
+            break
+    return tuple(dict.fromkeys(errors))
+
+
 def _subtitle_events(translation: TranslationCandidate) -> list[pysubs2.SSAEvent]:
     events: list[pysubs2.SSAEvent] = []
     compact_script = _uses_compact_script(translation)

@@ -44,6 +44,10 @@ class RunStatusSnapshot:
     transcription_providers: PhaseCounters | None = None
     translation_variants: PhaseCounters | None = None
     review_bundles: PhaseCounters | None = None
+    transcript_synthesis_status: str | None = None
+    transcript_unresolved_span_count: int | None = None
+    transcript_provider_provenance: dict[str, int] | None = None
+    transcript_artifact_ref: str | None = None
 
 
 @dataclass(slots=True)
@@ -97,6 +101,10 @@ class RunStatusAccumulator:
         self._transcription_phase = _PhaseState()
         self._translation_phase = _PhaseState()
         self._review_phase = _PhaseState()
+        self.transcript_synthesis_status: str | None = None
+        self.transcript_unresolved_span_count: int | None = None
+        self.transcript_provider_provenance: dict[str, int] | None = None
+        self.transcript_artifact_ref: str | None = None
 
     def apply_run_record(self, record: RunRecord, *, trace_path: str | Path | None = None) -> None:
         self.run_id = record.run_id
@@ -108,6 +116,20 @@ class RunStatusAccumulator:
         self.created_at = _parse_timestamp(record.created_at) or self.created_at
         self.updated_at = _parse_timestamp(record.updated_at) or self.updated_at
         self._final_stage = _string_or_none(output_data.get("final_stage"))
+        self.transcript_synthesis_status = _string_or_none(
+            output_data.get("transcript_synthesis_status")
+        )
+        self.transcript_unresolved_span_count = _int_or_none(
+            output_data.get("transcript_unresolved_span_count")
+        )
+        provenance_payload = _dict_payload(output_data.get("transcript_provider_provenance"))
+        if provenance_payload:
+            self.transcript_provider_provenance = {
+                str(key): int(value)
+                for key, value in provenance_payload.items()
+                if isinstance(value, (int, float))
+            }
+        self.transcript_artifact_ref = _string_or_none(output_data.get("transcript_artifact_ref"))
 
     def apply_node_executions(self, executions: Sequence[NodeExecutionRecord]) -> None:
         if not executions:
@@ -205,6 +227,10 @@ class RunStatusAccumulator:
             transcription_providers=self._transcription_phase.snapshot(),
             translation_variants=self._translation_phase.snapshot(),
             review_bundles=self._review_phase.snapshot(),
+            transcript_synthesis_status=self.transcript_synthesis_status,
+            transcript_unresolved_span_count=self.transcript_unresolved_span_count,
+            transcript_provider_provenance=self.transcript_provider_provenance,
+            transcript_artifact_ref=self.transcript_artifact_ref,
         )
 
     def _default_stage(self) -> str | None:

@@ -13,7 +13,7 @@ from translation_agent.graph._langgraph_compat import END, START, StateGraph
 from translation_agent.graph.routing import route_after_memory_pipeline
 from translation_agent.graph.runtime import WorkflowRuntime
 from translation_agent.graph.state import GraphState
-from translation_agent.nodes.adjudicate import adjudicate_transcript, adjudicate_translation
+from translation_agent.nodes.adjudicate import adjudicate_translation
 from translation_agent.nodes.extract_audio import extract_audio
 from translation_agent.nodes.finalize import finalize_outputs
 from translation_agent.nodes.ingest import ingest_job
@@ -22,7 +22,14 @@ from translation_agent.nodes.memory_pipeline import (
     drain_background_memory,
 )
 from translation_agent.nodes.normalize import normalize_transcripts, normalize_translations
-from translation_agent.nodes.review import review_transcripts, review_translations
+from translation_agent.nodes.review import review_translations
+from translation_agent.nodes.transcript_synthesis import (
+    adjudicate_transcript_spans,
+    build_canonical_transcript_spans_node,
+    materialize_synthesized_transcript_node,
+    review_transcript_spans,
+    select_transcript_spans,
+)
 from translation_agent.nodes.transcription import fanout_transcription
 from translation_agent.nodes.translate import generate_translation_candidates
 from translation_agent.observability import TraceEvent
@@ -47,21 +54,48 @@ def build_workflow_graph(runtime: WorkflowRuntime):
         _instrumented_node("normalize_transcripts", runtime, normalize_transcripts),
     )
     builder.add_node(
-        "review_transcripts",
-        _instrumented_node("review_transcripts", runtime, review_transcripts),
+        "build_canonical_transcript_spans",
+        _instrumented_node(
+            "build_canonical_transcript_spans",
+            runtime,
+            build_canonical_transcript_spans_node,
+        ),
     )
     builder.add_node(
-        "adjudicate_transcript",
-        _instrumented_node("adjudicate_transcript", runtime, adjudicate_transcript),
+        "select_transcript_spans",
+        _instrumented_node("select_transcript_spans", runtime, select_transcript_spans),
+    )
+    builder.add_node(
+        "review_transcript_spans",
+        _instrumented_node("review_transcript_spans", runtime, review_transcript_spans),
+    )
+    builder.add_node(
+        "adjudicate_transcript_spans",
+        _instrumented_node(
+            "adjudicate_transcript_spans",
+            runtime,
+            adjudicate_transcript_spans,
+        ),
+    )
+    builder.add_node(
+        "materialize_synthesized_transcript",
+        _instrumented_node(
+            "materialize_synthesized_transcript",
+            runtime,
+            materialize_synthesized_transcript_node,
+        ),
     )
 
     builder.add_edge(START, "ingest")
     builder.add_edge("ingest", "extract_audio")
     builder.add_edge("extract_audio", "fanout_transcription")
     builder.add_edge("fanout_transcription", "normalize_transcripts")
-    builder.add_edge("normalize_transcripts", "review_transcripts")
-    builder.add_edge("review_transcripts", "adjudicate_transcript")
-    builder.add_edge("adjudicate_transcript", "background_memory_pipeline")
+    builder.add_edge("normalize_transcripts", "build_canonical_transcript_spans")
+    builder.add_edge("build_canonical_transcript_spans", "select_transcript_spans")
+    builder.add_edge("select_transcript_spans", "review_transcript_spans")
+    builder.add_edge("review_transcript_spans", "adjudicate_transcript_spans")
+    builder.add_edge("adjudicate_transcript_spans", "materialize_synthesized_transcript")
+    builder.add_edge("materialize_synthesized_transcript", "background_memory_pipeline")
     _add_translation_edges(builder)
     return builder.compile(name="translation_agent_phase_two")
 
@@ -90,18 +124,45 @@ def build_transcription_resume_graph(runtime: WorkflowRuntime):
         _instrumented_node("normalize_transcripts", runtime, normalize_transcripts),
     )
     builder.add_node(
-        "review_transcripts",
-        _instrumented_node("review_transcripts", runtime, review_transcripts),
+        "build_canonical_transcript_spans",
+        _instrumented_node(
+            "build_canonical_transcript_spans",
+            runtime,
+            build_canonical_transcript_spans_node,
+        ),
     )
     builder.add_node(
-        "adjudicate_transcript",
-        _instrumented_node("adjudicate_transcript", runtime, adjudicate_transcript),
+        "select_transcript_spans",
+        _instrumented_node("select_transcript_spans", runtime, select_transcript_spans),
+    )
+    builder.add_node(
+        "review_transcript_spans",
+        _instrumented_node("review_transcript_spans", runtime, review_transcript_spans),
+    )
+    builder.add_node(
+        "adjudicate_transcript_spans",
+        _instrumented_node(
+            "adjudicate_transcript_spans",
+            runtime,
+            adjudicate_transcript_spans,
+        ),
+    )
+    builder.add_node(
+        "materialize_synthesized_transcript",
+        _instrumented_node(
+            "materialize_synthesized_transcript",
+            runtime,
+            materialize_synthesized_transcript_node,
+        ),
     )
     builder.add_edge(START, "fanout_transcription")
     builder.add_edge("fanout_transcription", "normalize_transcripts")
-    builder.add_edge("normalize_transcripts", "review_transcripts")
-    builder.add_edge("review_transcripts", "adjudicate_transcript")
-    builder.add_edge("adjudicate_transcript", "background_memory_pipeline")
+    builder.add_edge("normalize_transcripts", "build_canonical_transcript_spans")
+    builder.add_edge("build_canonical_transcript_spans", "select_transcript_spans")
+    builder.add_edge("select_transcript_spans", "review_transcript_spans")
+    builder.add_edge("review_transcript_spans", "adjudicate_transcript_spans")
+    builder.add_edge("adjudicate_transcript_spans", "materialize_synthesized_transcript")
+    builder.add_edge("materialize_synthesized_transcript", "background_memory_pipeline")
     _add_translation_edges(builder)
     return builder.compile(name="translation_agent_transcription_resume")
 

@@ -18,6 +18,7 @@ class TranslationCandidate(ContractModel):
     candidate_id: NonEmptyStr
     job_id: NonEmptyStr
     source_transcript_candidate_id: str | None = None
+    source_transcript_ref: str | None = None
     final_transcript_ref: str | None = None
     model_id: NonEmptyStr
     prompt_variant_id: NonEmptyStr
@@ -31,10 +32,12 @@ class TranslationCandidate(ContractModel):
 
     @model_validator(mode="after")
     def validate_source_reference(self) -> TranslationCandidate:
-        if self.source_transcript_candidate_id or self.final_transcript_ref:
+        if (
+            self.source_transcript_candidate_id
+            or self.source_transcript_ref
+            or self.final_transcript_ref
+        ):
             return self
         if self.metadata.get("review_mode") == "human_review_synthesis":
             return self
-        raise ValueError(
-            "translation candidates require source_transcript_candidate_id or final_transcript_ref"
-        )
+        raise ValueError("translation candidates require a synthesized transcript reference")

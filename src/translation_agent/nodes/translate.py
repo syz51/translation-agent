@@ -8,14 +8,20 @@ from typing import cast
 
 from translation_agent.graph.runtime import WorkflowRuntime
 from translation_agent.graph.state import GraphState, RoutingFact
-from translation_agent.models import RequestContext, TranscriptCandidate, TranslationCandidate
+from translation_agent.models import (
+    RequestContext,
+    SynthesizedTranscriptArtifact,
+    TranscriptCandidate,
+    TranslationCandidate,
+)
 from translation_agent.nodes.common import (
     build_memory_query,
     build_request_context,
     raw_translation_candidate_key,
-    select_transcript_candidates,
+    read_model_artifact,
     staged_translation_candidate_key,
     strip_private_metadata,
+    synthesized_transcript_as_candidate,
     write_model_artifact,
 )
 from translation_agent.observability import TraceEvent
@@ -27,6 +33,8 @@ PROMPT_VARIANTS = ("variant-a", "variant-b")
 @dataclass(frozen=True, slots=True)
 class _TranslationCandidateTask:
     transcript: TranscriptCandidate
+    transcript_ref: str
+    transcript_artifact: SynthesizedTranscriptArtifact
     prompt_variant_id: str
     resolved_prompt_payload: dict[str, object]
     request_context: RequestContext
@@ -35,18 +43,16 @@ class _TranslationCandidateTask:
 def generate_translation_candidates(
     state: GraphState, runtime: WorkflowRuntime
 ) -> dict[str, object]:
-    """Generate translation candidates from each surviving transcript candidate."""
+    """Generate translation candidates from the synthesized transcript artifact."""
 
-    if not state.transcript_candidate_ids:
-        raise RuntimeError("generate_translation_candidates requires transcript candidates")
-
-    candidates = select_transcript_candidates(
+    if state.final_transcript_ref is None:
+        raise RuntimeError("generate_translation_candidates requires a synthesized transcript")
+    transcript_artifact = read_model_artifact(
         runtime,
-        job=state.job,
-        candidate_ids=state.transcript_candidate_ids,
+        state.final_transcript_ref,
+        SynthesizedTranscriptArtifact,
     )
-    if not candidates:
-        raise RuntimeError("transcript candidates were not found")
+    transcript = synthesized_transcript_as_candidate(transcript_artifact)
 
     request_context = build_request_context(state, runtime)
     payload_refs: list[str] = []
@@ -54,55 +60,59 @@ def generate_translation_candidates(
     routing_facts = list(state.routing_facts)
     task_specs: list[_TranslationCandidateTask] = []
 
-    for transcript in candidates:
-        for prompt_variant_id in PROMPT_VARIANTS:
-            guidance_bundle = runtime.memory_recall_backend.recall_memory(
-                build_memory_query(
-                    state,
-                    stage="generate_translation_guidance",
-                    candidate_ids=(transcript.candidate_id,),
-                    provider_ids=(transcript.provider_id,),
-                    prompt_variant_ids=(prompt_variant_id,),
-                    model_ids=(runtime.translation_adapter.model_id,),
-                )
+    provider_ids = tuple(transcript_artifact.quality_metrics.provider_support_summary.keys()) or (
+        transcript.provider_id,
+    )
+    for prompt_variant_id in PROMPT_VARIANTS:
+        guidance_bundle = runtime.memory_recall_backend.recall_memory(
+            build_memory_query(
+                state,
+                stage="generate_translation_guidance",
+                candidate_ids=(transcript.candidate_id,),
+                provider_ids=provider_ids,
+                prompt_variant_ids=(prompt_variant_id,),
+                model_ids=(runtime.translation_adapter.model_id,),
             )
-            historical_instructions = tuple(
-                entry.content
-                for entry in (*guidance_bundle.rules, *guidance_bundle.procedural_memory)
-                if entry.content.strip()
-            )[:4]
-            resolved_prompt = runtime.prompt_resolver.resolve_translation_prompt(
-                base_prompt_version=getattr(
-                    runtime.translation_adapter,
-                    "_prompt_version",
-                    "unversioned",
-                ),
-                prompt_variant_id=prompt_variant_id,
-                model_id=runtime.translation_adapter.model_id,
-                source_language=state.job.source_language,
-                target_language=state.job.target_language,
-                tenant_id=state.job.tenant_id,
-                project_id=state.job.project_id,
-                media_key=state.job.media_key,
-                run_id=state.run_id,
-            )
-            variant_request_context = request_context.model_copy(
-                update={
-                    "metadata": {
-                        **request_context.metadata,
-                        "resolved_translation_prompt": resolved_prompt.model_dump(mode="json"),
-                        "historical_translation_instructions": list(historical_instructions),
-                    }
+        )
+        historical_instructions = tuple(
+            entry.content
+            for entry in (*guidance_bundle.rules, *guidance_bundle.procedural_memory)
+            if entry.content.strip()
+        )[:4]
+        resolved_prompt = runtime.prompt_resolver.resolve_translation_prompt(
+            base_prompt_version=getattr(
+                runtime.translation_adapter,
+                "_prompt_version",
+                "unversioned",
+            ),
+            prompt_variant_id=prompt_variant_id,
+            model_id=runtime.translation_adapter.model_id,
+            source_language=state.job.source_language,
+            target_language=state.job.target_language,
+            tenant_id=state.job.tenant_id,
+            project_id=state.job.project_id,
+            media_key=state.job.media_key,
+            run_id=state.run_id,
+        )
+        variant_request_context = request_context.model_copy(
+            update={
+                "metadata": {
+                    **request_context.metadata,
+                    "resolved_translation_prompt": resolved_prompt.model_dump(mode="json"),
+                    "historical_translation_instructions": list(historical_instructions),
                 }
+            }
+        )
+        task_specs.append(
+            _TranslationCandidateTask(
+                transcript=transcript,
+                transcript_ref=state.final_transcript_ref,
+                transcript_artifact=transcript_artifact,
+                prompt_variant_id=prompt_variant_id,
+                resolved_prompt_payload=resolved_prompt.model_dump(mode="json"),
+                request_context=variant_request_context,
             )
-            task_specs.append(
-                _TranslationCandidateTask(
-                    transcript=transcript,
-                    prompt_variant_id=prompt_variant_id,
-                    resolved_prompt_payload=resolved_prompt.model_dump(mode="json"),
-                    request_context=variant_request_context,
-                )
-            )
+        )
 
     gathered = ordered_parallel_map(
         task_specs,
@@ -117,14 +127,13 @@ def generate_translation_candidates(
     )
 
     for task, result in zip(task_specs, gathered, strict=True):
-        transcript = task.transcript
         prompt_variant_id = task.prompt_variant_id
         if result.error is not None:
             routing_facts.append(
                 RoutingFact(
                     stage="generate_translation_candidates",
                     fact_type="translation_variant_failed",
-                    value=f"{prompt_variant_id}:{transcript.candidate_id}",
+                    value=f"{prompt_variant_id}:{task.transcript_ref}",
                     source_ref=str(result.error),
                 )
             )
@@ -137,7 +146,7 @@ def generate_translation_candidates(
         raw_payload_ref = raw_translation_candidate_key(
             state.job,
             prompt_variant_id,
-            transcript.candidate_id,
+            _translation_source_token(task.transcript_ref),
         )
         original_raw_payload_ref = candidate.raw_response_ref
         if raw_payload is None:
@@ -162,10 +171,12 @@ def generate_translation_candidates(
             update={
                 "candidate_id": _translation_candidate_id(
                     prompt_variant_id,
-                    transcript.candidate_id,
+                    task.transcript_ref,
                     state.job.job_id,
                 ),
-                "source_transcript_candidate_id": transcript.candidate_id,
+                "source_transcript_candidate_id": None,
+                "source_transcript_ref": task.transcript_ref,
+                "final_transcript_ref": task.transcript_ref,
                 "prompt_version": str(
                     task.resolved_prompt_payload.get("effective_prompt_version")
                     or candidate.prompt_version
@@ -175,7 +186,17 @@ def generate_translation_candidates(
                     {
                         **candidate.metadata,
                         "prompt_resolver": task.resolved_prompt_payload,
-                        "source_transcript_candidate_id": transcript.candidate_id,
+                        "source_transcript_ref": task.transcript_ref,
+                        "provenance_summary": {
+                            "source_transcript_ref": task.transcript_ref,
+                            "source_span_ids": [
+                                span.canonical_span_id
+                                for span in task.transcript_artifact.canonical_spans
+                            ],
+                            "provider_support_summary": (
+                                task.transcript_artifact.quality_metrics.provider_support_summary
+                            ),
+                        },
                     }
                 ),
             }
@@ -191,7 +212,7 @@ def generate_translation_candidates(
             RoutingFact(
                 stage="generate_translation_candidates",
                 fact_type="translation_variant_succeeded",
-                value=f"{prompt_variant_id}:{transcript.candidate_id}",
+                value=f"{prompt_variant_id}:{task.transcript_ref}",
                 source_ref=raw_payload_ref,
             )
         )
@@ -207,10 +228,10 @@ def generate_translation_candidates(
 
 def _translation_candidate_id(
     prompt_variant_id: str,
-    source_transcript_candidate_id: str,
+    source_transcript_token: str,
     job_id: str,
 ) -> str:
-    transcript_token = sha256(source_transcript_candidate_id.encode("utf-8")).hexdigest()[:12]
+    transcript_token = sha256(source_transcript_token.encode("utf-8")).hexdigest()[:12]
     return f"tl-{prompt_variant_id}-{job_id}-{transcript_token}"
 
 
@@ -227,7 +248,7 @@ def _generate_translation_task(
             name="translation.variant.started",
             attributes={
                 "prompt_variant_id": task.prompt_variant_id,
-                "source_transcript_candidate_id": task.transcript.candidate_id,
+                "source_transcript_ref": task.transcript_ref,
                 "variant_total": variant_total,
             },
         )
@@ -262,7 +283,7 @@ def _generate_translation_task(
                 name="translation.variant.completed",
                 attributes={
                     "prompt_variant_id": task.prompt_variant_id,
-                    "source_transcript_candidate_id": task.transcript.candidate_id,
+                    "source_transcript_ref": task.transcript_ref,
                     "variant_total": variant_total,
                     "candidate_id": candidate.candidate_id,
                 },
@@ -276,7 +297,7 @@ def _generate_translation_task(
                 name="translation.variant.failed",
                 attributes={
                     "prompt_variant_id": task.prompt_variant_id,
-                    "source_transcript_candidate_id": task.transcript.candidate_id,
+                    "source_transcript_ref": task.transcript_ref,
                     "variant_total": variant_total,
                     "error": str(exc),
                 },
@@ -287,3 +308,7 @@ def _generate_translation_task(
 
 def _supports_raw_payload_translation(adapter: object) -> bool:
     return callable(getattr(adapter, "generate_translation_with_payload", None))
+
+
+def _translation_source_token(source_transcript_ref: str) -> str:
+    return sha256(source_transcript_ref.encode("utf-8")).hexdigest()[:12]

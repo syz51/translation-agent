@@ -80,6 +80,7 @@ def normalize_translation_candidate(candidate: TranslationCandidate) -> Translat
 
     candidate_id = _normalize_identifier(candidate.candidate_id, fallback="translation-candidate")
     source_candidate_id = _normalize_optional_identifier(candidate.source_transcript_candidate_id)
+    source_transcript_ref = _normalize_ref(candidate.source_transcript_ref)
     final_transcript_ref = _normalize_ref(candidate.final_transcript_ref)
     model_id = _normalize_identifier(candidate.model_id, fallback="unknown-model")
     prompt_variant_id = _normalize_identifier(candidate.prompt_variant_id, fallback="variant")
@@ -111,10 +112,12 @@ def normalize_translation_candidate(candidate: TranslationCandidate) -> Translat
     metadata["candidate_kind"] = "translation"
     metadata["raw_response_ref"] = raw_response_ref
     metadata["source_transcript_candidate_id"] = source_candidate_id
+    metadata["source_transcript_ref"] = source_transcript_ref
     return candidate.model_copy(
         update={
             "candidate_id": candidate_id,
             "source_transcript_candidate_id": source_candidate_id,
+            "source_transcript_ref": source_transcript_ref,
             "final_transcript_ref": final_transcript_ref,
             "model_id": model_id,
             "prompt_variant_id": prompt_variant_id,

@@ -66,7 +66,21 @@ from .review import (
     StructuredEvidence,
     SuggestedFix,
 )
-from .transcript import Segment, TranscriptCandidate
+from .transcript import (
+    CanonicalTranscriptSpan,
+    Segment,
+    SynthesizedTranscriptArtifact,
+    TranscriptCandidate,
+    TranscriptCanonicalSpanTable,
+    TranscriptQualityMetrics,
+    TranscriptReviewIssue,
+    TranscriptSpanCandidate,
+    TranscriptSpanDecision,
+    TranscriptSpanProvenance,
+    TranscriptSynthesisRecord,
+    TranscriptSynthesisReview,
+    TranscriptUnresolvedSpan,
+)
 from .translation import TranslationCandidate
 
 __all__ = [
@@ -78,6 +92,7 @@ __all__ = [
     "AssetRecord",
     "AudioArtifact",
     "CandidatePreference",
+    "CanonicalTranscriptSpan",
     "EvaluatedRunReport",
     "EvaluationFailure",
     "EvaluationReport",
@@ -122,6 +137,8 @@ __all__ = [
     "ReviewedSpanDecision",
     "RoutingContext",
     "Segment",
+    "SynthesizedTranscriptArtifact",
+    "TranscriptCanonicalSpanTable",
     "StrongerGraderScore",
     "StructuredEvidence",
     "SuggestedFix",
@@ -129,7 +146,15 @@ __all__ = [
     "TranscriptAlignmentReport",
     "TranscriptMismatchSpan",
     "TranscriptCandidate",
+    "TranscriptQualityMetrics",
+    "TranscriptReviewIssue",
     "TranscriptProviderQualityStats",
+    "TranscriptSpanCandidate",
+    "TranscriptSpanDecision",
+    "TranscriptSpanProvenance",
+    "TranscriptSynthesisRecord",
+    "TranscriptSynthesisReview",
+    "TranscriptUnresolvedSpan",
     "TranslationFeedbackStats",
     "TranslationScore",
     "TranslationCandidate",

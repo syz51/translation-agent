@@ -12,19 +12,18 @@ from translation_agent.models import (
     FinalTranscriptDecision,
     FinalTranslationDecision,
     PublishedArtifacts,
-    TranscriptCandidate,
+    SynthesizedTranscriptArtifact,
     TranslationCandidate,
 )
 from translation_agent.nodes.common import (
     published_artifacts_key,
     read_model_artifact,
-    select_transcript_candidates,
     select_translation_candidates,
     translation_failure_key,
     write_model_artifact,
 )
 from translation_agent.storage import job_path
-from translation_agent.subtitles import render_translation_srt
+from translation_agent.subtitles import render_translation_srt, subtitle_validation_errors
 
 
 def publish_outputs(state: GraphState, runtime: WorkflowRuntime) -> tuple[PublishedArtifacts, str]:
@@ -51,6 +50,9 @@ def publish_outputs(state: GraphState, runtime: WorkflowRuntime) -> tuple[Publis
         write_model_artifact(runtime, transcript_ref, transcript)
 
     if translation is not None and not state.human_review_required:
+        validation_errors = subtitle_validation_errors(translation)
+        if validation_errors:
+            raise RuntimeError("subtitle export validation failed: " + ", ".join(validation_errors))
         translation_ref = job_path(state.job, "published", "translation.json")
         write_model_artifact(runtime, translation_ref, translation)
     elif state.translation_failed:
@@ -188,17 +190,12 @@ def _publish_trace_artifact(
     return (trace_ref,)
 
 
-def _final_transcript(state: GraphState, runtime: WorkflowRuntime) -> TranscriptCandidate | None:
-    if state.final_transcript_candidate_id is None:
+def _final_transcript(
+    state: GraphState, runtime: WorkflowRuntime
+) -> SynthesizedTranscriptArtifact | None:
+    if state.final_transcript_ref is None:
         return None
-    transcript_candidates = select_transcript_candidates(
-        runtime,
-        job=state.job,
-        candidate_ids=(state.final_transcript_candidate_id,),
-    )
-    if transcript_candidates:
-        return transcript_candidates[0]
-    return None
+    return read_model_artifact(runtime, state.final_transcript_ref, SynthesizedTranscriptArtifact)
 
 
 def _final_translation(state: GraphState, runtime: WorkflowRuntime) -> TranslationCandidate | None:
@@ -276,7 +273,7 @@ def _scorecard_payload(
 def _export_payload(
     *,
     state: GraphState,
-    transcript: TranscriptCandidate | None,
+    transcript: SynthesizedTranscriptArtifact | None,
     translation: TranslationCandidate | None,
     transcript_ref: str | None,
     translation_ref: str | None,
@@ -295,6 +292,10 @@ def _export_payload(
         "approval_ref": state.approval_ref,
         "approved_candidate_id": state.approved_candidate_id,
         "approved_source_transcript_candidate_id": state.approved_source_transcript_candidate_id,
+        "transcript_synthesis_status": transcript.status if transcript is not None else None,
+        "transcript_unresolved_span_count": (
+            transcript.quality_metrics.unresolved_span_count if transcript is not None else None
+        ),
         "transcript_ref": transcript_ref,
         "translation_ref": translation_ref,
         "translation_failure_ref": translation_failure_ref,

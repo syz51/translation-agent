@@ -34,6 +34,11 @@ class GraphState(ContractModel):
     raw_transcript_candidate_refs: tuple[str, ...] = ()
     transcript_candidate_ids: tuple[str, ...] = ()
     transcript_review_ids: tuple[str, ...] = ()
+    canonical_transcript_span_ref: str | None = None
+    final_transcript_ref: str | None = None
+    final_transcript_synthesis_ref: str | None = None
+    transcript_span_review_ref: str | None = None
+    transcript_unresolved_span_count: int = 0
     final_transcript_candidate_id: str | None = None
     final_transcript_decision_ref: str | None = None
     raw_translation_payload_refs: tuple[str, ...] = ()

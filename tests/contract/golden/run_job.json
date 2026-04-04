@@ -21,5 +21,13 @@
   "state_db_target": "<state_db_target>",
   "status": "completed",
   "target_language": "zh-CN",
-  "trace_path": "<trace_path>"
+  "trace_path": "<trace_path>",
+  "transcript_artifact_ref": "tenants/tenant-local/projects/project-local/languages/en-to-zh-CN/jobs/job-123/artifacts/final-transcript.json",
+  "transcript_provider_provenance": {
+    "assemblyai": 1,
+    "deepgram": 1,
+    "speechmatics": 1
+  },
+  "transcript_synthesis_status": "ready",
+  "transcript_unresolved_span_count": 0
 }

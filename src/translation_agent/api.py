@@ -36,16 +36,21 @@ from translation_agent.models import (
     JobContext,
     ReviewDraftResolution,
     ReviewedSpanDecision,
+    SynthesizedTranscriptArtifact,
     TranscriptCandidate,
     TranslationCandidate,
 )
 from translation_agent.nodes.common import (
     audio_artifact_key,
+    canonical_transcript_span_key,
+    final_transcript_artifact_key,
     raw_transcript_candidate_key,
     transcript_candidate_key,
     transcript_decision_key,
     transcript_investigation_key,
     transcript_review_key,
+    transcript_span_review_record_key,
+    transcript_synthesis_key,
 )
 from translation_agent.observability.events import (
     configure_structured_logging,
@@ -123,6 +128,10 @@ class RunJobResult:
     approval_ref: str | None = None
     approved_candidate_id: str | None = None
     approved_source_transcript_candidate_id: str | None = None
+    transcript_synthesis_status: str | None = None
+    transcript_unresolved_span_count: int = 0
+    transcript_provider_provenance: dict[str, int] = field(default_factory=dict)
+    transcript_artifact_ref: str | None = None
     resume_commands: tuple[str, ...] = ()
 
 
@@ -150,6 +159,11 @@ class ResumedTranscriptState:
     final_transcript_candidate_id: str | None
     final_transcript_decision_ref: str | None
     routing_facts: tuple[RoutingFact, ...]
+    canonical_transcript_span_ref: str | None = None
+    final_transcript_ref: str | None = None
+    final_transcript_synthesis_ref: str | None = None
+    transcript_span_review_ref: str | None = None
+    transcript_unresolved_span_count: int = 0
 
 
 def list_runs(settings: Settings | None = None) -> list[RunRecord]:
@@ -363,6 +377,7 @@ def run_job(
             final_state=final_state,
             blob_store=blob_store,
         )
+        transcript_synthesis = _transcript_synthesis_payload(final_state, blob_store)
         terminal_error = _terminal_run_error(
             final_state=final_state,
             failure_ref=failure_ref,
@@ -382,6 +397,7 @@ def run_job(
                 "memory_batch_ids": list(final_state.memory_batch_ids),
                 "media_key": final_state.job.media_key,
                 "transcript_decision_ref": final_state.final_transcript_decision_ref,
+                "final_transcript_ref": final_state.final_transcript_ref,
                 "translation_decision_ref": final_state.final_translation_decision_ref,
                 "transcript_investigation_ref": _investigation_ref(
                     final_state,
@@ -404,6 +420,7 @@ def run_job(
                 "approved_source_transcript_candidate_id": (
                     final_state.approved_source_transcript_candidate_id
                 ),
+                **transcript_synthesis,
                 "failure_ref": failure_ref,
                 "failure_summary": failure_summary,
                 "failure_reasons": list(failure_reasons),
@@ -456,6 +473,10 @@ def run_job(
         approval_ref=final_state.approval_ref,
         approved_candidate_id=final_state.approved_candidate_id,
         approved_source_transcript_candidate_id=final_state.approved_source_transcript_candidate_id,
+        transcript_synthesis_status=transcript_synthesis["transcript_synthesis_status"],
+        transcript_unresolved_span_count=transcript_synthesis["transcript_unresolved_span_count"],
+        transcript_provider_provenance=transcript_synthesis["transcript_provider_provenance"],
+        transcript_artifact_ref=transcript_synthesis["transcript_artifact_ref"],
         resume_commands=_resume_commands(run_id, final_state),
     )
 
@@ -606,6 +627,11 @@ def resume_translation(
                 source_video_ref=resumed_job.source_video_ref,
                 source_artifact_ref=request_artifact.key,
                 transcript_candidate_ids=transcript_state.transcript_candidate_ids,
+                canonical_transcript_span_ref=transcript_state.canonical_transcript_span_ref,
+                final_transcript_ref=transcript_state.final_transcript_ref,
+                final_transcript_synthesis_ref=transcript_state.final_transcript_synthesis_ref,
+                transcript_span_review_ref=transcript_state.transcript_span_review_ref,
+                transcript_unresolved_span_count=transcript_state.transcript_unresolved_span_count,
                 final_transcript_candidate_id=transcript_state.final_transcript_candidate_id,
                 final_transcript_decision_ref=transcript_state.final_transcript_decision_ref,
                 routing_facts=transcript_state.routing_facts,
@@ -665,6 +691,7 @@ def resume_translation(
             final_state=final_state,
             blob_store=blob_store,
         )
+        transcript_synthesis = _transcript_synthesis_payload(final_state, blob_store)
         terminal_error = _terminal_run_error(
             final_state=final_state,
             failure_ref=failure_ref,
@@ -684,6 +711,7 @@ def resume_translation(
                 "memory_batch_ids": list(final_state.memory_batch_ids),
                 "media_key": final_state.job.media_key,
                 "transcript_decision_ref": final_state.final_transcript_decision_ref,
+                "final_transcript_ref": final_state.final_transcript_ref,
                 "translation_decision_ref": final_state.final_translation_decision_ref,
                 "transcript_investigation_ref": _investigation_ref(
                     final_state,
@@ -706,6 +734,7 @@ def resume_translation(
                 "approved_source_transcript_candidate_id": (
                     final_state.approved_source_transcript_candidate_id
                 ),
+                **transcript_synthesis,
                 "failure_ref": failure_ref,
                 "failure_summary": failure_summary,
                 "failure_reasons": list(failure_reasons),
@@ -760,6 +789,10 @@ def resume_translation(
         approval_ref=final_state.approval_ref,
         approved_candidate_id=final_state.approved_candidate_id,
         approved_source_transcript_candidate_id=final_state.approved_source_transcript_candidate_id,
+        transcript_synthesis_status=transcript_synthesis["transcript_synthesis_status"],
+        transcript_unresolved_span_count=transcript_synthesis["transcript_unresolved_span_count"],
+        transcript_provider_provenance=transcript_synthesis["transcript_provider_provenance"],
+        transcript_artifact_ref=transcript_synthesis["transcript_artifact_ref"],
         resume_commands=_resume_commands(new_run_id, final_state),
     )
     if review_mode == "never":
@@ -981,6 +1014,7 @@ def resume_transcription(
             final_state=final_state,
             blob_store=blob_store,
         )
+        transcript_synthesis = _transcript_synthesis_payload(final_state, blob_store)
         terminal_error = _terminal_run_error(
             final_state=final_state,
             failure_ref=failure_ref,
@@ -1000,6 +1034,7 @@ def resume_transcription(
                 "memory_batch_ids": list(final_state.memory_batch_ids),
                 "media_key": final_state.job.media_key,
                 "transcript_decision_ref": final_state.final_transcript_decision_ref,
+                "final_transcript_ref": final_state.final_transcript_ref,
                 "translation_decision_ref": final_state.final_translation_decision_ref,
                 "transcript_investigation_ref": _investigation_ref(
                     final_state,
@@ -1022,6 +1057,7 @@ def resume_transcription(
                 "approved_source_transcript_candidate_id": (
                     final_state.approved_source_transcript_candidate_id
                 ),
+                **transcript_synthesis,
                 "failure_ref": failure_ref,
                 "failure_summary": failure_summary,
                 "failure_reasons": list(failure_reasons),
@@ -1078,6 +1114,10 @@ def resume_transcription(
         approval_ref=final_state.approval_ref,
         approved_candidate_id=final_state.approved_candidate_id,
         approved_source_transcript_candidate_id=final_state.approved_source_transcript_candidate_id,
+        transcript_synthesis_status=transcript_synthesis["transcript_synthesis_status"],
+        transcript_unresolved_span_count=transcript_synthesis["transcript_unresolved_span_count"],
+        transcript_provider_provenance=transcript_synthesis["transcript_provider_provenance"],
+        transcript_artifact_ref=transcript_synthesis["transcript_artifact_ref"],
         resume_commands=_resume_commands(new_run_id, final_state),
     )
     if review_mode == "never":
@@ -1380,13 +1420,40 @@ def _seed_resumed_transcript_state(
         )
 
     copied_decision_ref = None
-    final_transcript_candidate_id = (
-        transcript_decision.winner_candidate_id
-        if transcript_decision is not None
-        else _fallback_final_transcript_candidate_id(transcript_candidates)
+    copied_final_transcript_ref = None
+    source_final_transcript_ref = _normalized_optional_identifier(
+        source_output_data.get("final_transcript_ref")
     )
-    if final_transcript_candidate_id is None:
-        raise ValueError("resume translation requires a resolved final transcript candidate")
+    if source_final_transcript_ref is None and transcript_decision is not None:
+        source_final_transcript_ref = _normalized_optional_identifier(
+            transcript_decision.transcript_artifact_ref
+        )
+    if source_final_transcript_ref is not None and blob_store.exists(source_final_transcript_ref):
+        copied_final_transcript_ref = final_transcript_artifact_key(resumed_job)
+        blob_store.put_bytes(
+            copied_final_transcript_ref,
+            blob_store.read_bytes(source_final_transcript_ref),
+        )
+
+    copied_canonical_span_ref = _copy_optional_artifact(
+        blob_store=blob_store,
+        source_ref=canonical_transcript_span_key(source_job),
+        target_ref=canonical_transcript_span_key(resumed_job),
+    )
+    copied_synthesis_ref = _copy_optional_artifact(
+        blob_store=blob_store,
+        source_ref=transcript_synthesis_key(source_job),
+        target_ref=transcript_synthesis_key(resumed_job),
+    )
+    copied_span_review_ref = _copy_optional_artifact(
+        blob_store=blob_store,
+        source_ref=transcript_span_review_record_key(source_job),
+        target_ref=transcript_span_review_record_key(resumed_job),
+    )
+
+    final_transcript_candidate_id = _fallback_final_transcript_candidate_id(transcript_candidates)
+    if copied_final_transcript_ref is None and final_transcript_candidate_id is None:
+        raise ValueError("resume translation requires a resolved synthesized transcript")
     if transcript_decision is not None:
         for review_id in transcript_decision.review_refs:
             source_review_ref = transcript_review_key(source_job, review_id)
@@ -1397,6 +1464,7 @@ def _seed_resumed_transcript_state(
             update={
                 "job_id": resumed_job.job_id,
                 "investigation_ref": copied_investigation_ref,
+                "transcript_artifact_ref": copied_final_transcript_ref,
             }
         )
         store.save_transcript_decision(copied_decision, storage_job_id=storage_job_id)
@@ -1445,6 +1513,13 @@ def _seed_resumed_transcript_state(
     return ResumedTranscriptState(
         audio_artifact_ref=None,
         transcript_candidate_ids=tuple(copied_candidate_ids),
+        canonical_transcript_span_ref=copied_canonical_span_ref,
+        final_transcript_ref=copied_final_transcript_ref,
+        final_transcript_synthesis_ref=copied_synthesis_ref,
+        transcript_span_review_ref=copied_span_review_ref,
+        transcript_unresolved_span_count=(
+            transcript_decision.unresolved_span_count if transcript_decision is not None else 0
+        ),
         final_transcript_candidate_id=final_transcript_candidate_id,
         final_transcript_decision_ref=copied_decision_ref,
         routing_facts=tuple(routing_facts),
@@ -1556,6 +1631,18 @@ def _copy_audio_artifact(
     )
     _write_blob_model_artifact(blob_store, audio_artifact_key(resumed_job), copied_audio)
     return copied_audio
+
+
+def _copy_optional_artifact(
+    *,
+    blob_store: LocalBlobStore,
+    source_ref: str,
+    target_ref: str,
+) -> str | None:
+    if not blob_store.exists(source_ref):
+        return None
+    blob_store.put_bytes(target_ref, blob_store.read_bytes(source_ref))
+    return target_ref
 
 
 def _failed_transcription_provider_ids(
@@ -1746,7 +1833,7 @@ def _upsert_current_run_link(
             created_at=state.job.created_at,
             transcript_ref=(
                 job_path(state.job, "published", "transcript.json")
-                if state.final_transcript_candidate_id is not None
+                if state.final_transcript_ref is not None
                 else None
             ),
             translation_ref=(
@@ -1904,7 +1991,31 @@ def _translation_failure_retryable(failure_reasons: tuple[str, ...]) -> bool:
     return False
 
 
+def _transcript_synthesis_payload(
+    state: GraphState,
+    blob_store: LocalBlobStore,
+) -> dict[str, Any]:
+    if state.final_transcript_ref is None or not blob_store.exists(state.final_transcript_ref):
+        return {
+            "transcript_synthesis_status": None,
+            "transcript_unresolved_span_count": state.transcript_unresolved_span_count,
+            "transcript_provider_provenance": {},
+            "transcript_artifact_ref": state.final_transcript_ref,
+        }
+    artifact = SynthesizedTranscriptArtifact.model_validate_json(
+        blob_store.read_bytes(state.final_transcript_ref)
+    )
+    return {
+        "transcript_synthesis_status": artifact.status,
+        "transcript_unresolved_span_count": artifact.quality_metrics.unresolved_span_count,
+        "transcript_provider_provenance": artifact.quality_metrics.provider_support_summary,
+        "transcript_artifact_ref": state.final_transcript_ref,
+    }
+
+
 def _resume_commands(run_id: str, state: GraphState) -> tuple[str, ...]:
+    if state.review_required_stage == "transcript":
+        return (f"uv run translation-agent review-job {run_id}",)
     if state.review_required_stage != "translation":
         return ()
     return (

@@ -242,7 +242,7 @@ def test_phase_five_happy_path_publishes_audit_ready_outputs(tmp_path: Path) -> 
         format_="srt",
     )
     assert scorecard["translation_decision"]["disagreement_bucket"] == "low"
-    assert scorecard["translation_decision"]["adjudication_scorecard"]["candidate_count"] == 6
+    assert scorecard["translation_decision"]["adjudication_scorecard"]["candidate_count"] == 2
     assert scorecard["export_refs"] == [
         _artifact_path("exports", "translation.srt"),
         _artifact_path("exports", "translation.json"),
