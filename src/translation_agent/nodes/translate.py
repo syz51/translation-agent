@@ -21,7 +21,8 @@ from translation_agent.nodes.common import (
 from translation_agent.observability import TraceEvent
 from translation_agent.parallelism import ordered_parallel_map
 
-PROMPT_VARIANTS = ("variant-a", "variant-b")
+DEFAULT_PROMPT_VARIANTS = ("variant-a",)
+EXPERIMENT_PROMPT_VARIANTS = ("variant-a", "variant-b")
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,7 +36,7 @@ class _TranslationCandidateTask:
 def generate_translation_candidates(
     state: GraphState, runtime: WorkflowRuntime
 ) -> dict[str, object]:
-    """Generate translation candidates from each surviving transcript candidate."""
+    """Generate translation candidates from the selected transcript scope."""
 
     if not state.transcript_candidate_ids:
         raise RuntimeError("generate_translation_candidates requires transcript candidates")
@@ -48,14 +49,16 @@ def generate_translation_candidates(
     if not candidates:
         raise RuntimeError("transcript candidates were not found")
 
+    selected_transcripts = _selected_transcripts_for_translation(state, tuple(candidates))
+    prompt_variants = _selected_prompt_variants(state)
     request_context = build_request_context(state, runtime)
     payload_refs: list[str] = []
     staged_refs: list[str] = []
     routing_facts = list(state.routing_facts)
     task_specs: list[_TranslationCandidateTask] = []
 
-    for transcript in candidates:
-        for prompt_variant_id in PROMPT_VARIANTS:
+    for transcript in selected_transcripts:
+        for prompt_variant_id in prompt_variants:
             guidance_bundle = runtime.memory_recall_backend.recall_memory(
                 build_memory_query(
                     state,
@@ -203,6 +206,40 @@ def generate_translation_candidates(
         "translation_failed": not staged_refs,
         "routing_facts": tuple(routing_facts),
     }
+
+
+def _selected_transcripts_for_translation(
+    state: GraphState,
+    candidates: tuple[TranscriptCandidate, ...],
+) -> tuple[TranscriptCandidate, ...]:
+    if _transcript_review_deferred_to_translation(state):
+        return candidates
+    if state.final_transcript_candidate_id is None:
+        raise RuntimeError(
+            "generate_translation_candidates requires final_transcript_candidate_id "
+            "when transcript review is resolved"
+        )
+    selected = tuple(
+        candidate
+        for candidate in candidates
+        if candidate.candidate_id == state.final_transcript_candidate_id
+    )
+    if not selected:
+        raise RuntimeError("final transcript candidate was not found among survivors")
+    return selected
+
+
+def _selected_prompt_variants(state: GraphState) -> tuple[str, ...]:
+    if state.job.translation_variant_policy == "dual_experiment":
+        return EXPERIMENT_PROMPT_VARIANTS
+    return DEFAULT_PROMPT_VARIANTS
+
+
+def _transcript_review_deferred_to_translation(state: GraphState) -> bool:
+    return any(
+        fact.fact_type == "transcript_review_deferred_to_translation"
+        for fact in state.routing_facts
+    )
 
 
 def _translation_candidate_id(

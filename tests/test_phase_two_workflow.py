@@ -179,7 +179,7 @@ def _artifact_path(*parts: str) -> str:
 
 
 def _run_workflow(
-    tmp_path: Path, *, scenario: str
+    tmp_path: Path, *, scenario: str, job: JobContext | None = None
 ) -> tuple[GraphState, InMemoryRunStore, LocalBlobStore]:
     run_store = InMemoryRunStore()
     run_store.create_run(run_id="run-123", status="running")
@@ -195,7 +195,7 @@ def _run_workflow(
     )
     initial_state = GraphState(
         run_id="run-123",
-        job=_job_context(),
+        job=job or _job_context(),
         current_stage="ingest",
         source_video_ref="input.mp4",
         source_artifact_ref=source_ref,
@@ -212,6 +212,7 @@ def test_phase_two_happy_path_executes_full_graph(tmp_path: Path) -> None:
     assert final_state.translation_failed is False
     assert len(final_state.memory_batch_ids) == 2
     assert final_state.final_translation_candidate_id is not None
+    assert final_state.translation_candidate_ids == (final_state.final_translation_candidate_id,)
     assert blob_store.exists(_artifact_path("published", "transcript.json"))
     assert blob_store.exists(_artifact_path("published", "translation.json"))
     assert len(run_store.list_node_executions("run-123")) == 13
@@ -229,8 +230,14 @@ def test_phase_two_degraded_stt_keeps_run_recoverable(tmp_path: Path) -> None:
     assert len(run_store.list_node_executions("run-123")) == 13
 
 
-def test_phase_two_single_surviving_translation_variant_still_publishes(tmp_path: Path) -> None:
-    final_state, _, blob_store = _run_workflow(tmp_path, scenario="translation_single_variant")
+def test_phase_two_dual_experiment_single_surviving_variant_still_publishes(
+    tmp_path: Path,
+) -> None:
+    final_state, _, blob_store = _run_workflow(
+        tmp_path,
+        scenario="translation_single_variant",
+        job=_job_context().model_copy(update={"translation_variant_policy": "dual_experiment"}),
+    )
 
     assert final_state.translation_failed is False
     assert final_state.final_translation_candidate_id is not None
@@ -240,7 +247,7 @@ def test_phase_two_single_surviving_translation_variant_still_publishes(tmp_path
         for fact in final_state.routing_facts
         if fact.fact_type == "surviving_translation_candidates"
     ]
-    assert surviving_translation_counts[-1] == "3"
+    assert surviving_translation_counts[-1] == "1"
 
 
 def test_phase_two_translation_failure_preserves_transcript_outputs(tmp_path: Path) -> None:
@@ -263,10 +270,21 @@ def test_phase_two_escalation_skips_translation_path(tmp_path: Path) -> None:
     executed_nodes = [record.node_name for record in run_store.list_node_executions("run-123")]
     assert "generate_translation_candidates" in executed_nodes
     assert len(executed_nodes) == 13
+    succeeded_translation_facts = [
+        fact.value
+        for fact in final_state.routing_facts
+        if fact.fact_type == "translation_variant_succeeded"
+    ]
+    assert len(succeeded_translation_facts) == len(final_state.transcript_candidate_ids)
+    assert all(value.startswith("variant-a:") for value in succeeded_translation_facts)
 
 
 def test_phase_four_medium_disagreement_invokes_conflict_investigator(tmp_path: Path) -> None:
-    final_state, _, blob_store = _run_workflow(tmp_path, scenario="translation_conflict")
+    final_state, _, blob_store = _run_workflow(
+        tmp_path,
+        scenario="translation_conflict",
+        job=_job_context().model_copy(update={"translation_variant_policy": "dual_experiment"}),
+    )
 
     assert final_state.human_review_required is False
     assert final_state.final_translation_candidate_id is not None
@@ -283,7 +301,11 @@ def test_phase_four_medium_disagreement_invokes_conflict_investigator(tmp_path: 
 
 
 def test_phase_four_high_risk_invokes_stronger_adjudicator(tmp_path: Path) -> None:
-    final_state, _, blob_store = _run_workflow(tmp_path, scenario="translation_high_risk")
+    final_state, _, blob_store = _run_workflow(
+        tmp_path,
+        scenario="translation_high_risk",
+        job=_job_context().model_copy(update={"translation_variant_policy": "dual_experiment"}),
+    )
 
     assert final_state.human_review_required is False
     assert final_state.final_translation_candidate_id is not None
@@ -302,7 +324,11 @@ def test_phase_four_high_risk_invokes_stronger_adjudicator(tmp_path: Path) -> No
 def test_phase_four_translation_escalation_uses_stronger_adjudicator(
     tmp_path: Path,
 ) -> None:
-    final_state, _, blob_store = _run_workflow(tmp_path, scenario="translation_escalation")
+    final_state, _, blob_store = _run_workflow(
+        tmp_path,
+        scenario="translation_escalation",
+        job=_job_context().model_copy(update={"translation_variant_policy": "dual_experiment"}),
+    )
 
     assert final_state.human_review_required is False
     assert final_state.final_translation_candidate_id is not None
@@ -394,7 +420,141 @@ def test_phase_two_transcription_fanout_runs_in_parallel(tmp_path: Path) -> None
     assert final_state.current_stage == "finalize_outputs"
 
 
-def test_generate_translation_candidates_preserves_task_order_and_partial_failures(
+def test_generate_translation_candidates_defaults_to_winner_first_single_variant(
+    tmp_path: Path,
+) -> None:
+    run_store = InMemoryRunStore()
+    run_store.create_run(run_id="run-translation-single", status="running")
+    blob_store = LocalBlobStore(tmp_path / "blobs")
+    source_ref = "jobs/run-translation-single-request.json"
+    blob_store.put_bytes(source_ref, b"{}\n")
+    runtime = build_phase_two_runtime(
+        blob_store=blob_store,
+        run_store=run_store,
+        trace_sink=NoOpTraceSink(),
+        source_artifact_ref=source_ref,
+        scenario="happy",
+    )
+    job = _job_context(job_id="job-translation-single")
+    storage_job_id = operational_job_key(job)
+    transcript_a = TranscriptCandidate(
+        candidate_id="tr-a",
+        job_id=job.job_id,
+        provider_id="assemblyai",
+        provider_request_id="req-a",
+        language=job.source_language,
+        segments=(
+            Segment(
+                segment_id="seg-a",
+                start_ms=0,
+                end_ms=1_000,
+                speaker="speaker-1",
+                source_text="Alpha",
+            ),
+        ),
+        full_text="Alpha",
+        speaker_map={"speaker-1": "Host"},
+        timing_resolution="segment",
+        raw_payload_ref="raw/tr-a.json",
+        normalization_version="test",
+        metadata={"provider_rank": 0},
+    )
+    transcript_b = transcript_a.model_copy(
+        update={
+            "candidate_id": "tr-b",
+            "provider_request_id": "req-b",
+            "full_text": "Beta",
+            "segments": (
+                Segment(
+                    segment_id="seg-b",
+                    start_ms=0,
+                    end_ms=1_000,
+                    speaker="speaker-1",
+                    source_text="Beta",
+                ),
+            ),
+            "raw_payload_ref": "raw/tr-b.json",
+            "metadata": {"provider_rank": 1},
+        }
+    )
+    runtime.decision_store.save_transcript_candidate(transcript_a, storage_job_id=storage_job_id)
+    runtime.decision_store.save_transcript_candidate(transcript_b, storage_job_id=storage_job_id)
+
+    class RawAdapter:
+        model_id = "gpt-5.4-mini"
+        _prompt_version = "phase-3-v1"
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str]] = []
+
+        def generate_translation(
+            self,
+            final_transcript: TranscriptCandidate,
+            prompt_variant_id: str,
+            request_context: RequestContext,
+        ) -> TranslationCandidate:
+            candidate, _ = self.generate_translation_with_payload(
+                final_transcript,
+                prompt_variant_id,
+                request_context,
+            )
+            return candidate
+
+        def generate_translation_with_payload(
+            self,
+            transcript: TranscriptCandidate,
+            prompt_variant_id: str,
+            request_context: RequestContext,
+        ) -> tuple[TranslationCandidate, dict[str, object]]:
+            del request_context
+            self.calls.append((transcript.candidate_id, prompt_variant_id))
+            target_text = f"{transcript.full_text}-{prompt_variant_id}"
+            candidate = TranslationCandidate(
+                candidate_id=f"raw-{transcript.candidate_id}-{prompt_variant_id}",
+                job_id=job.job_id,
+                source_transcript_candidate_id=transcript.candidate_id,
+                model_id=self.model_id,
+                prompt_variant_id=prompt_variant_id,
+                prompt_version="raw-prompt",
+                language=job.target_language,
+                segments=(transcript.segments[0].model_copy(update={"target_text": target_text}),),
+                full_text=target_text,
+                raw_response_ref=None,
+                normalization_version="raw-test",
+                metadata={},
+            )
+            return candidate, {"candidate": candidate.candidate_id}
+
+    adapter = RawAdapter()
+    runtime.translation_adapter = cast(Any, adapter)
+    state = GraphState(
+        run_id="run-translation-single",
+        job=job,
+        current_stage="generate_translation_candidates",
+        source_video_ref="input.mp4",
+        source_artifact_ref=source_ref,
+        transcript_candidate_ids=("tr-a", "tr-b"),
+        final_transcript_candidate_id="tr-b",
+    )
+
+    output = generate_translation_candidates(state, runtime)
+
+    assert output["translation_failed"] is False
+    assert adapter.calls == [("tr-b", "variant-a")]
+    assert output["raw_translation_payload_refs"] == (
+        job_path(job, "raw", "translation-candidates", "variant-a-tr-b.json"),
+    )
+    assert output["raw_translation_candidate_refs"] == (
+        job_path(
+            job,
+            "staging",
+            "translations",
+            f"{_translation_candidate_id('variant-a', 'tr-b', job.job_id)}.json",
+        ),
+    )
+
+
+def test_generate_translation_candidates_defers_to_survivor_fanout_when_requested(
     tmp_path: Path,
 ) -> None:
     run_store = InMemoryRunStore()
@@ -459,8 +619,7 @@ def test_generate_translation_candidates_preserves_task_order_and_partial_failur
         _prompt_version = "phase-3-v1"
 
         def __init__(self) -> None:
-            self._first_variant_started = threading.Event()
-            self._second_variant_released = threading.Event()
+            self.calls: list[tuple[str, str]] = []
 
         def generate_translation(
             self,
@@ -481,23 +640,17 @@ def test_generate_translation_candidates_preserves_task_order_and_partial_failur
             prompt_variant_id: str,
             request_context: RequestContext,
         ) -> tuple[TranslationCandidate, dict[str, object]]:
-            if transcript.candidate_id == "tr-a" and prompt_variant_id == "variant-a":
-                self._first_variant_started.set()
-                assert self._second_variant_released.wait(timeout=1)
-            if transcript.candidate_id == "tr-a" and prompt_variant_id == "variant-b":
-                assert self._first_variant_started.wait(timeout=1)
-                self._second_variant_released.set()
-            if transcript.candidate_id == "tr-b" and prompt_variant_id == "variant-a":
-                raise RuntimeError("boom-tr-b-variant-a")
+            del request_context
+            self.calls.append((transcript.candidate_id, prompt_variant_id))
             target_text = f"{transcript.full_text}-{prompt_variant_id}"
             candidate = TranslationCandidate(
                 candidate_id=f"raw-{transcript.candidate_id}-{prompt_variant_id}",
-                job_id=request_context.job.job_id,
+                job_id=job.job_id,
                 source_transcript_candidate_id=transcript.candidate_id,
                 model_id=self.model_id,
                 prompt_variant_id=prompt_variant_id,
                 prompt_version="raw-prompt",
-                language=request_context.job.target_language,
+                language=job.target_language,
                 segments=(transcript.segments[0].model_copy(update={"target_text": target_text}),),
                 full_text=target_text,
                 raw_response_ref=None,
@@ -506,7 +659,8 @@ def test_generate_translation_candidates_preserves_task_order_and_partial_failur
             )
             return candidate, {"candidate": candidate.candidate_id}
 
-    runtime.translation_adapter = cast(Any, RawAdapter())
+    adapter = RawAdapter()
+    runtime.translation_adapter = cast(Any, adapter)
     state = GraphState(
         run_id="run-translation-order",
         job=job,
@@ -514,15 +668,24 @@ def test_generate_translation_candidates_preserves_task_order_and_partial_failur
         source_video_ref="input.mp4",
         source_artifact_ref=source_ref,
         transcript_candidate_ids=("tr-a", "tr-b"),
+        final_transcript_candidate_id="tr-a",
+        routing_facts=(
+            RoutingFact(
+                stage="adjudicate_transcript",
+                fact_type="transcript_review_deferred_to_translation",
+                value="tr-a",
+                source_ref="jobs/test/investigation.json",
+            ),
+        ),
     )
 
     output = generate_translation_candidates(state, runtime)
 
     assert output["translation_failed"] is False
+    assert adapter.calls == [("tr-a", "variant-a"), ("tr-b", "variant-a")]
     assert output["raw_translation_payload_refs"] == (
         job_path(job, "raw", "translation-candidates", "variant-a-tr-a.json"),
-        job_path(job, "raw", "translation-candidates", "variant-b-tr-a.json"),
-        job_path(job, "raw", "translation-candidates", "variant-b-tr-b.json"),
+        job_path(job, "raw", "translation-candidates", "variant-a-tr-b.json"),
     )
     assert output["raw_translation_candidate_refs"] == (
         job_path(
@@ -535,22 +698,138 @@ def test_generate_translation_candidates_preserves_task_order_and_partial_failur
             job,
             "staging",
             "translations",
-            f"{_translation_candidate_id('variant-b', 'tr-a', job.job_id)}.json",
-        ),
-        job_path(
-            job,
-            "staging",
-            "translations",
-            f"{_translation_candidate_id('variant-b', 'tr-b', job.job_id)}.json",
+            f"{_translation_candidate_id('variant-a', 'tr-b', job.job_id)}.json",
         ),
     )
-    routing_facts = cast(tuple[RoutingFact, ...], output["routing_facts"])
-    failed_facts = [
-        fact for fact in routing_facts if fact.fact_type == "translation_variant_failed"
-    ]
-    assert [(fact.value, fact.source_ref) for fact in failed_facts] == [
-        ("variant-a:tr-b", "boom-tr-b-variant-a"),
-    ]
+
+
+def test_generate_translation_candidates_dual_experiment_runs_both_variants_for_selected_winner(
+    tmp_path: Path,
+) -> None:
+    run_store = InMemoryRunStore()
+    run_store.create_run(run_id="run-translation-experiment", status="running")
+    blob_store = LocalBlobStore(tmp_path / "blobs")
+    source_ref = "jobs/run-translation-experiment-request.json"
+    blob_store.put_bytes(source_ref, b"{}\n")
+    runtime = build_phase_two_runtime(
+        blob_store=blob_store,
+        run_store=run_store,
+        trace_sink=NoOpTraceSink(),
+        source_artifact_ref=source_ref,
+        scenario="happy",
+    )
+    job = _job_context(job_id="job-translation-experiment").model_copy(
+        update={"translation_variant_policy": "dual_experiment"}
+    )
+    storage_job_id = operational_job_key(job)
+    transcript_a = TranscriptCandidate(
+        candidate_id="tr-a",
+        job_id=job.job_id,
+        provider_id="assemblyai",
+        provider_request_id="req-a",
+        language=job.source_language,
+        segments=(
+            Segment(
+                segment_id="seg-a",
+                start_ms=0,
+                end_ms=1_000,
+                speaker="speaker-1",
+                source_text="Alpha",
+            ),
+        ),
+        full_text="Alpha",
+        speaker_map={"speaker-1": "Host"},
+        timing_resolution="segment",
+        raw_payload_ref="raw/tr-a.json",
+        normalization_version="test",
+        metadata={"provider_rank": 0},
+    )
+    transcript_b = transcript_a.model_copy(
+        update={
+            "candidate_id": "tr-b",
+            "provider_request_id": "req-b",
+            "full_text": "Beta",
+            "segments": (
+                Segment(
+                    segment_id="seg-b",
+                    start_ms=0,
+                    end_ms=1_000,
+                    speaker="speaker-1",
+                    source_text="Beta",
+                ),
+            ),
+            "raw_payload_ref": "raw/tr-b.json",
+            "metadata": {"provider_rank": 1},
+        }
+    )
+    runtime.decision_store.save_transcript_candidate(transcript_a, storage_job_id=storage_job_id)
+    runtime.decision_store.save_transcript_candidate(transcript_b, storage_job_id=storage_job_id)
+
+    class RawAdapter:
+        model_id = "gpt-5.4-mini"
+        _prompt_version = "phase-3-v1"
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str]] = []
+
+        def generate_translation(
+            self,
+            final_transcript: TranscriptCandidate,
+            prompt_variant_id: str,
+            request_context: RequestContext,
+        ) -> TranslationCandidate:
+            candidate, _ = self.generate_translation_with_payload(
+                final_transcript,
+                prompt_variant_id,
+                request_context,
+            )
+            return candidate
+
+        def generate_translation_with_payload(
+            self,
+            transcript: TranscriptCandidate,
+            prompt_variant_id: str,
+            request_context: RequestContext,
+        ) -> tuple[TranslationCandidate, dict[str, object]]:
+            del request_context
+            self.calls.append((transcript.candidate_id, prompt_variant_id))
+            target_text = f"{transcript.full_text}-{prompt_variant_id}"
+            candidate = TranslationCandidate(
+                candidate_id=f"raw-{transcript.candidate_id}-{prompt_variant_id}",
+                job_id=job.job_id,
+                source_transcript_candidate_id=transcript.candidate_id,
+                model_id=self.model_id,
+                prompt_variant_id=prompt_variant_id,
+                prompt_version="raw-prompt",
+                language=job.target_language,
+                segments=(transcript.segments[0].model_copy(update={"target_text": target_text}),),
+                full_text=target_text,
+                raw_response_ref=None,
+                normalization_version="raw-test",
+                metadata={},
+            )
+            return candidate, {"candidate": candidate.candidate_id}
+
+    adapter = RawAdapter()
+    runtime.translation_adapter = cast(Any, adapter)
+    state = GraphState(
+        run_id="run-translation-experiment",
+        job=job,
+        current_stage="generate_translation_candidates",
+        source_video_ref="input.mp4",
+        source_artifact_ref=source_ref,
+        transcript_candidate_ids=("tr-a", "tr-b"),
+        final_transcript_candidate_id="tr-a",
+    )
+
+    output = generate_translation_candidates(state, runtime)
+
+    assert output["translation_failed"] is False
+    assert adapter.calls == [("tr-a", "variant-a"), ("tr-a", "variant-b")]
+    assert output["raw_translation_payload_refs"] == (
+        job_path(job, "raw", "translation-candidates", "variant-a-tr-a.json"),
+        job_path(job, "raw", "translation-candidates", "variant-b-tr-a.json"),
+    )
 
 
 def test_sqlite_runtime_store_writes_stay_on_main_thread(tmp_path: Path) -> None:

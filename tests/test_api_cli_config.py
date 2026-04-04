@@ -1504,10 +1504,7 @@ def test_run_job_returns_translation_failure_details(
     assert result.failure_summary == (
         "All translation variants failed; transcript preserved for recovery."
     )
-    assert result.failure_reasons == (
-        "variant-a: simulated translation failure for variant-a",
-        "variant-b: simulated translation failure for variant-b",
-    )
+    assert result.failure_reasons == ("variant-a: simulated translation failure for variant-a",)
 
 
 @pytest.mark.unit
@@ -1603,6 +1600,7 @@ def test_run_job_human_review_required_leaves_default_output_path_unset(
             source="input.mp4",
             job_id="job-human-review",
             metadata={"scenario": "translation_conflict_timeout"},
+            translation_variant_policy="dual_experiment",
         )
     )
 
@@ -1649,7 +1647,6 @@ def test_run_job_persists_structured_translation_failure_error(
         "failure_summary": "All translation variants failed; transcript preserved for recovery.",
         "failure_reasons": [
             "variant-a: simulated translation failure for variant-a",
-            "variant-b: simulated translation failure for variant-b",
         ],
         "retryable": False,
     }
@@ -1665,7 +1662,6 @@ def test_run_job_persists_structured_translation_failure_error(
     )
     assert record.output_data["failure_reasons"] == [
         "variant-a: simulated translation failure for variant-a",
-        "variant-b: simulated translation failure for variant-b",
     ]
 
 
@@ -1730,6 +1726,7 @@ def test_resume_translation_from_partial_variant_run_completes(
             source="input.mp4",
             job_id="job-resume-partial",
             metadata={"scenario": "translation_single_variant"},
+            translation_variant_policy="dual_experiment",
         )
     )
 
@@ -2058,6 +2055,7 @@ def test_review_job_json_exposes_exception_only_review_contract_and_legacy_revie
             source="input.mp4",
             job_id="job-review-json",
             metadata={"scenario": "translation_conflict_timeout"},
+            translation_variant_policy="dual_experiment",
         )
     )
 
@@ -2129,6 +2127,7 @@ def test_review_job_interactive_launches_textual_app_when_tty_is_present(
             source="input.mp4",
             job_id="job-review-interactive",
             metadata={"scenario": "translation_conflict_timeout"},
+            translation_variant_policy="dual_experiment",
         )
     )
     payload = review_job(result.run_id)
@@ -2168,6 +2167,7 @@ def test_review_job_interactive_requires_real_tty(
             source="input.mp4",
             job_id="job-review-no-tty",
             metadata={"scenario": "translation_conflict_timeout"},
+            translation_variant_policy="dual_experiment",
         )
     )
     monkeypatch.setattr("translation_agent.cli._has_tty", lambda: False)
@@ -2329,6 +2329,7 @@ def test_approve_review_json_republishes_outputs_and_updates_provider_stats(
             source="input.mp4",
             job_id="job-review-approve-a",
             metadata={"scenario": "translation_conflict_timeout"},
+            translation_variant_policy="dual_experiment",
         )
     )
     first_payload = review_job(first.run_id)
@@ -2358,6 +2359,7 @@ def test_approve_review_json_republishes_outputs_and_updates_provider_stats(
             source="input.mp4",
             job_id="job-review-approve-b",
             metadata={"scenario": "translation_conflict_timeout"},
+            translation_variant_policy="dual_experiment",
         )
     )
     second_payload = review_job(second.run_id)
@@ -2453,6 +2455,7 @@ def test_resolve_review_validation_enforces_candidate_and_failure_tag_rules(
             source="input.mp4",
             job_id="job-review-validate-resolution",
             metadata={"scenario": "translation_conflict_timeout"},
+            translation_variant_policy="dual_experiment",
         )
     )
     payload = review_job(result.run_id)
@@ -2489,6 +2492,7 @@ def test_resolve_review_with_structured_span_decisions_builds_synthetic_candidat
             source="input.mp4",
             job_id="job-review-structured-resolution",
             metadata={"scenario": "translation_conflict_timeout"},
+            translation_variant_policy="dual_experiment",
         )
     )
     review_payload = review_job(result.run_id)
@@ -2577,6 +2581,7 @@ def test_resolve_review_approved_best_available_persists_soft_feedback(
             source="input.mp4",
             job_id="job-review-soft-resolution",
             metadata={"scenario": "translation_conflict_timeout"},
+            translation_variant_policy="dual_experiment",
         )
     )
     review_payload = review_job(result.run_id)
@@ -2631,6 +2636,7 @@ def test_resolve_review_rejected_all_persists_negative_feedback(
             source="input.mp4",
             job_id="job-review-rejected-all",
             metadata={"scenario": "translation_conflict_timeout"},
+            translation_variant_policy="dual_experiment",
         )
     )
     review_payload = review_job(result.run_id)

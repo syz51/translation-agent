@@ -13,6 +13,7 @@ from .base import ContractModel
 NonEmptyStr = Annotated[str, Field(min_length=1)]
 ReferenceTranscriptFormat = Literal["srt"]
 ReferenceMode = Literal["none", "evaluate_and_regenerate"]
+TranslationVariantPolicy = Literal["single", "dual_experiment"]
 
 
 class JobContext(ContractModel):
@@ -34,6 +35,7 @@ class JobContext(ContractModel):
     reference_transcript_source: str | None = None
     reference_transcript_format: ReferenceTranscriptFormat | None = None
     reference_mode: ReferenceMode = "none"
+    translation_variant_policy: TranslationVariantPolicy = "single"
 
 
 class RequestContext(ContractModel):

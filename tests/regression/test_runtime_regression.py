@@ -852,7 +852,9 @@ def test_replay_translation_failure_manifest_is_stable_regression(tmp_path: Path
 def test_replay_adjudication_uses_persisted_candidates_reviews_and_memory_refs(
     tmp_path: Path,
 ) -> None:
-    job = _job_context(job_id="job-replay-adjudication")
+    job = _job_context(job_id="job-replay-adjudication").model_copy(
+        update={"translation_variant_policy": "dual_experiment"}
+    )
     final_state, blob_store = _run_workflow(
         tmp_path,
         run_id="run-replay-adjudication",
@@ -946,7 +948,9 @@ def test_replay_adjudication_supports_transcript_stage_regression(tmp_path: Path
 
 
 def test_replay_adjudication_preserves_timeout_escalation_regression(tmp_path: Path) -> None:
-    job = _job_context(job_id="job-replay-timeout")
+    job = _job_context(job_id="job-replay-timeout").model_copy(
+        update={"translation_variant_policy": "dual_experiment"}
+    )
     final_state, blob_store = _run_workflow(
         tmp_path,
         run_id="run-replay-timeout",
@@ -992,7 +996,9 @@ def test_replay_adjudication_preserves_timeout_escalation_regression(tmp_path: P
 
 
 def test_replay_adjudication_ignores_missing_timeout_artifact_regression(tmp_path: Path) -> None:
-    job = _job_context(job_id="job-replay-missing-timeout")
+    job = _job_context(job_id="job-replay-missing-timeout").model_copy(
+        update={"translation_variant_policy": "dual_experiment"}
+    )
     final_state, blob_store = _run_workflow(
         tmp_path,
         run_id="run-replay-missing-timeout",

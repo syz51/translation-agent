@@ -25,6 +25,8 @@ from translation_agent.nodes.review import review_transcripts, review_translatio
 from translation_agent.observability import NoOpTraceSink
 from translation_agent.review import (
     adjudicate_reviews,
+    build_review_context,
+    build_structured_review,
     parse_reviewer_output,
     render_reviewer_output,
     reviewer_roles_for_stage,
@@ -184,6 +186,7 @@ def _run_workflow(
     tmp_path: Path,
     *,
     scenario: str,
+    job: JobContext | None = None,
 ) -> tuple[GraphState, InMemoryRunStore, LocalBlobStore]:
     run_store = InMemoryRunStore()
     run_store.create_run(run_id="run-phase-four", status="running")
@@ -199,7 +202,7 @@ def _run_workflow(
     )
     initial_state = GraphState(
         run_id="run-phase-four",
-        job=_job_context(),
+        job=job or _job_context(),
         current_stage="ingest",
         source_video_ref="input.mp4",
         source_artifact_ref=source_ref,
@@ -418,6 +421,29 @@ Why:
 - Missing the rest of the required sections.
 """
         )
+
+
+def test_build_structured_review_keeps_single_translation_candidate_singleton() -> None:
+    transcript = _transcript_candidate("tr-final", "Hello world from provider A.")
+    translation = _translation_candidate("tl-a", "Bonjour du workflow.", "variant-a")
+    context = build_review_context(
+        run_id="run-single-translation-review",
+        stage="translation",
+        reviewer_role="faithfulness_reviewer",
+        job=_job_context("job-single-translation-review"),
+        candidate_ids=(translation.candidate_id,),
+        memory_bundle=MemoryBundle(),
+    )
+
+    draft = build_structured_review(
+        context,
+        candidates=(translation,),
+        final_transcript=transcript,
+    )
+
+    assert [preference.candidate_id for preference in draft.candidate_preferences] == ["tl-a"]
+    assert all(issue.candidate_id != "variant-b" for issue in draft.issues)
+    assert all(fix.candidate_id != "variant-b" for fix in draft.suggested_fixes)
 
 
 def test_adjudication_uses_provider_quality_prior_as_bounded_tie_breaker() -> None:
@@ -676,7 +702,11 @@ Escalate?: no
 def test_phase_four_workflow_routes_translation_escalation_to_stronger_adjudicator(
     tmp_path: Path,
 ) -> None:
-    final_state, _, blob_store = _run_workflow(tmp_path, scenario="translation_escalation")
+    final_state, _, blob_store = _run_workflow(
+        tmp_path,
+        scenario="translation_escalation",
+        job=_job_context().model_copy(update={"translation_variant_policy": "dual_experiment"}),
+    )
 
     decision = FinalTranslationDecision.model_validate_json(
         blob_store.read_bytes(_artifact_path("decisions", "translation.json"))

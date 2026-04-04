@@ -43,7 +43,7 @@ from translation_agent.models import (
     TranslationCandidate,
     TranslationFeedbackStats,
 )
-from translation_agent.models.jobs import ReferenceMode
+from translation_agent.models.jobs import ReferenceMode, TranslationVariantPolicy
 from translation_agent.nodes.common import (
     approval_record_key,
     memory_batch_key,
@@ -887,6 +887,10 @@ def _job_context_from_run(
         reference_mode=cast(
             ReferenceMode,
             request_payload.get("reference_mode") or "none",
+        ),
+        translation_variant_policy=cast(
+            TranslationVariantPolicy,
+            request_payload.get("translation_variant_policy") or "single",
         ),
     )
 

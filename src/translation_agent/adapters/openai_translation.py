@@ -48,6 +48,7 @@ class _TranslationChunk:
     segments: tuple[Segment, ...]
     context_before: tuple[str, ...] = ()
     context_after: tuple[str, ...] = ()
+    split_levels_remaining: int = 0
 
     @property
     def full_text(self) -> str:
@@ -290,13 +291,7 @@ class ChatCompletionTranslationAdapter:
             "chunking": {
                 "chunk_count": len(chunk_full_texts),
                 "planned_chunk_count": len(chunks),
-                "executed_request_count": len(
-                    [
-                        payload
-                        for payload in raw_chunk_payloads
-                        if payload.get("status") == "translated"
-                    ]
-                ),
+                "executed_request_count": len(raw_chunk_payloads),
                 "max_chunk_workers": self._max_chunk_workers,
                 "max_chunk_characters": self._max_chunk_characters,
                 "max_chunk_segments": self._max_chunk_segments,
@@ -651,7 +646,7 @@ def _system_prompt(
         "Translate the provided transcript chunk from "
         f"{source_language} into {target_language}. Return JSON only with keys "
         "full_text and segments. Each segment must contain segment_id and "
-        "target_text. Translate only the segments in chunk.segments. Use "
+        "target_text. Translate only the provided segments. Use "
         "context_before and context_after only for disambiguation; do not translate "
         "or mention them. The response must include every chunk segment_id exactly "
         "once and no extra segment_ids. "
@@ -690,25 +685,25 @@ def _historical_instructions(request_context: RequestContext) -> tuple[str, ...]
 
 
 def _user_prompt(chunk: _TranslationChunk) -> str:
-    payload = {
-        "chunk": {
-            "chunk_index": chunk.chunk_index,
-            "full_text": chunk.full_text,
-            "segments": [
-                {
-                    "segment_id": segment.segment_id,
-                    "start_ms": segment.start_ms,
-                    "end_ms": segment.end_ms,
-                    "speaker": segment.speaker,
-                    "source_text": segment.source_text,
-                }
-                for segment in chunk.segments
-            ],
-        },
+    return json.dumps(_user_prompt_payload(chunk), ensure_ascii=True)
+
+
+def _user_prompt_payload(chunk: _TranslationChunk) -> dict[str, Any]:
+    return {
+        "chunk_index": chunk.chunk_index,
+        "segments": [
+            {
+                "segment_id": segment.segment_id,
+                "start_ms": segment.start_ms,
+                "end_ms": segment.end_ms,
+                "speaker": segment.speaker,
+                "source_text": segment.source_text,
+            }
+            for segment in chunk.segments
+        ],
         "context_before": list(chunk.context_before),
         "context_after": list(chunk.context_after),
     }
-    return json.dumps(payload, ensure_ascii=True)
 
 
 def _translation_schema() -> dict[str, Any]:
@@ -742,28 +737,42 @@ def _chunk_transcript(
     context_segment_window: int,
 ) -> tuple[_TranslationChunk, ...]:
     if not final_transcript.segments:
-        return (_TranslationChunk(chunk_key="chunk-0", chunk_index=0, segments=()),)
+        return (
+            _TranslationChunk(
+                chunk_key="chunk-0",
+                chunk_index=0,
+                segments=(),
+                split_levels_remaining=1,
+            ),
+        )
 
-    groups: list[tuple[Segment, ...]] = []
+    groups: list[tuple[int, tuple[Segment, ...]]] = []
     current_group: list[Segment] = []
-    current_characters = 0
-    for segment in final_transcript.segments:
-        segment_text = (segment.source_text or "").strip()
-        projected_characters = current_characters + len(segment_text)
+    current_group_start_index = 0
+    for segment_index, segment in enumerate(final_transcript.segments):
+        projected_group = (*current_group, segment)
+        projected_prompt_size = _estimated_user_prompt_size(
+            chunk_index=len(groups),
+            segments=projected_group,
+            transcript_segments=final_transcript.segments,
+            start_index=current_group_start_index,
+            end_index=segment_index + 1,
+            context_segment_window=context_segment_window,
+        )
         if current_group and (
-            len(current_group) >= max_chunk_segments or projected_characters > max_chunk_characters
+            len(projected_group) > max_chunk_segments
+            or projected_prompt_size > max_chunk_characters
         ):
-            groups.append(tuple(current_group))
-            current_group = []
-            current_characters = 0
+            groups.append((current_group_start_index, tuple(current_group)))
+            current_group = [segment]
+            current_group_start_index = segment_index
+            continue
         current_group.append(segment)
-        current_characters += len(segment_text)
     if current_group:
-        groups.append(tuple(current_group))
+        groups.append((current_group_start_index, tuple(current_group)))
 
     chunked: list[_TranslationChunk] = []
-    start_index = 0
-    for chunk_index, group in enumerate(groups):
+    for chunk_index, (start_index, group) in enumerate(groups):
         end_index = start_index + len(group)
         chunked.append(
             _TranslationChunk(
@@ -780,14 +789,43 @@ def _chunk_transcript(
                     end_index,
                     min(end_index + context_segment_window, len(final_transcript.segments)),
                 ),
+                split_levels_remaining=1,
             )
         )
-        start_index = end_index
     return tuple(chunked)
 
 
+def _estimated_user_prompt_size(
+    *,
+    chunk_index: int,
+    segments: tuple[Segment, ...],
+    transcript_segments: tuple[Segment, ...],
+    start_index: int,
+    end_index: int,
+    context_segment_window: int,
+) -> int:
+    payload = _user_prompt_payload(
+        _TranslationChunk(
+            chunk_key=f"estimate-{chunk_index}",
+            chunk_index=chunk_index,
+            segments=segments,
+            context_before=_context_texts(
+                transcript_segments,
+                max(start_index - context_segment_window, 0),
+                start_index,
+            ),
+            context_after=_context_texts(
+                transcript_segments,
+                end_index,
+                min(end_index + context_segment_window, len(transcript_segments)),
+            ),
+        )
+    )
+    return len(json.dumps(payload, ensure_ascii=True))
+
+
 def _should_split_chunk(chunk: _TranslationChunk, error: AdapterError) -> bool:
-    if len(chunk.segments) <= 1:
+    if chunk.split_levels_remaining <= 0 or len(chunk.segments) <= 1:
         return False
     if error.retryable:
         return True
@@ -831,6 +869,7 @@ def _split_chunk(
             segments=left_segments,
             context_before=chunk.context_before,
             context_after=left_context_after,
+            split_levels_remaining=max(chunk.split_levels_remaining - 1, 0),
         ),
         _TranslationChunk(
             chunk_key=f"{chunk.chunk_key}.b",
@@ -838,6 +877,7 @@ def _split_chunk(
             segments=right_segments,
             context_before=right_context_before,
             context_after=chunk.context_after,
+            split_levels_remaining=max(chunk.split_levels_remaining - 1, 0),
         ),
     )
 

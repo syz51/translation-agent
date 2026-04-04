@@ -680,6 +680,36 @@ def _scenario_translation_review(
     candidates: tuple[TranslationCandidate, ...],
     scenario: str,
 ) -> StructuredReviewDraft:
+    if len(candidates) == 1:
+        candidate = candidates[0]
+        source_span_id = (
+            _segment_source_span_id(candidate.segments[0]) if candidate.segments else "span:0:1250"
+        )
+        return StructuredReviewDraft(
+            candidate_preferences=_candidate_preferences([(candidate.candidate_id, 0.82)]),
+            confidence=0.82,
+            evidence=(
+                StructuredEvidence(
+                    source_span_id=source_span_id,
+                    candidate_id=candidate.candidate_id,
+                    dimension="coverage",
+                    polarity="supports",
+                    normalized_value="single_candidate",
+                    severity="minor",
+                    evidence_text=(
+                        "Only one translation candidate survived, so review stays on "
+                        "source-grounded single-candidate checks."
+                    ),
+                ),
+            ),
+            issues=(),
+            suggested_fixes=(),
+            escalation_signal=False,
+            why_lines=(
+                f"{context.reviewer_role} reviewed the only surviving translation candidate.",
+                "No synthetic variant comparison was introduced for this scenario.",
+            ),
+        )
     candidate_by_variant = {candidate.prompt_variant_id: candidate for candidate in candidates}
     candidate_a = candidate_by_variant.get("variant-a", candidates[0])
     candidate_b = candidate_by_variant.get("variant-b", candidates[-1])

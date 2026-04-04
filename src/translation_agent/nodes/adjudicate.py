@@ -97,8 +97,9 @@ def adjudicate_transcript(state: GraphState, runtime: WorkflowRuntime) -> dict[s
     if outcome.human_review_required:
         rationale_summary = (
             "Transcript disagreement remained unresolved after machine adjudication; "
-            "translation generation will continue across all surviving transcript candidates "
-            "and transcript provenance will be surfaced during translation review."
+            "translation generation will fall back to surviving transcript fan-out for "
+            "translation review, and transcript provenance will stay visible until the "
+            "unresolved transcript choice is settled."
         )
         deferred_review_fact = (
             RoutingFact(
