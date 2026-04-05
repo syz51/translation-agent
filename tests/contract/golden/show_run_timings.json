@@ -45,6 +45,10 @@
   "transcription_providers": null,
   "translation_variants": null,
   "review_bundles": null,
+  "transcript_synthesis_status": null,
+  "transcript_unresolved_span_count": null,
+  "transcript_provider_provenance": null,
+  "transcript_artifact_ref": null,
   "timings": {
     "run_status": "completed",
     "run_started_at": "2026-04-03T00:00:00+00:00",

@@ -8,7 +8,14 @@ from typing import Any
 
 import pytest
 
-from translation_agent.api import convert_translation_json_to_srt
+from translation_agent.api import (
+    RunJobRequest,
+    approve_review,
+    convert_translation_json_to_srt,
+    get_run_status,
+    review_job,
+    run_job,
+)
 from translation_agent.config import (
     Settings,
     load_settings,
@@ -731,6 +738,44 @@ def test_convert_translation_json_to_srt_matches_published_export_regression(
     )
 
 
+def test_run_job_status_snapshot_preserves_translation_variant_progress_regression(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("TA_DATA_DIR", str(tmp_path / "runtime"))
+    monkeypatch.delenv("TA_STATE_DB_DSN", raising=False)
+
+    result = run_job(
+        RunJobRequest(
+            source="input.mp4",
+            job_id="job-status-regression",
+            translation_variant_policy="dual_experiment",
+        )
+    )
+    snapshot = get_run_status(result.run_id)
+
+    assert snapshot.status == "completed"
+    assert snapshot.transcription_providers is not None
+    assert snapshot.transcription_providers.total == 3
+    assert snapshot.transcription_providers.completed == 3
+    assert snapshot.translation_variants is not None
+    assert snapshot.translation_variants.total == 2
+    assert snapshot.translation_variants.completed == 2
+    assert snapshot.translation_variants.failed == 0
+    assert snapshot.review_bundles is not None
+    assert snapshot.review_bundles.total == 2
+    assert snapshot.review_bundles.completed == 2
+    assert snapshot.transcript_synthesis_status == "ready"
+    assert snapshot.transcript_unresolved_span_count == 0
+    assert snapshot.transcript_provider_provenance == {
+        "assemblyai": 1,
+        "deepgram": 1,
+        "speechmatics": 1,
+    }
+    assert snapshot.transcript_artifact_ref is not None
+    assert snapshot.transcript_artifact_ref.endswith("/artifacts/final-transcript.json")
+
+
 def test_real_mode_single_selected_provider_failure_raises_expected_error_regression(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -977,6 +1022,73 @@ def test_replay_adjudication_preserves_timeout_escalation_regression(tmp_path: P
     assert replayed.decision.decision_mode == "human_review"
     assert replayed.decision.winner_candidate_id is None
     assert replayed.decision.disagreement_bucket == "unresolved"
+
+
+def test_timeout_human_review_outputs_preserve_review_artifacts_regression(tmp_path: Path) -> None:
+    job = _job_context(job_id="job-timeout-review-envelope").model_copy(
+        update={"translation_variant_policy": "dual_experiment"}
+    )
+    final_state, blob_store = _run_workflow(
+        tmp_path,
+        run_id="run-timeout-review-envelope",
+        scenario="translation_conflict_timeout",
+        job=job,
+    )
+
+    investigation_path = job_path(job, "investigations", "translation.json")
+    manifest_path = job_path(job, "published", "artifacts.json")
+    export_path = job_path(job, "exports", "translation.json")
+    delivery_path = job_path(job, "deliveries", "translation.json")
+
+    investigation = _load_json(blob_store, investigation_path)
+    manifest = _load_json(blob_store, manifest_path)
+    export_payload = _load_json(blob_store, export_path)
+    delivery_payload = _load_json(blob_store, delivery_path)
+
+    assert final_state.human_review_required is True
+    assert final_state.review_required_stage == "translation"
+    assert investigation["status"] == "timed_out"
+    assert blob_store.exists(job_path(job, "published", "transcript.json"))
+    assert not blob_store.exists(job_path(job, "published", "translation.json"))
+    assert not blob_store.exists(job_path(job, "exports", "translation.srt"))
+    assert manifest["final_transcript_ref"] == job_path(job, "published", "transcript.json")
+    assert manifest["final_translation_ref"] is None
+    assert manifest["export_refs"] == [export_path]
+    assert export_payload["status"] == "human_review_required"
+    assert export_payload["review_required_stage"] == "translation"
+    assert delivery_payload["status"] == "human_review_required"
+    assert delivery_payload["translation_ref"] is None
+
+
+def test_human_review_resolution_updates_run_status_snapshot_regression(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("TA_DATA_DIR", str(tmp_path / "runtime"))
+    monkeypatch.delenv("TA_STATE_DB_DSN", raising=False)
+
+    result = run_job(
+        RunJobRequest(
+            source="input.mp4",
+            job_id="job-approved-status",
+            metadata={"scenario": "translation_conflict_timeout"},
+            translation_variant_policy="dual_experiment",
+        )
+    )
+    review_payload = review_job(result.run_id)
+
+    approval_payload = approve_review(
+        result.run_id,
+        candidate_id=str(review_payload["candidates"][0]["candidate_id"]),
+        approved_by="tester",
+        note="ship",
+    )
+    snapshot = get_run_status(result.run_id)
+
+    assert approval_payload["status"] == "completed_after_human_review"
+    assert snapshot.status == "completed_after_human_review"
+    assert snapshot.current_stage == "resolve_review"
+    assert snapshot.trace_path.exists()
 
 
 def test_replay_adjudication_ignores_missing_timeout_artifact_regression(tmp_path: Path) -> None:

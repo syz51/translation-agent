@@ -184,30 +184,35 @@ class RunStatusAccumulator:
         if self.job_id is None:
             self.job_id = _string_or_none(attributes.get("job_id"))
         timestamp = _parse_timestamp(normalized.timestamp)
+        should_apply_trace_state = not self._prefers_newer_run_record(timestamp)
         if normalized.name == "run.bootstrapped":
-            self.status = "bootstrapped"
-            self.created_at = timestamp or self.created_at
+            if should_apply_trace_state:
+                self.status = "bootstrapped"
+                self.created_at = timestamp or self.created_at
         elif normalized.name == "run.started":
-            self.status = "running"
-            self.created_at = timestamp or self.created_at
+            if should_apply_trace_state:
+                self.status = "running"
+                self.created_at = timestamp or self.created_at
         elif normalized.name == "run.completed":
-            self.status = _string_or_none(attributes.get("status")) or "completed"
-            self.updated_at = timestamp or self.updated_at
+            if should_apply_trace_state:
+                self.status = _string_or_none(attributes.get("status")) or "completed"
+                self.updated_at = timestamp or self.updated_at
         elif normalized.name == "run.failed":
-            self.status = "failed"
-            self.updated_at = timestamp or self.updated_at
+            if should_apply_trace_state:
+                self.status = "failed"
+                self.updated_at = timestamp or self.updated_at
 
-        if normalized.stage is not None:
+        if normalized.stage is not None and should_apply_trace_state:
             self._trace_stage_hint = normalized.stage
             if self.active_node is None:
                 self.current_stage = normalized.stage
 
-        if normalized.name == "node.started":
+        if normalized.name == "node.started" and should_apply_trace_state:
             node_name = _string_or_none(attributes.get("node_name"))
             if node_name is not None:
                 self.active_node = node_name
                 self.current_stage = node_name
-        elif normalized.name in {"node.completed", "node.failed"}:
+        elif normalized.name in {"node.completed", "node.failed"} and should_apply_trace_state:
             node_name = _string_or_none(attributes.get("node_name"))
             if node_name is not None and self.active_node == node_name:
                 self.active_node = None
@@ -258,6 +263,13 @@ class RunStatusAccumulator:
         if self._final_stage is not None:
             return self._final_stage
         return self._trace_stage_hint
+
+    def _prefers_newer_run_record(self, timestamp: datetime | None) -> bool:
+        if self.status in _NON_TERMINAL_RUN_STATUSES:
+            return False
+        if self.updated_at is None or timestamp is None:
+            return False
+        return self.updated_at > timestamp
 
     def _update_phase_state(self, event: _NormalizedTraceEvent) -> None:
         attributes = event.attributes
@@ -612,10 +624,14 @@ def _event_state(name: str) -> str | None:
 
 def _translation_item_key(attributes: Mapping[str, Any]) -> str | None:
     prompt_variant_id = _string_or_none(attributes.get("prompt_variant_id"))
-    transcript_candidate_id = _string_or_none(attributes.get("source_transcript_candidate_id"))
-    if prompt_variant_id is None or transcript_candidate_id is None:
+    transcript_subject = _string_or_none(attributes.get("source_transcript_candidate_id"))
+    if transcript_subject is None:
+        source_transcript_ref = _string_or_none(attributes.get("source_transcript_ref"))
+        if source_transcript_ref is not None:
+            transcript_subject = Path(source_transcript_ref).stem or source_transcript_ref
+    if prompt_variant_id is None or transcript_subject is None:
         return None
-    return f"{prompt_variant_id}:{transcript_candidate_id}"
+    return f"{prompt_variant_id}:{transcript_subject}"
 
 
 def _review_item_key(attributes: Mapping[str, Any]) -> str | None:
