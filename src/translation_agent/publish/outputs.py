@@ -372,6 +372,8 @@ def _delivery_status(state: GraphState) -> str:
         return "completed_after_human_review"
     if state.resolution_kind == "rejected_all":
         return "rejected_after_human_review"
+    if state.transcript_failed:
+        return "transcript_failed"
     if state.translation_failed:
         return "translation_failed"
     if state.human_review_required:

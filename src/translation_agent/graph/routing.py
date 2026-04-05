@@ -10,6 +10,8 @@ def route_after_memory_pipeline(state: GraphState) -> str:
 
     if state.final_translation_decision_ref is not None:
         return "finalize_outputs"
+    if state.transcript_failed:
+        return "finalize_outputs"
     if state.human_review_required:
         return "finalize_outputs"
     return "generate_translation_candidates"

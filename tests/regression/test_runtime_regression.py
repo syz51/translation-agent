@@ -4,7 +4,7 @@ import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -1076,10 +1076,12 @@ def test_human_review_resolution_updates_run_status_snapshot_regression(
         )
     )
     review_payload = review_job(result.run_id)
+    review_payload_dict = cast(dict[str, object], review_payload)
+    candidates = cast(list[dict[str, object]], review_payload_dict["candidates"])
 
     approval_payload = approve_review(
         result.run_id,
-        candidate_id=str(review_payload["candidates"][0]["candidate_id"]),
+        candidate_id=str(candidates[0]["candidate_id"]),
         approved_by="tester",
         note="ship",
     )

@@ -6,7 +6,7 @@ import json
 import re
 from collections import defaultdict
 from hashlib import sha256
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAI
 from pydantic import ValidationError
@@ -177,6 +177,137 @@ def build_span_candidates(
     return tuple(span_candidates)
 
 
+def _index_span_candidates(
+    span_candidates: tuple[TranscriptSpanCandidate, ...],
+) -> dict[str, tuple[TranscriptSpanCandidate, ...]]:
+    indexed: dict[str, list[TranscriptSpanCandidate]] = defaultdict(list)
+    for candidate in span_candidates:
+        indexed[candidate.canonical_span_id].append(candidate)
+    return {span_id: tuple(items) for span_id, items in indexed.items()}
+
+
+def _candidate_evidence_index(
+    span_candidates: tuple[TranscriptSpanCandidate, ...],
+) -> dict[str, tuple[TranscriptSpanCandidate, ...]]:
+    indexed: dict[str, list[TranscriptSpanCandidate]] = defaultdict(list)
+    for candidate in span_candidates:
+        indexed[candidate.candidate_id].append(candidate)
+    return {candidate_id: tuple(items) for candidate_id, items in indexed.items()}
+
+
+def _rank_transcript_candidates(
+    *,
+    spans: tuple[CanonicalTranscriptSpan, ...],
+    span_candidates: tuple[TranscriptSpanCandidate, ...],
+) -> tuple[dict[str, object], ...]:
+    spans_by_id = {span.canonical_span_id: span for span in spans}
+    candidate_index = _candidate_evidence_index(span_candidates)
+    rankings: list[dict[str, object]] = []
+    for candidate_id, evidence in candidate_index.items():
+        ordered = tuple(
+            sorted(
+                evidence,
+                key=lambda item: (
+                    spans_by_id[item.canonical_span_id].start_ms,
+                    spans_by_id[item.canonical_span_id].end_ms,
+                    item.span_candidate_id,
+                ),
+            )
+        )
+        covered_span_ids = tuple(dict.fromkeys(item.canonical_span_id for item in ordered))
+        coverage_count = len(covered_span_ids)
+        covered_duration_ms = sum(
+            _overlap_ms(
+                spans_by_id[item.canonical_span_id].start_ms,
+                spans_by_id[item.canonical_span_id].end_ms,
+                item.start_ms,
+                item.end_ms,
+            )
+            for item in ordered
+        )
+        stable_pair_count = 0
+        overlap_violation_count = 0
+        continuity_score = 0
+        previous_item: TranscriptSpanCandidate | None = None
+        for item in ordered:
+            if previous_item is not None:
+                if item.start_ms >= previous_item.end_ms:
+                    stable_pair_count += 1
+                else:
+                    overlap_violation_count += 1
+                if _texts_equivalent(
+                    previous_item.next_span_text or "",
+                    item.normalized_text,
+                ) or _texts_equivalent(
+                    item.previous_span_text or "",
+                    previous_item.normalized_text,
+                ):
+                    continuity_score += 1
+            previous_item = item
+        provider_rank = min(int(item.metadata.get("provider_rank", 100)) for item in ordered)
+        score = (
+            coverage_count * 1_000_000
+            + covered_duration_ms * 10
+            + stable_pair_count * 1_000
+            + continuity_score * 100
+            - overlap_violation_count * 10_000
+            - provider_rank
+        )
+        rankings.append(
+            {
+                "candidate_id": candidate_id,
+                "provider_id": ordered[0].provider_id,
+                "coverage_count": coverage_count,
+                "covered_duration_ms": covered_duration_ms,
+                "stable_pair_count": stable_pair_count,
+                "overlap_violation_count": overlap_violation_count,
+                "continuity_score": continuity_score,
+                "provider_rank": provider_rank,
+                "score": score,
+                "covered_span_ids": list(covered_span_ids),
+            }
+        )
+
+    def _ranking_sort_key(item: dict[str, object]) -> tuple[int, int, int, int, str]:
+        score = int(cast(int, item["score"]))
+        coverage_count = int(cast(int, item["coverage_count"]))
+        covered_duration_ms = int(cast(int, item["covered_duration_ms"]))
+        provider_rank = int(cast(int, item["provider_rank"]))
+        candidate_id = str(item["candidate_id"])
+        return (
+            -score,
+            -coverage_count,
+            -covered_duration_ms,
+            provider_rank,
+            candidate_id,
+        )
+
+    rankings.sort(key=_ranking_sort_key)
+    return tuple(rankings)
+
+
+def _selection_rationale(
+    *,
+    base_candidate_id: str,
+    base_provider_id: str,
+    candidate_rankings: tuple[dict[str, object], ...],
+) -> str:
+    top = next(
+        item for item in candidate_rankings if str(item["candidate_id"]) == base_candidate_id
+    )
+    alternate = candidate_rankings[1] if len(candidate_rankings) > 1 else None
+    if alternate is None:
+        return (
+            f"Selected {base_candidate_id} ({base_provider_id}) as the only grounded transcript "
+            "candidate with canonical-span coverage."
+        )
+    return (
+        f"Selected {base_candidate_id} ({base_provider_id}) as the global base because it led "
+        f"coverage ({top['coverage_count']} spans, {top['covered_duration_ms']} ms) and remained "
+        "the most stable transcript-level candidate against ranked alternates."
+    )
+
+
 def run_selector_agent(
     *,
     job: JobContext,
@@ -185,28 +316,71 @@ def run_selector_agent(
     spans: tuple[CanonicalTranscriptSpan, ...],
     span_candidates: tuple[TranscriptSpanCandidate, ...],
 ) -> TranscriptSynthesisRecord:
-    """Emit structured per-span synthesis decisions."""
+    """Choose a global base transcript candidate and emit base-carried decisions."""
 
-    if _should_use_live_reasoning(runtime):
-        decisions = _live_selector_decisions(
+    span_index = _index_span_candidates(span_candidates)
+    candidate_rankings = _rank_transcript_candidates(spans=spans, span_candidates=span_candidates)
+    base_candidate_id = (
+        _live_base_candidate_selection(
             run_id=run_id,
             runtime=runtime,
             spans=spans,
             span_candidates=span_candidates,
+            candidate_rankings=candidate_rankings,
         )
-    else:
+        if _should_use_live_reasoning(runtime)
+        else None
+    )
+    if not base_candidate_id or base_candidate_id not in {
+        str(item["candidate_id"]) for item in candidate_rankings
+    }:
+        base_candidate_id = (
+            str(candidate_rankings[0]["candidate_id"]) if candidate_rankings else None
+        )
+    base_provider_id = next(
+        (
+            str(item["provider_id"])
+            for item in candidate_rankings
+            if str(item["candidate_id"]) == base_candidate_id
+        ),
+        None,
+    )
+    if base_candidate_id is None or base_provider_id is None:
         decisions = tuple(
-            _selector_decision_for_span(
-                span,
-                _span_candidates_for(span.canonical_span_id, span_candidates),
+            TranscriptSpanDecision(
+                canonical_span_id=span.canonical_span_id,
+                decision_type="mark_unresolved",
+                rationale="No transcript candidate could be selected as the global base.",
+                conflict_reasons=("base_candidate_selection_failed",),
             )
             for span in spans
+            if span_index.get(span.canonical_span_id)
         )
-    unresolved_span_ids = tuple(
-        decision.canonical_span_id
-        for decision in decisions
-        if decision.decision_type == "mark_unresolved"
-    )
+        unresolved_span_ids = tuple(decision.canonical_span_id for decision in decisions)
+        selection_rationale = (
+            "Base candidate selection failed because no grounded candidates ranked."
+        )
+    else:
+        decisions_list: list[TranscriptSpanDecision] = []
+        for span in spans:
+            decision = _base_decision_for_span(
+                span,
+                span_index.get(span.canonical_span_id, ()),
+                base_candidate_id=base_candidate_id,
+            )
+            if decision is not None:
+                decisions_list.append(decision)
+        decisions = tuple(decisions_list)
+        unresolved_span_ids = tuple(
+            decision.canonical_span_id
+            for decision in decisions
+            if decision.decision_type == "mark_unresolved"
+        )
+        selection_rationale = _selection_rationale(
+            base_candidate_id=base_candidate_id,
+            base_provider_id=base_provider_id,
+            candidate_rankings=candidate_rankings,
+        )
     payload = {
         "record_id": _record_id(job.job_id, "selector", run_id),
         "job_id": job.job_id,
@@ -218,7 +392,13 @@ def run_selector_agent(
         "decisions": decisions,
         "unresolved_span_ids": unresolved_span_ids,
         "provider_support_summary": _provider_support_summary(span_candidates),
-        "metadata": {"base_url_source": runtime.reasoning_profile.base_url_source},
+        "metadata": {
+            "base_url_source": runtime.reasoning_profile.base_url_source,
+            "base_candidate_id": base_candidate_id,
+            "base_provider_id": base_provider_id,
+            "candidate_rankings": list(candidate_rankings),
+            "selection_rationale": selection_rationale,
+        },
     }
     return TranscriptSynthesisRecord.model_validate(payload)
 
@@ -232,7 +412,7 @@ def run_reviewer_agent(
     span_candidates: tuple[TranscriptSpanCandidate, ...],
     selector_record: TranscriptSynthesisRecord,
 ) -> TranscriptSynthesisReview:
-    """Audit synthesized span decisions for grounding, coverage, timing, and provenance."""
+    """Audit base-carried decisions and flag only fill or defensive failures."""
 
     if _should_use_live_reasoning(runtime):
         return _live_reviewer_review(
@@ -244,20 +424,36 @@ def run_reviewer_agent(
             selector_record=selector_record,
         )
 
+    span_index = _index_span_candidates(span_candidates)
     decision_by_span = {
         decision.canonical_span_id: decision for decision in selector_record.decisions
     }
+    base_candidate_id = str(selector_record.metadata.get("base_candidate_id") or "")
     accepted_span_ids: list[str] = []
     corrected_decisions: list[TranscriptSpanDecision] = []
     unresolved_span_ids: list[str] = []
     dropped_supported_span_ids: list[str] = []
     issues: list[TranscriptReviewIssue] = []
     for span in spans:
-        supported = _span_candidates_for(span.canonical_span_id, span_candidates)
+        supported = span_index.get(span.canonical_span_id, ())
         decision = decision_by_span.get(span.canonical_span_id)
         if not supported:
             continue
         if decision is None:
+            if any(item.candidate_id != base_candidate_id for item in supported):
+                unresolved_span_ids.append(span.canonical_span_id)
+                issues.append(
+                    TranscriptReviewIssue(
+                        canonical_span_id=span.canonical_span_id,
+                        issue_type="coverage",
+                        severity="major",
+                        description=(
+                            "Base transcript left a supported canonical span uncovered; "
+                            "fill required."
+                        ),
+                    )
+                )
+                continue
             dropped_supported_span_ids.append(span.canonical_span_id)
             unresolved_span_ids.append(span.canonical_span_id)
             issues.append(
@@ -292,16 +488,7 @@ def run_reviewer_agent(
             )
             continue
         if not _decision_grounded(decision, supported):
-            candidate_merge = _bounded_merge_decision(
-                span,
-                supported,
-                rationale="reviewer_correction",
-            )
-            if candidate_merge is not None:
-                corrected_decisions.append(candidate_merge)
-                accepted_span_ids.append(span.canonical_span_id)
-            else:
-                unresolved_span_ids.append(span.canonical_span_id)
+            unresolved_span_ids.append(span.canonical_span_id)
             issues.append(
                 TranscriptReviewIssue(
                     canonical_span_id=span.canonical_span_id,
@@ -312,14 +499,13 @@ def run_reviewer_agent(
             )
             continue
         if decision.start_ms < span.start_ms or decision.end_ms > span.end_ms:
-            corrected_decisions.append(
-                decision.model_copy(
-                    update={
-                        "start_ms": max(decision.start_ms, span.start_ms),
-                        "end_ms": min(decision.end_ms, span.end_ms),
-                    }
-                )
+            clipped = decision.model_copy(
+                update={
+                    "start_ms": max(decision.start_ms, span.start_ms),
+                    "end_ms": min(decision.end_ms, span.end_ms),
+                }
             )
+            corrected_decisions.append(clipped)
             issues.append(
                 TranscriptReviewIssue(
                     canonical_span_id=span.canonical_span_id,
@@ -330,9 +516,15 @@ def run_reviewer_agent(
             )
         accepted_span_ids.append(span.canonical_span_id)
 
+    effective_decisions = {
+        decision.canonical_span_id: decision for decision in selector_record.decisions
+    }
+    effective_decisions.update(
+        {decision.canonical_span_id: decision for decision in corrected_decisions}
+    )
     for left, right in zip(spans, spans[1:], strict=False):
-        left_decision = decision_by_span.get(left.canonical_span_id)
-        right_decision = decision_by_span.get(right.canonical_span_id)
+        left_decision = effective_decisions.get(left.canonical_span_id)
+        right_decision = effective_decisions.get(right.canonical_span_id)
         if left_decision is None or right_decision is None:
             continue
         if left_decision.decision_type == "mark_unresolved":
@@ -340,13 +532,14 @@ def run_reviewer_agent(
         if right_decision.decision_type == "mark_unresolved":
             continue
         if right_decision.start_ms < left_decision.end_ms:
-            unresolved_span_ids.extend([left.canonical_span_id, right.canonical_span_id])
             issues.append(
                 TranscriptReviewIssue(
                     canonical_span_id=right.canonical_span_id,
                     issue_type="timing",
                     severity="critical",
-                    description="Resolved transcript spans overlap and must be re-adjudicated.",
+                    description=(
+                        "Resolved transcript spans overlap and will fail assembly invariants."
+                    ),
                 )
             )
 
@@ -376,7 +569,7 @@ def run_global_adjudicator(
     selector_record: TranscriptSynthesisRecord,
     review: TranscriptSynthesisReview,
 ) -> TranscriptSynthesisRecord:
-    """Resolve remaining unresolved transcript spans or leave them blocked."""
+    """Resolve only base-uncovered spans or record defensive failures."""
 
     if _should_use_live_reasoning(runtime):
         decisions = _live_global_decisions(
@@ -406,30 +599,43 @@ def run_global_adjudicator(
         }
         return TranscriptSynthesisRecord.model_validate(payload)
 
-    candidate_decisions = {
+    span_index = _index_span_candidates(span_candidates)
+    selector_decisions = {
         decision.canonical_span_id: decision for decision in selector_record.decisions
     }
-    candidate_decisions.update(
-        {decision.canonical_span_id: decision for decision in review.corrected_decisions}
-    )
     unresolved_set = set(selector_record.unresolved_span_ids) | set(review.unresolved_span_ids)
-    for span in spans:
-        if span.canonical_span_id not in candidate_decisions:
-            candidate_decisions[span.canonical_span_id] = TranscriptSpanDecision(
-                canonical_span_id=span.canonical_span_id,
-                decision_type="mark_unresolved",
-                rationale="No selector decision was available for the canonical span.",
-            )
+    base_candidate_id = str(selector_record.metadata.get("base_candidate_id") or "")
+    candidate_decisions: dict[str, TranscriptSpanDecision] = {}
     for span in spans:
         if span.canonical_span_id not in unresolved_set:
             continue
-        supported = _span_candidates_for(span.canonical_span_id, span_candidates)
-        candidate_decisions[span.canonical_span_id] = _global_decision_for_span(
+        supported = span_index.get(span.canonical_span_id, ())
+        selector_decision = selector_decisions.get(span.canonical_span_id)
+        if (
+            selector_decision is not None
+            and selector_decision.metadata.get("decision_origin") == "base"
+        ):
+            candidate_decisions[span.canonical_span_id] = TranscriptSpanDecision(
+                canonical_span_id=span.canonical_span_id,
+                decision_type="mark_unresolved",
+                rationale=(
+                    "Base-carried span failed defensive review checks and "
+                    "cannot be repaired by fill."
+                ),
+                conflict_reasons=("assembly_invariant_failure",),
+                metadata={"decision_origin": "defensive_failure"},
+            )
+            continue
+        candidate_decisions[span.canonical_span_id] = _fill_decision_for_span(
             span,
             supported,
-            existing=candidate_decisions.get(span.canonical_span_id),
+            base_candidate_id=base_candidate_id,
         )
-    decisions = tuple(candidate_decisions[span.canonical_span_id] for span in spans)
+    decisions = tuple(
+        candidate_decisions[span.canonical_span_id]
+        for span in spans
+        if span.canonical_span_id in candidate_decisions
+    )
 
     payload = {
         "record_id": _record_id(job.job_id, "global_adjudicator", run_id),
@@ -462,25 +668,33 @@ def materialize_synthesized_transcript(
     review: TranscriptSynthesisReview,
     global_record: TranscriptSynthesisRecord,
 ) -> SynthesizedTranscriptArtifact:
-    """Create the synthesized transcript artifact and deterministic quality metrics."""
+    """Create the synthesized transcript artifact via deterministic base-plus-fill assembly."""
 
-    final_decisions = {
+    span_index = _index_span_candidates(span_candidates)
+    base_decisions = {
         decision.canonical_span_id: decision for decision in selector_record.decisions
     }
-    final_decisions.update(
+    base_decisions.update(
         {decision.canonical_span_id: decision for decision in review.corrected_decisions}
     )
-    final_decisions.update(
-        {decision.canonical_span_id: decision for decision in global_record.decisions}
-    )
+    fill_decisions = {decision.canonical_span_id: decision for decision in global_record.decisions}
+    base_candidate_id = selector_record.metadata.get("base_candidate_id")
+    base_provider_id = selector_record.metadata.get("base_provider_id")
 
     final_segments: list[Segment] = []
     provenance: list[TranscriptSpanProvenance] = []
     unresolved_spans: list[TranscriptUnresolvedSpan] = []
+    base_span_count = 0
+    fill_span_count = 0
 
     for span in spans:
-        supported = _span_candidates_for(span.canonical_span_id, span_candidates)
-        decision = final_decisions.get(span.canonical_span_id)
+        supported = span_index.get(span.canonical_span_id, ())
+        decision = base_decisions.get(span.canonical_span_id)
+        global_decision = fill_decisions.get(span.canonical_span_id)
+        if decision is None or (
+            global_decision is not None and global_decision.decision_type == "mark_unresolved"
+        ):
+            decision = global_decision
         if decision is None or decision.decision_type == "mark_unresolved":
             if supported:
                 unresolved_spans.append(
@@ -498,12 +712,31 @@ def materialize_synthesized_transcript(
                     )
                 )
             continue
+        clipped_start = max(span.start_ms, decision.start_ms)
+        clipped_end = min(span.end_ms, decision.end_ms)
+        if clipped_end <= clipped_start:
+            unresolved_spans.append(
+                TranscriptUnresolvedSpan(
+                    canonical_span_id=span.canonical_span_id,
+                    start_ms=span.start_ms,
+                    end_ms=span.end_ms,
+                    provider_ids=tuple(dict.fromkeys(item.provider_id for item in supported)),
+                    candidate_ids=tuple(dict.fromkeys(item.candidate_id for item in supported)),
+                    reason="Assembly clipped a resolved span to an invalid duration.",
+                )
+            )
+            continue
+        decision_origin = str(decision.metadata.get("decision_origin", "base"))
+        if decision_origin == "base":
+            base_span_count += 1
+        elif decision_origin == "fill":
+            fill_span_count += 1
 
         final_segments.append(
             Segment(
                 segment_id=_segment_id_for_decision(span.canonical_span_id, decision),
-                start_ms=decision.start_ms,
-                end_ms=decision.end_ms,
+                start_ms=clipped_start,
+                end_ms=clipped_end,
                 speaker=decision.speaker_label,
                 source_text=decision.output_text,
                 annotations={
@@ -511,6 +744,7 @@ def materialize_synthesized_transcript(
                     "synthesis_mode": decision.decision_type,
                     "source_fragment_refs": list(decision.source_fragment_refs),
                     "source_candidate_ids": list(decision.selected_candidate_ids),
+                    "decision_origin": decision_origin,
                 },
             )
         )
@@ -531,7 +765,7 @@ def materialize_synthesized_transcript(
                     for ref in (
                         selector_record.record_id,
                         review.review_id,
-                        global_record.record_id,
+                        global_record.record_id if decision_origin == "fill" else None,
                     )
                     if ref
                 ),
@@ -551,8 +785,12 @@ def materialize_synthesized_transcript(
             "global_adjudicator_record_id": global_record.record_id,
             "reasoning_provider": selector_record.reasoning_provider,
             "reasoning_model_id": selector_record.reasoning_model_id,
-            "normalization_version": "transcript-synthesis-v1",
+            "normalization_version": "transcript-synthesis-v2",
             "blocker_tags": list(blocker_tags),
+            "base_candidate_id": base_candidate_id,
+            "base_provider_id": base_provider_id,
+            "base_span_count": base_span_count,
+            "fill_span_count": fill_span_count,
         },
         canonical_spans=spans,
         span_candidates=span_candidates,
@@ -587,89 +825,79 @@ def blocking_failures_for_artifact(metrics: TranscriptQualityMetrics) -> tuple[s
     return tuple(failures)
 
 
-def _selector_decision_for_span(
-    span: CanonicalTranscriptSpan,
-    candidates: tuple[TranscriptSpanCandidate, ...],
-) -> TranscriptSpanDecision:
-    if not candidates:
-        return TranscriptSpanDecision(
-            canonical_span_id=span.canonical_span_id,
-            decision_type="mark_unresolved",
-            rationale="No provider evidence overlapped the canonical speech span.",
-        )
-
-    ranked = sorted(candidates, key=_span_candidate_sort_key, reverse=True)
-    top = ranked[0]
-    if len(ranked) == 1:
-        return _select_decision(span, top, rationale="Only one provider supported the span.")
-
-    runner_up = ranked[1]
-    if _texts_equivalent(top.normalized_text, runner_up.normalized_text):
-        return _select_decision(
-            span,
-            top,
-            rationale="Providers aligned on meaning and timing; selected the stronger overlap.",
-        )
-
-    if _dominates(top, runner_up):
-        return _select_decision(
-            span,
-            top,
-            rationale="One provider dominated coverage, meaning stability, and timing.",
-        )
-
-    merge = _bounded_merge_decision(
-        span,
-        ranked[:2],
-        rationale="Complementary provider evidence covered distinct grounded parts of the span.",
-    )
-    if merge is not None:
-        return merge
-
-    return TranscriptSpanDecision(
-        canonical_span_id=span.canonical_span_id,
-        decision_type="mark_unresolved",
-        rationale="Provider evidence conflicted and no bounded grounded merge was available.",
-        conflict_reasons=("conflicting_provider_evidence",),
-    )
-
-
-def _global_decision_for_span(
+def _base_decision_for_span(
     span: CanonicalTranscriptSpan,
     candidates: tuple[TranscriptSpanCandidate, ...],
     *,
-    existing: TranscriptSpanDecision | None,
+    base_candidate_id: str,
+) -> TranscriptSpanDecision | None:
+    base_candidate = next(
+        (candidate for candidate in candidates if candidate.candidate_id == base_candidate_id),
+        None,
+    )
+    if base_candidate is None:
+        return None
+    return _select_decision(
+        span,
+        base_candidate,
+        rationale="Selected the global base transcript candidate for the covered canonical span.",
+        decision_origin="base",
+    )
+
+
+def _fill_decision_for_span(
+    span: CanonicalTranscriptSpan,
+    candidates: tuple[TranscriptSpanCandidate, ...],
+    *,
+    base_candidate_id: str,
 ) -> TranscriptSpanDecision:
-    if len(candidates) == 1:
-        return _select_decision(
-            span,
-            candidates[0],
-            rationale="Global adjudicator accepted the only grounded provider span.",
+    fill_candidates = tuple(
+        candidate for candidate in candidates if candidate.candidate_id != base_candidate_id
+    )
+    if not fill_candidates:
+        return TranscriptSpanDecision(
+            canonical_span_id=span.canonical_span_id,
+            decision_type="mark_unresolved",
+            rationale=(
+                "Base transcript left the span uncovered and no non-base fill evidence remained."
+            ),
+            conflict_reasons=("fill_evidence_missing",),
+            metadata={"decision_origin": "defensive_failure"},
         )
-    ranked = sorted(candidates, key=_span_candidate_sort_key, reverse=True)
-    if ranked and len(ranked) > 1 and _dominates(ranked[0], ranked[1]):
+    ranked = sorted(fill_candidates, key=_span_candidate_sort_key, reverse=True)
+    if len(ranked) == 1:
         return _select_decision(
             span,
             ranked[0],
-            rationale="Global adjudicator resolved the span in favor of the stronger provider.",
+            rationale="Filled the uncovered canonical span from the strongest non-base evidence.",
+            decision_origin="fill",
+        )
+    if _dominates(ranked[0], ranked[1]) or _texts_equivalent(
+        ranked[0].normalized_text,
+        ranked[1].normalized_text,
+    ):
+        return _select_decision(
+            span,
+            ranked[0],
+            rationale="Filled the uncovered canonical span from the strongest non-base evidence.",
+            decision_origin="fill",
         )
     merge = _bounded_merge_decision(
         span,
         ranked[:2],
-        rationale="Global adjudicator merged complementary grounded fragments.",
+        rationale=(
+            "Filled the uncovered canonical span by concatenating complementary non-base fragments."
+        ),
+        decision_origin="fill",
     )
     if merge is not None:
         return merge
-    reason = (
-        existing.rationale
-        if existing is not None and existing.rationale
-        else "Global adjudicator could not resolve the span without ungrounded rewriting."
-    )
     return TranscriptSpanDecision(
         canonical_span_id=span.canonical_span_id,
         decision_type="mark_unresolved",
-        rationale=reason,
-        conflict_reasons=("transcript_blocked",),
+        rationale="Non-base fill evidence could not produce a grounded monotonic span.",
+        conflict_reasons=("fill_assembly_failed",),
+        metadata={"decision_origin": "defensive_failure"},
     )
 
 
@@ -678,6 +906,7 @@ def _select_decision(
     candidate: TranscriptSpanCandidate,
     *,
     rationale: str,
+    decision_origin: str,
 ) -> TranscriptSpanDecision:
     return TranscriptSpanDecision(
         canonical_span_id=span.canonical_span_id,
@@ -692,6 +921,7 @@ def _select_decision(
         start_ms=max(span.start_ms, candidate.start_ms),
         end_ms=min(span.end_ms, candidate.end_ms),
         rationale=rationale,
+        metadata={"decision_origin": decision_origin},
     )
 
 
@@ -700,6 +930,7 @@ def _bounded_merge_decision(
     candidates: tuple[TranscriptSpanCandidate, ...] | list[TranscriptSpanCandidate],
     *,
     rationale: str,
+    decision_origin: str,
 ) -> TranscriptSpanDecision | None:
     deduped: dict[str, TranscriptSpanCandidate] = {}
     for candidate in candidates:
@@ -760,6 +991,7 @@ def _bounded_merge_decision(
         start_ms=max(span.start_ms, min(candidate.start_ms for candidate in ordered)),
         end_ms=min(span.end_ms, max(candidate.end_ms for candidate in ordered)),
         rationale=rationale,
+        metadata={"decision_origin": decision_origin},
     )
 
 
@@ -943,28 +1175,30 @@ def _reasoning_client(runtime: WorkflowRuntime) -> OpenAI:
     )
 
 
-def _live_selector_decisions(
+def _live_base_candidate_selection(
     *,
     run_id: str,
     runtime: WorkflowRuntime,
     spans: tuple[CanonicalTranscriptSpan, ...],
     span_candidates: tuple[TranscriptSpanCandidate, ...],
-) -> tuple[TranscriptSpanDecision, ...]:
+    candidate_rankings: tuple[dict[str, object], ...],
+) -> str | None:
     response = _invoke_reasoning_json(
         runtime=runtime,
         run_id=run_id,
         schema_name="transcript_selector",
-        schema=_selector_output_schema(),
+        schema=_selector_selection_schema(),
         system_prompt=(
-            "You are the transcript selector. For each canonical transcript span, choose the best "
-            "grounded provider span, merge grounded fragments, or mark the span unresolved. "
-            "Never invent words not present in the evidence. You may reconcile slight timing drift "
-            "only within the canonical span and the supported evidence timing."
+            "You are the transcript selector. Choose exactly one transcript candidate as the "
+            "global base for the entire job. Favor transcript-level coverage, covered duration, "
+            "internal monotonicity and overlap stability, provider rank, and text continuity "
+            "across neighboring spans. Do not choose per-span winners."
         ),
         user_prompt=json.dumps(
             {
                 "spans": [_span_payload(span) for span in spans],
                 "span_candidates": [_candidate_payload(item) for item in span_candidates],
+                "candidate_rankings": list(candidate_rankings),
             },
             ensure_ascii=True,
             sort_keys=True,
@@ -975,18 +1209,11 @@ def _live_selector_decisions(
             "span_candidate_count": len(span_candidates),
         },
     )
-    fallback_map = {
-        span.canonical_span_id: _selector_decision_for_span(
-            span,
-            _span_candidates_for(span.canonical_span_id, span_candidates),
-        )
-        for span in spans
-    }
-    return _normalized_decisions(
-        spans=spans,
-        raw_decisions=response.get("decisions"),
-        fallback_map=fallback_map,
-    )
+    candidate_id = response.get("base_candidate_id")
+    if candidate_id is None:
+        return None
+    selected = str(candidate_id).strip()
+    return selected or None
 
 
 def _live_reviewer_review(
@@ -1004,9 +1231,10 @@ def _live_reviewer_review(
         schema_name="transcript_reviewer",
         schema=_reviewer_output_schema(),
         system_prompt=(
-            "You are the transcript reviewer. Audit selector decisions for grounding, timing, "
-            "coverage, and provenance. Correct only when fully grounded in the provided evidence. "
-            "Otherwise leave the span unresolved."
+            "You are the transcript reviewer. The selector already chose one transcript-level "
+            "base candidate. Audit only for fill-required coverage gaps, provenance completeness, "
+            "grounding, and timing safety. Do not replace or override base-covered text because "
+            "another provider disagrees."
         ),
         user_prompt=json.dumps(
             {
@@ -1066,16 +1294,23 @@ def _live_global_decisions(
     selector_record: TranscriptSynthesisRecord,
     review: TranscriptSynthesisReview,
 ) -> tuple[TranscriptSpanDecision, ...]:
+    unresolved_span_ids = {
+        *selector_record.unresolved_span_ids,
+        *review.unresolved_span_ids,
+    }
+    target_spans = tuple(span for span in spans if span.canonical_span_id in unresolved_span_ids)
+    base_candidate_id = str(selector_record.metadata.get("base_candidate_id") or "")
+    span_index = _index_span_candidates(span_candidates)
     response = _invoke_reasoning_json(
         runtime=runtime,
         run_id=run_id,
         schema_name="transcript_global_adjudicator",
         schema=_selector_output_schema(),
         system_prompt=(
-            "You are the transcript global adjudicator. Resolve only the remaining risky or "
-            "unresolved transcript spans. Prefer grounded resolutions, slight timing "
-            "reconciliation, or bounded grounded merges. If evidence is still insufficient, "
-            "mark the span unresolved."
+            "You are the transcript global adjudicator. Resolve only canonical spans the base "
+            "candidate left uncovered or spans that failed defensive review checks. Do not "
+            "override base-carried text. Prefer the strongest grounded non-base evidence, or a "
+            "bounded additive merge only when the uncovered span truly requires multiple fragments."
         ),
         user_prompt=json.dumps(
             {
@@ -1107,23 +1342,34 @@ def _live_global_decisions(
         },
     )
     fallback_map = {}
-    for span in spans:
-        supported = _span_candidates_for(span.canonical_span_id, span_candidates)
-        existing = next(
-            (
-                decision
-                for decision in selector_record.decisions
-                if decision.canonical_span_id == span.canonical_span_id
-            ),
-            None,
-        )
-        fallback_map[span.canonical_span_id] = _global_decision_for_span(
+    selector_decisions = {
+        decision.canonical_span_id: decision for decision in selector_record.decisions
+    }
+    for span in target_spans:
+        supported = span_index.get(span.canonical_span_id, ())
+        selector_decision = selector_decisions.get(span.canonical_span_id)
+        if (
+            selector_decision is not None
+            and selector_decision.metadata.get("decision_origin") == "base"
+        ):
+            fallback_map[span.canonical_span_id] = TranscriptSpanDecision(
+                canonical_span_id=span.canonical_span_id,
+                decision_type="mark_unresolved",
+                rationale=(
+                    "Base-carried span failed defensive review checks and "
+                    "cannot be repaired by fill."
+                ),
+                conflict_reasons=("assembly_invariant_failure",),
+                metadata={"decision_origin": "defensive_failure"},
+            )
+            continue
+        fallback_map[span.canonical_span_id] = _fill_decision_for_span(
             span,
             supported,
-            existing=existing,
+            base_candidate_id=base_candidate_id,
         )
     return _normalized_decisions(
-        spans=spans,
+        spans=target_spans,
         raw_decisions=response.get("decisions"),
         fallback_map=fallback_map,
     )
@@ -1388,6 +1634,17 @@ def _selector_output_schema() -> dict[str, object]:
             }
         },
         "required": ["decisions"],
+        "additionalProperties": False,
+    }
+
+
+def _selector_selection_schema() -> dict[str, object]:
+    return {
+        "type": "object",
+        "properties": {
+            "base_candidate_id": {"type": "string"},
+        },
+        "required": ["base_candidate_id"],
         "additionalProperties": False,
     }
 

@@ -162,6 +162,10 @@ def transcript_synthesis_key(job: JobContext) -> str:
     return job_path(job, "artifacts", "transcript-synthesis.json")
 
 
+def transcript_selector_record_key(job: JobContext) -> str:
+    return job_path(job, "artifacts", "transcript-selector.json")
+
+
 def transcript_span_review_record_key(job: JobContext) -> str:
     return job_path(job, "artifacts", "transcript-span-review.json")
 

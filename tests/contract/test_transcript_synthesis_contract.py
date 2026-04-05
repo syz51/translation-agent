@@ -52,6 +52,8 @@ def test_selector_output_contract_roundtrip() -> None:
     reparsed = TranscriptSynthesisRecord.model_validate(record.model_dump(mode="json"))
     assert reparsed.agent_role == "selector"
     assert reparsed.canonical_span_count == len(spans)
+    assert reparsed.metadata["base_candidate_id"]
+    assert reparsed.metadata["candidate_rankings"]
 
 
 def test_reviewer_output_contract_roundtrip() -> None:
@@ -109,6 +111,7 @@ def test_global_adjudicator_output_contract_roundtrip() -> None:
     reparsed = TranscriptSynthesisRecord.model_validate(adjudicated.model_dump(mode="json"))
     assert reparsed.agent_role == "global_adjudicator"
     assert reparsed.reasoning_model_id == "gpt-5.4"
+    assert reparsed.record_id != selector.record_id
 
 
 def _fixture_inputs():

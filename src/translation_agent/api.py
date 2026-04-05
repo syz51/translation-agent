@@ -1898,7 +1898,11 @@ def _resolved_asset_context(
 
 
 def _default_output_path(blob_root: Path, state: GraphState) -> Path | None:
-    if state.translation_failed or (state.human_review_required and state.approval_ref is None):
+    if (
+        state.transcript_failed
+        or state.translation_failed
+        or (state.human_review_required and state.approval_ref is None)
+    ):
         return None
     default_output_ref = job_path(state.job, "exports", "translation.srt")
     default_output_path = blob_root / default_output_ref
@@ -1910,6 +1914,8 @@ def _default_output_path(blob_root: Path, state: GraphState) -> Path | None:
 def _final_status(state: GraphState) -> str:
     if state.approval_ref is not None:
         return "completed_after_human_review"
+    if state.transcript_failed:
+        return "transcript_failed"
     if state.translation_failed:
         return "translation_failed"
     if state.human_review_required:
@@ -1927,6 +1933,19 @@ def _failure_details(
     final_state: GraphState,
     blob_store: LocalBlobStore,
 ) -> tuple[str | None, str | None, tuple[str, ...]]:
+    if final_state.transcript_failed:
+        failure_ref = job_path(final_state.job, "investigations", "transcript.json")
+        if not blob_store.exists(failure_ref):
+            return failure_ref, None, ()
+        payload = json.loads(blob_store.read_bytes(failure_ref).decode("utf-8"))
+        reasons = payload.get("blocking_failures")
+        summary = "Transcript synthesis failed assembly invariants before translation."
+        normalized_reasons = (
+            tuple(reason for reason in reasons if isinstance(reason, str))
+            if isinstance(reasons, (list, tuple))
+            else ()
+        )
+        return failure_ref, summary, normalized_reasons
     if not final_state.translation_failed:
         return None, None, ()
 
@@ -1954,6 +1973,20 @@ def _terminal_run_error(
     failure_reasons: tuple[str, ...],
     translation_provider_id: str | None = None,
 ) -> dict[str, object] | None:
+    if final_state.transcript_failed:
+        message = failure_summary or next(
+            iter(failure_reasons),
+            "Transcript synthesis failed assembly invariants before translation.",
+        )
+        return {
+            "category": "transcript_failed",
+            "reason": "transcript_assembly_failed",
+            "message": message,
+            "failure_ref": failure_ref,
+            "failure_summary": failure_summary,
+            "failure_reasons": list(failure_reasons),
+            "retryable": False,
+        }
     if not final_state.translation_failed:
         return None
 
