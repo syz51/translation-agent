@@ -13,9 +13,6 @@ from translation_agent.models import (
     JobContext,
     Segment,
     TranscriptCandidate,
-    TranscriptSpanDecision,
-    TranscriptSynthesisRecord,
-    TranscriptSynthesisReview,
 )
 from translation_agent.observability import TraceEvent
 from translation_agent.parallelism import GlobalConcurrencyLimiter, RuntimeParallelismPolicy
@@ -140,17 +137,17 @@ def test_selector_picks_single_provider_when_only_one_supports_span() -> None:
     assert record.decisions[0].output_text == "Only one provider spoke here"
 
 
-def test_selector_merges_complementary_provider_fragments() -> None:
+def test_selector_chooses_one_global_base_candidate() -> None:
     candidates = (
         _candidate(
             "candidate-a",
             "assemblyai",
-            (("seg-a1", 0, 1_400, "We should go."),),
+            (("seg-a1", 0, 1_000, "Alpha"), ("seg-a2", 1_500, 2_300, "Beta")),
         ),
         _candidate(
             "candidate-b",
             "speechmatics",
-            (("seg-b1", 0, 1_400, "We should go. Wait, take the map."),),
+            (("seg-b1", 0, 1_000, "Alpha"),),
         ),
     )
     spans = build_canonical_transcript_spans(candidates)
@@ -164,78 +161,64 @@ def test_selector_merges_complementary_provider_fragments() -> None:
         span_candidates=span_candidates,
     )
 
-    assert record.decisions[0].decision_type in {
-        "select_provider_span",
-        "merge_provider_spans",
-    }
-    assert "take the map" in record.decisions[0].output_text.lower()
+    assert record.metadata["base_candidate_id"] == "candidate-a"
+    assert record.metadata["base_provider_id"] == "assemblyai"
+    assert record.decisions[0].metadata["decision_origin"] == "base"
+    assert record.decisions[1].metadata["decision_origin"] == "base"
+    assert len(record.metadata["candidate_rankings"]) == 2
 
 
-def test_selector_marks_unresolved_for_conflicting_unsupported_merge() -> None:
-    span = CanonicalTranscriptSpan(
-        canonical_span_id="canonical-span-0001",
-        start_ms=0,
-        end_ms=1_000,
-        speaker=None,
-        supporting_candidate_ids=("candidate-a", "candidate-b"),
-        supporting_provider_ids=("assemblyai", "speechmatics"),
-        metadata={},
-    )
+def test_base_covered_span_survives_provider_disagreement() -> None:
     candidates = (
         _candidate("candidate-a", "assemblyai", (("seg-a1", 0, 1_000, "red blue"),)),
-        _candidate("candidate-b", "speechmatics", (("seg-b1", 0, 1_000, "orange green"),)),
+        _candidate(
+            "candidate-b",
+            "speechmatics",
+            (("seg-b1", 0, 1_000, "orange green extra words"),),
+        ),
     )
-    span_candidates = build_span_candidates((span,), candidates)
+    spans = build_canonical_transcript_spans(candidates)
+    span_candidates = build_span_candidates(spans, candidates)
 
     record = run_selector_agent(
         job=_job(),
         run_id="run-selector-unresolved",
         runtime=_runtime(),
-        spans=(span,),
+        spans=spans,
         span_candidates=span_candidates,
     )
 
-    assert record.unresolved_span_ids == ("canonical-span-0001",)
-    assert record.decisions[0].decision_type == "mark_unresolved"
+    assert record.unresolved_span_ids == ()
+    assert record.decisions[0].decision_type == "select_provider_span"
+    assert record.decisions[0].output_text == "red blue"
+    assert record.decisions[0].metadata["decision_origin"] == "base"
 
 
-def test_global_adjudicator_resolves_remaining_span_when_one_candidate_remains() -> None:
+def test_global_adjudicator_fills_base_gap_from_non_base_candidate() -> None:
     candidates = (
-        _candidate("candidate-a", "assemblyai", (("seg-a1", 0, 1_000, "resolved text"),)),
+        _candidate(
+            "candidate-a",
+            "assemblyai",
+            (("seg-a1", 0, 1_000, "Alpha"), ("seg-a2", 3_000, 4_000, "Gamma")),
+        ),
+        _candidate("candidate-b", "speechmatics", (("seg-b1", 1_500, 2_100, "Beta"),)),
     )
     spans = build_canonical_transcript_spans(candidates)
     span_candidates = build_span_candidates(spans, candidates)
-    selector_record = TranscriptSynthesisRecord(
-        record_id="selector",
-        job_id="job-1",
-        run_id="run-1",
-        agent_role="selector",
-        reasoning_provider="openai",
-        reasoning_model_id="gpt-5.4",
-        canonical_span_count=1,
-        decisions=(
-            TranscriptSpanDecision(
-                canonical_span_id=spans[0].canonical_span_id,
-                decision_type="mark_unresolved",
-                rationale="Needs escalation",
-            ),
-        ),
-        unresolved_span_ids=(spans[0].canonical_span_id,),
-        provider_support_summary={"assemblyai": 1},
-        metadata={},
+    selector_record = run_selector_agent(
+        job=_job(),
+        run_id="run-global",
+        runtime=_runtime(),
+        spans=spans,
+        span_candidates=span_candidates,
     )
-    review = TranscriptSynthesisReview(
-        review_id="review",
-        job_id="job-1",
-        run_id="run-1",
-        reasoning_provider="openai",
-        reasoning_model_id="gpt-5.4",
-        accepted_span_ids=(),
-        corrected_decisions=(),
-        unresolved_span_ids=(spans[0].canonical_span_id,),
-        dropped_supported_span_ids=(),
-        issues=(),
-        metadata={},
+    review = run_reviewer_agent(
+        job=_job(),
+        run_id="run-global",
+        runtime=_runtime(),
+        spans=spans,
+        span_candidates=span_candidates,
+        selector_record=selector_record,
     )
 
     adjudicated = run_global_adjudicator(
@@ -249,48 +232,46 @@ def test_global_adjudicator_resolves_remaining_span_when_one_candidate_remains()
     )
 
     assert adjudicated.unresolved_span_ids == ()
+    assert len(adjudicated.decisions) == 1
     assert adjudicated.decisions[0].decision_type == "select_provider_span"
-    assert adjudicated.decisions[0].output_text == "resolved text"
+    assert adjudicated.decisions[0].output_text == "Beta"
+    assert adjudicated.decisions[0].metadata["decision_origin"] == "fill"
 
 
-def test_materialized_transcript_blocks_when_supported_span_stays_unresolved() -> None:
+def test_materialized_transcript_builds_base_plus_fill_without_unresolved_disagreement() -> None:
     candidates = (
-        _candidate("candidate-a", "assemblyai", (("seg-a1", 0, 1_000, "red blue"),)),
-        _candidate("candidate-b", "speechmatics", (("seg-b1", 0, 1_000, "orange green"),)),
+        _candidate(
+            "candidate-a",
+            "assemblyai",
+            (("seg-a1", 0, 1_000, "Alpha"), ("seg-a2", 3_000, 4_000, "Gamma")),
+        ),
+        _candidate("candidate-b", "speechmatics", (("seg-b1", 1_500, 2_100, "Beta"),)),
     )
     spans = build_canonical_transcript_spans(candidates)
     span_candidates = build_span_candidates(spans, candidates)
-    unresolved_record = TranscriptSynthesisRecord(
-        record_id="selector",
-        job_id="job-1",
-        run_id="run-1",
-        agent_role="selector",
-        reasoning_provider="openai",
-        reasoning_model_id="gpt-5.4",
-        canonical_span_count=1,
-        decisions=(
-            TranscriptSpanDecision(
-                canonical_span_id=spans[0].canonical_span_id,
-                decision_type="mark_unresolved",
-                rationale="conflict",
-            ),
-        ),
-        unresolved_span_ids=(spans[0].canonical_span_id,),
-        provider_support_summary={"assemblyai": 1, "speechmatics": 1},
-        metadata={},
+    selector_record = run_selector_agent(
+        job=_job(),
+        run_id="run-materialize",
+        runtime=_runtime(),
+        spans=spans,
+        span_candidates=span_candidates,
     )
-    review = TranscriptSynthesisReview(
-        review_id="review",
-        job_id="job-1",
-        run_id="run-1",
-        reasoning_provider="openai",
-        reasoning_model_id="gpt-5.4",
-        accepted_span_ids=(),
-        corrected_decisions=(),
-        unresolved_span_ids=(spans[0].canonical_span_id,),
-        dropped_supported_span_ids=(),
-        issues=(),
-        metadata={},
+    review = run_reviewer_agent(
+        job=_job(),
+        run_id="run-materialize",
+        runtime=_runtime(),
+        spans=spans,
+        span_candidates=span_candidates,
+        selector_record=selector_record,
+    )
+    global_record = run_global_adjudicator(
+        job=_job(),
+        run_id="run-materialize",
+        runtime=_runtime(),
+        spans=spans,
+        span_candidates=span_candidates,
+        selector_record=selector_record,
+        review=review,
     )
 
     artifact = materialize_synthesized_transcript(
@@ -299,19 +280,25 @@ def test_materialized_transcript_blocks_when_supported_span_stays_unresolved() -
         language="en",
         spans=spans,
         span_candidates=span_candidates,
-        selector_record=unresolved_record,
+        selector_record=selector_record,
         review=review,
-        global_record=unresolved_record,
+        global_record=global_record,
     )
 
-    assert artifact.status == "blocked"
-    assert artifact.quality_metrics.unresolved_span_count == 1
-    assert blocking_failures_for_artifact(artifact.quality_metrics) == (
-        "unresolved_supported_spans",
-    )
+    assert artifact.status == "ready"
+    assert artifact.quality_metrics.unresolved_span_count == 0
+    assert [segment.source_text for segment in artifact.final_segments] == [
+        "Alpha",
+        "Beta",
+        "Gamma",
+    ]
+    assert artifact.full_text == "Alpha Beta Gamma"
+    assert artifact.transcript_metadata["base_span_count"] == 2
+    assert artifact.transcript_metadata["fill_span_count"] == 1
+    assert blocking_failures_for_artifact(artifact.quality_metrics) == ()
 
 
-def test_regression_window_2504_2604_preserves_missing_dialogue() -> None:
+def test_regression_window_2504_2604_preserves_base_text_under_disagreement() -> None:
     start_ms = 25 * 60 * 1_000 + 4 * 1_000
     end_ms = 26 * 60 * 1_000 + 4 * 1_000
     candidates = (
@@ -336,7 +323,65 @@ def test_regression_window_2504_2604_preserves_missing_dialogue() -> None:
         span_candidates=span_candidates,
     )
 
-    assert "bring the radio" in record.decisions[0].output_text.lower()
+    assert record.decisions[0].output_text == "We should leave now."
+    assert record.decisions[0].metadata["decision_origin"] == "base"
+
+
+def test_materialized_transcript_preserves_distinct_selector_and_global_refs() -> None:
+    candidates = (
+        _candidate(
+            "candidate-a",
+            "assemblyai",
+            (("seg-a1", 0, 1_000, "Alpha"), ("seg-a2", 3_000, 4_000, "Gamma")),
+        ),
+        _candidate("candidate-b", "speechmatics", (("seg-b1", 1_500, 2_100, "Beta"),)),
+    )
+    spans = build_canonical_transcript_spans(candidates)
+    span_candidates = build_span_candidates(spans, candidates)
+    selector = run_selector_agent(
+        job=_job(),
+        run_id="run-distinct-refs",
+        runtime=_runtime(),
+        spans=spans,
+        span_candidates=span_candidates,
+    )
+    review = run_reviewer_agent(
+        job=_job(),
+        run_id="run-distinct-refs",
+        runtime=_runtime(),
+        spans=spans,
+        span_candidates=span_candidates,
+        selector_record=selector,
+    )
+    global_record = run_global_adjudicator(
+        job=_job(),
+        run_id="run-distinct-refs",
+        runtime=_runtime(),
+        spans=spans,
+        span_candidates=span_candidates,
+        selector_record=selector,
+        review=review,
+    )
+    artifact = materialize_synthesized_transcript(
+        job=_job(),
+        run_id="run-distinct-refs",
+        language="en",
+        spans=spans,
+        span_candidates=span_candidates,
+        selector_record=selector,
+        review=review,
+        global_record=global_record,
+    )
+
+    assert (
+        artifact.transcript_metadata["selector_record_id"]
+        != artifact.transcript_metadata["global_adjudicator_record_id"]
+    )
+    fill_provenance = next(
+        item for item in artifact.provenance if item.candidate_ids == ("candidate-b",)
+    )
+    assert selector.record_id in fill_provenance.reasoning_refs
+    assert global_record.record_id in fill_provenance.reasoning_refs
 
 
 def test_live_reasoning_requests_acquire_provider_io_budget(
@@ -371,22 +416,7 @@ def test_live_reasoning_requests_acquire_provider_io_budget(
 
     completions = _Completions(
         [
-            {
-                "decisions": [
-                    {
-                        "canonical_span_id": "canonical-span-0001",
-                        "decision_type": "select_provider_span",
-                        "selected_candidate_ids": ["candidate-a"],
-                        "selected_span_candidate_ids": ["canonical-span-0001--candidate-a"],
-                        "source_fragment_refs": ["candidate-a:seg-a1"],
-                        "output_text": "Take the map.",
-                        "speaker_label": "speaker-1",
-                        "start_ms": 0,
-                        "end_ms": 1_000,
-                        "rationale": "Grounded provider evidence.",
-                    }
-                ]
-            },
+            {"base_candidate_id": "candidate-a"},
             {
                 "accepted_span_ids": ["canonical-span-0001"],
                 "corrected_decisions": [],
@@ -394,22 +424,7 @@ def test_live_reasoning_requests_acquire_provider_io_budget(
                 "dropped_supported_span_ids": [],
                 "issues": [],
             },
-            {
-                "decisions": [
-                    {
-                        "canonical_span_id": "canonical-span-0001",
-                        "decision_type": "select_provider_span",
-                        "selected_candidate_ids": ["candidate-a"],
-                        "selected_span_candidate_ids": ["canonical-span-0001--candidate-a"],
-                        "source_fragment_refs": ["candidate-a:seg-a1"],
-                        "output_text": "Take the map.",
-                        "speaker_label": "speaker-1",
-                        "start_ms": 0,
-                        "end_ms": 1_000,
-                        "rationale": "Grounded provider evidence.",
-                    }
-                ]
-            },
+            {"decisions": []},
         ]
     )
 
@@ -458,7 +473,7 @@ def test_live_reasoning_requests_acquire_provider_io_budget(
 
     assert selector.decisions[0].decision_type == "select_provider_span"
     assert review.accepted_span_ids == ("canonical-span-0001",)
-    assert adjudicated.decisions[0].decision_type == "select_provider_span"
+    assert adjudicated.decisions == ()
     assert len(completions.calls) == 3
 
     stage_started_events = [

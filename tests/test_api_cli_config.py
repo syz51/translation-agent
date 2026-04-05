@@ -1480,7 +1480,7 @@ def test_run_job_rejects_invalid_runtime_configuration(
 
 
 @pytest.mark.unit
-def test_final_status_prefers_translation_failure_then_human_review_then_degraded() -> None:
+def test_final_status_prefers_transcript_failure_then_other_terminal_states() -> None:
     base = GraphState(
         run_id="run-status",
         job=_job_context(),
@@ -1488,6 +1488,7 @@ def test_final_status_prefers_translation_failure_then_human_review_then_degrade
         source_video_ref="input.mp4",
     )
 
+    assert _final_status(base.model_copy(update={"transcript_failed": True})) == "transcript_failed"
     assert (
         _final_status(
             base.model_copy(update={"translation_failed": True, "human_review_required": True})

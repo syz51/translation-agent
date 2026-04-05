@@ -217,6 +217,7 @@ def test_phase_two_happy_path_executes_full_graph(tmp_path: Path) -> None:
 
     assert final_state.current_stage == "finalize_outputs"
     assert final_state.human_review_required is False
+    assert final_state.transcript_failed is False
     assert final_state.translation_failed is False
     assert len(final_state.memory_batch_ids) == 2
     assert final_state.final_translation_candidate_id is not None
@@ -229,6 +230,7 @@ def test_phase_two_happy_path_executes_full_graph(tmp_path: Path) -> None:
 def test_phase_two_degraded_stt_keeps_run_recoverable(tmp_path: Path) -> None:
     final_state, run_store, _ = _run_workflow(tmp_path, scenario="degraded_stt")
 
+    assert final_state.transcript_failed is False
     assert final_state.translation_failed is False
     assert final_state.human_review_required is False
     assert any(
@@ -273,6 +275,7 @@ def test_phase_two_escalation_skips_translation_path(tmp_path: Path) -> None:
     final_state, run_store, blob_store = _run_workflow(tmp_path, scenario="transcript_escalation")
 
     assert final_state.human_review_required is False
+    assert final_state.transcript_failed is False
     assert final_state.final_translation_decision_ref is not None
     assert blob_store.exists(_artifact_path("published", "translation.json"))
     executed_nodes = [record.node_name for record in run_store.list_node_executions("run-123")]
@@ -320,6 +323,207 @@ def test_phase_four_high_risk_invokes_stronger_adjudicator(tmp_path: Path) -> No
         fact.fact_type == "disagreement_bucket" and fact.value == "high"
         for fact in final_state.routing_facts
     )
+
+
+def test_phase_two_translation_receives_base_plus_fill_full_text(tmp_path: Path) -> None:
+    run_store = InMemoryRunStore()
+    run_store.create_run(run_id="run-base-fill", status="running")
+    blob_store = LocalBlobStore(tmp_path / "blobs")
+    source_ref = "jobs/run-base-fill-request.json"
+    blob_store.put_bytes(source_ref, b"{}\n")
+    runtime = build_phase_two_runtime(
+        blob_store=blob_store,
+        run_store=run_store,
+        trace_sink=NoOpTraceSink(),
+        source_artifact_ref=source_ref,
+        scenario="happy",
+    )
+    job = _job_context(job_id="job-base-fill")
+
+    class TranscriptAdapter:
+        def __init__(self, provider_id: str, rank: int, segments) -> None:  # noqa: ANN001
+            self.provider_id = provider_id
+            self.rank = rank
+            self._segments = segments
+
+        def transcribe(self, audio_artifact, request_context):  # noqa: ANN001
+            candidate, _ = self.transcribe_with_payload(audio_artifact, request_context)
+            return candidate
+
+        def transcribe_with_payload(self, audio_artifact, request_context):  # noqa: ANN001
+            del audio_artifact
+            candidate = TranscriptCandidate(
+                candidate_id=f"tr-{self.provider_id}-{request_context.job.job_id}",
+                job_id=request_context.job.job_id,
+                provider_id=self.provider_id,
+                provider_request_id=f"req-{self.provider_id}",
+                language=request_context.job.source_language,
+                segments=tuple(
+                    Segment(
+                        segment_id=segment_id,
+                        start_ms=start_ms,
+                        end_ms=end_ms,
+                        speaker="speaker-1",
+                        source_text=text,
+                    )
+                    for segment_id, start_ms, end_ms, text in self._segments
+                ),
+                full_text=" ".join(
+                    text for _segment_id, _start_ms, _end_ms, text in self._segments
+                ),
+                speaker_map={"speaker-1": "Host"},
+                timing_resolution="segment",
+                raw_payload_ref=job_path(
+                    request_context.job,
+                    "raw",
+                    "provider-payloads",
+                    f"{self.provider_id}.json",
+                ),
+                normalization_version="test",
+                metadata={"provider_rank": self.rank},
+            )
+            return candidate, {"provider": self.provider_id}
+
+    class CapturingTranslationAdapter:
+        model_id = "gpt-5.4-mini"
+        _prompt_version = "phase-3-v1"
+
+        def __init__(self) -> None:
+            self.transcript_texts: list[str] = []
+
+        def generate_translation(self, final_transcript, prompt_variant_id, request_context):  # noqa: ANN001
+            candidate, _ = self.generate_translation_with_payload(
+                final_transcript,
+                prompt_variant_id,
+                request_context,
+            )
+            return candidate
+
+        def generate_translation_with_payload(
+            self,
+            transcript: TranscriptCandidate,
+            prompt_variant_id: str,
+            request_context: RequestContext,
+        ) -> tuple[TranslationCandidate, dict[str, object]]:
+            assert request_context.metadata["transcript_synthesis"]["transcript_blockers"] == []
+            self.transcript_texts.append(transcript.full_text)
+            segments = tuple(
+                segment.model_copy(
+                    update={"target_text": f"{segment.source_text}-{prompt_variant_id}"}
+                )
+                for segment in transcript.segments
+            )
+            candidate = TranslationCandidate(
+                candidate_id=f"tr-{prompt_variant_id}",
+                job_id=request_context.job.job_id,
+                source_transcript_ref=request_context.metadata["transcript_synthesis"][
+                    "final_transcript_ref"
+                ],
+                model_id=self.model_id,
+                prompt_variant_id=prompt_variant_id,
+                prompt_version="raw-prompt",
+                language=request_context.job.target_language,
+                segments=segments,
+                full_text=f"{transcript.full_text}-{prompt_variant_id}",
+                raw_response_ref=None,
+                normalization_version="raw-test",
+                metadata={},
+            )
+            return candidate, {"candidate": candidate.candidate_id}
+
+    runtime.transcription_adapters = (
+        TranscriptAdapter(
+            "assemblyai",
+            0,
+            (("seg-a1", 0, 1_000, "Alpha"), ("seg-a2", 3_000, 4_000, "Gamma")),
+        ),
+        TranscriptAdapter("speechmatics", 1, (("seg-b1", 1_500, 2_100, "Beta"),)),
+    )
+    adapter = CapturingTranslationAdapter()
+    runtime.translation_adapter = cast(Any, adapter)
+
+    final_state = run_workflow(
+        GraphState(
+            run_id="run-base-fill",
+            job=job,
+            current_stage="ingest",
+            source_video_ref="input.mp4",
+            source_artifact_ref=source_ref,
+        ),
+        runtime,
+    )
+
+    assert final_state.transcript_failed is False
+    assert adapter.transcript_texts == ["Alpha Beta Gamma"]
+
+
+def test_phase_two_transcript_failure_stops_before_translation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_store = InMemoryRunStore()
+    run_store.create_run(run_id="run-transcript-failed", status="running")
+    blob_store = LocalBlobStore(tmp_path / "blobs")
+    source_ref = "jobs/run-transcript-failed-request.json"
+    blob_store.put_bytes(source_ref, b"{}\n")
+    runtime = build_phase_two_runtime(
+        blob_store=blob_store,
+        run_store=run_store,
+        trace_sink=NoOpTraceSink(),
+        source_artifact_ref=source_ref,
+        scenario="happy",
+    )
+    job = _job_context(job_id="job-transcript-failed")
+
+    blocked_artifact = SynthesizedTranscriptArtifact(
+        artifact_id=f"synth-{job.job_id}",
+        job_id=job.job_id,
+        run_id="run-transcript-failed",
+        language=job.source_language,
+        transcript_metadata={"blocker_tags": ["transcript_non_monotonic"]},
+        canonical_spans=(),
+        span_candidates=(),
+        final_segments=(),
+        provenance=(),
+        unresolved_spans=(),
+        quality_metrics=TranscriptQualityMetrics(
+            canonical_span_count=1,
+            supported_span_count=1,
+            emitted_span_count=1,
+            unresolved_span_count=0,
+            overlap_count=0,
+            non_monotonic_count=1,
+            zero_length_count=0,
+            dropped_supported_span_count=0,
+            provider_support_summary={"assemblyai": 1},
+        ),
+        full_text="Alpha",
+        status="blocked",
+    )
+
+    monkeypatch.setattr(
+        "translation_agent.nodes.transcript_synthesis.build_final_transcript_artifact",
+        lambda **_kwargs: blocked_artifact,
+    )
+
+    final_state = run_workflow(
+        GraphState(
+            run_id="run-transcript-failed",
+            job=job,
+            current_stage="ingest",
+            source_video_ref="input.mp4",
+            source_artifact_ref=source_ref,
+        ),
+        runtime,
+    )
+
+    executed_nodes = [
+        record.node_name for record in run_store.list_node_executions("run-transcript-failed")
+    ]
+    assert final_state.transcript_failed is True
+    assert final_state.translation_failed is False
+    assert final_state.final_translation_decision_ref is None
+    assert "generate_translation_candidates" not in executed_nodes
 
 
 def test_phase_four_translation_escalation_uses_stronger_adjudicator(

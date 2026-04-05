@@ -18,6 +18,7 @@ from translation_agent.nodes.common import (
     select_transcript_candidates,
     transcript_decision_key,
     transcript_investigation_key,
+    transcript_selector_record_key,
     transcript_span_review_record_key,
     transcript_synthesis_key,
     write_model_artifact,
@@ -84,10 +85,10 @@ def select_transcript_spans(state: GraphState, runtime: WorkflowRuntime) -> dict
         spans=span_table.canonical_spans,
         span_candidates=span_table.span_candidates,
     )
-    synthesis_ref = write_model_artifact(runtime, transcript_synthesis_key(state.job), record)
+    synthesis_ref = write_model_artifact(runtime, transcript_selector_record_key(state.job), record)
     return {
         "current_stage": "select_transcript_spans",
-        "final_transcript_synthesis_ref": synthesis_ref,
+        "transcript_selector_ref": synthesis_ref,
         "transcript_unresolved_span_count": len(record.unresolved_span_ids),
         "routing_facts": state.routing_facts
         + (
@@ -174,20 +175,21 @@ def materialize_synthesized_transcript_node(
 
     span_table = _load_span_table(state, runtime)
     review = _load_review_record(state, runtime)
-    global_record = _load_selector_record(state, runtime)
+    selector_record = _load_selector_record(state, runtime)
+    global_record = _load_global_record(state, runtime)
     artifact = build_final_transcript_artifact(
         job=state.job,
         run_id=state.run_id,
         language=state.job.source_language,
         spans=span_table.canonical_spans,
         span_candidates=span_table.span_candidates,
-        selector_record=global_record,
+        selector_record=selector_record,
         review=review,
         global_record=global_record,
     )
     artifact_ref = write_model_artifact(runtime, final_transcript_artifact_key(state.job), artifact)
     blocking_failures = blocking_failures_for_artifact(artifact.quality_metrics)
-    blocked = bool(blocking_failures)
+    transcript_failed = bool(blocking_failures)
     primary_candidate_id = _primary_transcript_candidate_id(artifact)
     investigation_ref = write_model_artifact(
         runtime,
@@ -197,10 +199,11 @@ def materialize_synthesized_transcript_node(
             "run_id": state.run_id,
             "stage": "transcript_synthesis",
             "canonical_span_ref": state.canonical_transcript_span_ref,
+            "selector_record_ref": state.transcript_selector_ref,
             "synthesis_record_ref": state.final_transcript_synthesis_ref,
             "span_review_ref": state.transcript_span_review_ref,
             "transcript_artifact_ref": artifact_ref,
-            "synthesis_status": "blocked" if blocked else "complete",
+            "synthesis_status": "transcript_failed" if transcript_failed else "complete",
             "unresolved_span_count": artifact.quality_metrics.unresolved_span_count,
             "unresolved_span_ids": list(global_record.unresolved_span_ids),
             "blocking_failures": blocking_failures,
@@ -214,13 +217,12 @@ def materialize_synthesized_transcript_node(
         canonical_span_ref=state.canonical_transcript_span_ref,
         synthesis_record_ref=state.final_transcript_synthesis_ref,
         span_review_ref=state.transcript_span_review_ref,
-        decision_mode="conflict_investigation" if blocked else "automatic_finalize",
-        decision_confidence=0.42 if blocked else 0.88,
+        decision_mode="conflict_investigation" if transcript_failed else "automatic_finalize",
+        decision_confidence=0.42 if transcript_failed else 0.88,
         rationale_summary=(
-            "Synthesized transcript completed with transcript blockers that downstream translation "
-            "must inspect."
-            if blocked
-            else "Synthesized transcript passed span selection, review, and adjudication."
+            "Synthesized transcript failed assembly invariants and translation was skipped."
+            if transcript_failed
+            else "Synthesized transcript passed base selection, review, and fill adjudication."
         ),
         review_refs=(
             (state.transcript_span_review_ref,)
@@ -228,16 +230,16 @@ def materialize_synthesized_transcript_node(
             else ()
         ),
         investigation_ref=investigation_ref,
-        disagreement_bucket="unresolved" if blocked else "low",
+        disagreement_bucket="unresolved" if transcript_failed else "low",
         adjudication_scorecard=_transcript_scorecard(artifact),
-        synthesis_status="blocked" if blocked else "complete",
+        synthesis_status="blocked" if transcript_failed else "complete",
         canonical_span_count=artifact.quality_metrics.canonical_span_count,
         emitted_span_count=artifact.quality_metrics.emitted_span_count,
         unresolved_span_count=artifact.quality_metrics.unresolved_span_count,
         blocker_tags=blocking_failures,
         provider_support_summary=artifact.quality_metrics.provider_support_summary,
         provenance_refs=(artifact_ref,),
-        escalated=blocked,
+        escalated=transcript_failed,
         human_review_required=False,
     )
     runtime.decision_store.save_transcript_decision(
@@ -252,6 +254,7 @@ def materialize_synthesized_transcript_node(
         "final_transcript_decision_ref": decision_ref,
         "transcript_unresolved_span_count": artifact.quality_metrics.unresolved_span_count,
         "pending_memory_source_stage": "transcript_adjudication",
+        "transcript_failed": transcript_failed,
         "human_review_required": False,
         "review_required_stage": None,
         "routing_facts": state.routing_facts
@@ -298,6 +301,16 @@ def _load_span_table(state: GraphState, runtime: WorkflowRuntime) -> TranscriptC
 
 
 def _load_selector_record(state: GraphState, runtime: WorkflowRuntime) -> TranscriptSynthesisRecord:
+    if state.transcript_selector_ref is None:
+        raise RuntimeError("transcript selector record is required")
+    return read_model_artifact(
+        runtime,
+        state.transcript_selector_ref,
+        TranscriptSynthesisRecord,
+    )
+
+
+def _load_global_record(state: GraphState, runtime: WorkflowRuntime) -> TranscriptSynthesisRecord:
     if state.final_transcript_synthesis_ref is None:
         raise RuntimeError("transcript synthesis record is required")
     return read_model_artifact(

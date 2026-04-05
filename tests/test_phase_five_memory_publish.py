@@ -24,12 +24,17 @@ from translation_agent.memory import (
     LongTermMemoryRecallBackend,
 )
 from translation_agent.models import (
+    CanonicalTranscriptSpan,
     JobContext,
     MemoryConsolidation,
     MemoryQuery,
     MemoryWrite,
     MemoryWriteBatch,
+    Segment,
+    SynthesizedTranscriptArtifact,
+    TranscriptQualityMetrics,
 )
+from translation_agent.nodes.common import write_model_artifact
 from translation_agent.nodes.memory_pipeline import drain_background_memory
 from translation_agent.observability import NoOpTraceSink
 from translation_agent.parallelism import GlobalConcurrencyLimiter, RuntimeParallelismPolicy
@@ -504,6 +509,93 @@ def test_phase_five_translation_failure_manifest_dedupes_duplicate_reasons(tmp_p
     assert failure_manifest["failure_reasons"] == [
         "variant-a: simulated translation failure for variant-a",
     ]
+
+
+def test_phase_five_transcript_failure_keeps_publish_shape_but_marks_delivery_failed(
+    tmp_path: Path,
+) -> None:
+    run_store = InMemoryRunStore()
+    run_store.create_run(run_id="run-transcript-failed", status="running")
+    blob_store = LocalBlobStore(tmp_path / "blobs")
+    source_ref = "jobs/run-transcript-failed-request.json"
+    blob_store.put_bytes(source_ref, b"{}\n")
+    runtime = build_phase_two_runtime(
+        blob_store=blob_store,
+        run_store=run_store,
+        trace_sink=NoOpTraceSink(),
+        source_artifact_ref=source_ref,
+        scenario="happy",
+    )
+    job = _job_context(job_id="job-transcript-failed")
+    transcript_ref = job_path(job, "artifacts", "final-transcript.json")
+    write_model_artifact(
+        runtime,
+        transcript_ref,
+        SynthesizedTranscriptArtifact(
+            artifact_id=f"synth-{job.job_id}",
+            job_id=job.job_id,
+            run_id="run-transcript-failed",
+            language=job.source_language,
+            transcript_metadata={"blocker_tags": ["transcript_non_monotonic"]},
+            canonical_spans=(
+                CanonicalTranscriptSpan(
+                    canonical_span_id="canonical-span-0001",
+                    start_ms=0,
+                    end_ms=1_000,
+                    speaker="speaker-1",
+                    supporting_candidate_ids=("candidate-a",),
+                    supporting_provider_ids=("assemblyai",),
+                    metadata={},
+                ),
+            ),
+            span_candidates=(),
+            final_segments=(
+                Segment(
+                    segment_id="seg-a1",
+                    start_ms=0,
+                    end_ms=1_000,
+                    speaker="speaker-1",
+                    source_text="Alpha",
+                ),
+            ),
+            provenance=(),
+            unresolved_spans=(),
+            quality_metrics=TranscriptQualityMetrics(
+                canonical_span_count=1,
+                supported_span_count=1,
+                emitted_span_count=1,
+                unresolved_span_count=0,
+                overlap_count=0,
+                non_monotonic_count=1,
+                zero_length_count=0,
+                dropped_supported_span_count=0,
+                provider_support_summary={"assemblyai": 1},
+            ),
+            full_text="Alpha",
+            status="blocked",
+        ),
+    )
+
+    state = GraphState(
+        run_id="run-transcript-failed",
+        job=job,
+        current_stage="finalize_outputs",
+        source_video_ref="input.mp4",
+        source_artifact_ref=source_ref,
+        final_transcript_ref=transcript_ref,
+        transcript_failed=True,
+    )
+    publish_outputs(state, runtime)
+
+    export_payload = json.loads(
+        blob_store.read_bytes(job_path(job, "exports", "translation.json")).decode("utf-8")
+    )
+    delivery_payload = json.loads(
+        blob_store.read_bytes(job_path(job, "deliveries", "translation.json")).decode("utf-8")
+    )
+    assert export_payload["transcript_synthesis_status"] == "blocked"
+    assert export_payload["status"] == "transcript_failed"
+    assert delivery_payload["status"] == "transcript_failed"
 
 
 def test_phase_five_background_memory_failures_do_not_block_finalization(tmp_path: Path) -> None:
