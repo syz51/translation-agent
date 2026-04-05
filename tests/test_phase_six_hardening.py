@@ -351,7 +351,9 @@ def test_phase_six_memory_recall_isolates_by_language_pair() -> None:
 def test_phase_six_translation_conflict_timeout_escalates_to_human_review(
     tmp_path: Path,
 ) -> None:
-    job = _job_context(job_id="job-timeout")
+    job = _job_context(job_id="job-timeout").model_copy(
+        update={"translation_variant_policy": "dual_experiment"}
+    )
     final_state, blob_store, _ = _run_workflow(
         tmp_path,
         run_id="run-timeout",
@@ -367,9 +369,23 @@ def test_phase_six_translation_conflict_timeout_escalates_to_human_review(
     )
 
     assert final_state.human_review_required is True
+    assert final_state.review_required_stage == "translation"
     assert decision.decision_mode == "human_review"
     assert decision.disagreement_bucket == "unresolved"
     assert investigation["status"] == "timed_out"
+    assert blob_store.exists(job_path(job, "published", "transcript.json"))
+    assert not blob_store.exists(job_path(job, "published", "translation.json"))
+    assert not blob_store.exists(job_path(job, "exports", "translation.srt"))
+    export_payload = json.loads(
+        blob_store.read_bytes(job_path(job, "exports", "translation.json")).decode("utf-8")
+    )
+    delivery_payload = json.loads(
+        blob_store.read_bytes(job_path(job, "deliveries", "translation.json")).decode("utf-8")
+    )
+    assert export_payload["status"] == "human_review_required"
+    assert export_payload["review_required_stage"] == "translation"
+    assert delivery_payload["status"] == "human_review_required"
+    assert delivery_payload["translation_ref"] is None
     assert any(
         fact.fact_type == "investigation_timeout" and fact.value == "conflict_investigator"
         for fact in final_state.routing_facts

@@ -91,6 +91,27 @@ def test_normalize_trace_event_builds_short_domain_messages() -> None:
     assert failed.stage == "review_translations"
 
 
+def test_normalize_trace_event_uses_transcript_ref_fallback_for_translation_variants() -> None:
+    completed = normalize_trace_event(
+        {
+            "name": "translation.variant.completed",
+            "timestamp": "2026-04-03T00:00:02+00:00",
+            "attributes": {
+                "prompt_variant_id": "variant-b",
+                "source_transcript_ref": (
+                    "tenants/tenant-local/projects/project-local/languages/en-to-fr/"
+                    "jobs/job-123/artifacts/final-transcript.json"
+                ),
+                "variant_total": 2,
+            },
+        }
+    )
+
+    assert completed is not None
+    assert completed.message == "Completed translation variant variant-b:final-transcript"
+    assert completed.stage == "generate_translation_candidates"
+
+
 def test_derive_run_status_snapshot_tracks_active_node_recent_events_and_counters() -> None:
     snapshot = derive_run_status_snapshot(
         _run_record(),
@@ -162,6 +183,68 @@ def test_derive_run_status_snapshot_tracks_active_node_recent_events_and_counter
     )
 
 
+def test_derive_run_status_snapshot_preserves_newer_terminal_record_over_stale_trace() -> None:
+    stale_trace_events = (
+        {
+            "run_id": "run-123",
+            "name": "run.started",
+            "timestamp": "2026-04-03T00:00:00+00:00",
+            "attributes": {"job_id": "job-123"},
+        },
+        {
+            "run_id": "run-123",
+            "name": "node.completed",
+            "timestamp": "2026-04-03T00:00:04+00:00",
+            "attributes": {"node_name": "review_translations", "execution_id": "exec-stale"},
+        },
+        {
+            "run_id": "run-123",
+            "name": "run.completed",
+            "timestamp": "2026-04-03T00:00:05+00:00",
+            "attributes": {"status": "human_review_required"},
+        },
+    )
+
+    snapshot_with_node_history = derive_run_status_snapshot(
+        _run_record(
+            status="completed_after_human_review",
+            updated_at="2026-04-03T00:00:08+00:00",
+            output_data={"final_stage": "resolve_review"},
+        ),
+        (
+            _node_execution(
+                execution_id="exec-1",
+                node_name="resolve_review",
+                status="completed",
+                created_at="2026-04-03T00:00:05+00:00",
+                updated_at="2026-04-03T00:00:06+00:00",
+            ),
+        ),
+        stale_trace_events,
+        trace_path=Path("/tmp/run-123.jsonl"),
+        now=datetime(2026, 4, 3, 0, 0, 8, tzinfo=UTC),
+    )
+
+    snapshot_without_node_history = derive_run_status_snapshot(
+        _run_record(
+            status="completed_after_human_review",
+            updated_at="2026-04-03T00:00:08+00:00",
+            output_data={"final_stage": "resolve_review"},
+        ),
+        (),
+        stale_trace_events,
+        trace_path=Path("/tmp/run-123-no-execs.jsonl"),
+        now=datetime(2026, 4, 3, 0, 0, 8, tzinfo=UTC),
+    )
+
+    assert snapshot_with_node_history.status == "completed_after_human_review"
+    assert snapshot_with_node_history.current_stage == "resolve_review"
+    assert snapshot_with_node_history.elapsed_seconds == 8.0
+    assert snapshot_without_node_history.status == "completed_after_human_review"
+    assert snapshot_without_node_history.current_stage == "resolve_review"
+    assert snapshot_without_node_history.elapsed_seconds == 8.0
+
+
 def test_derive_run_timing_summary_tracks_completed_and_active_intervals() -> None:
     summary = derive_run_timing_summary(
         (
@@ -219,6 +302,46 @@ def test_derive_run_timing_summary_tracks_completed_and_active_intervals() -> No
     assert summary.translation_variants[0].name == "variant-a:tr-1"
     assert summary.translation_variants[0].status == "active"
     assert summary.translation_variants[0].elapsed_seconds == 3.0
+
+
+def test_derive_run_timing_summary_tracks_translation_variants_from_transcript_refs() -> None:
+    summary = derive_run_timing_summary(
+        (
+            {
+                "run_id": "run-123",
+                "name": "translation.variant.started",
+                "timestamp": "2026-04-03T00:00:05+00:00",
+                "attributes": {
+                    "prompt_variant_id": "variant-a",
+                    "source_transcript_ref": (
+                        "tenants/tenant-local/projects/project-local/languages/en-to-fr/"
+                        "jobs/job-123/artifacts/final-transcript.json"
+                    ),
+                    "variant_total": 2,
+                },
+            },
+            {
+                "run_id": "run-123",
+                "name": "translation.variant.completed",
+                "timestamp": "2026-04-03T00:00:07+00:00",
+                "attributes": {
+                    "prompt_variant_id": "variant-a",
+                    "source_transcript_ref": (
+                        "tenants/tenant-local/projects/project-local/languages/en-to-fr/"
+                        "jobs/job-123/artifacts/final-transcript.json"
+                    ),
+                    "variant_total": 2,
+                    "candidate_id": "tl-variant-a-job-123",
+                },
+            },
+        ),
+        now=datetime(2026, 4, 3, 0, 0, 8, tzinfo=UTC),
+    )
+
+    assert len(summary.translation_variants) == 1
+    assert summary.translation_variants[0].name == "variant-a:final-transcript"
+    assert summary.translation_variants[0].status == "completed"
+    assert summary.translation_variants[0].elapsed_seconds == 2.0
 
 
 @pytest.mark.parametrize(
